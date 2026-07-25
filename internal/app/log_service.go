@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"ccLoad/internal/config"
+	"ccLoad/internal/eventbus"
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
 )
@@ -37,6 +38,15 @@ type LogService struct {
 	shutdownCh     chan struct{}
 	isShuttingDown *atomic.Bool
 	wg             *sync.WaitGroup
+
+	// 用量事件发布器：日志批量落库成功后发布 attempt 事件。
+	// nil 表示未装配（等价禁用）。
+	eventPublisher eventbus.Publisher
+}
+
+// SetEventPublisher 注入用量事件发布器（在 StartWorkers 之前调用）。
+func (s *LogService) SetEventPublisher(p eventbus.Publisher) {
+	s.eventPublisher = p
 }
 
 // NewLogService 创建日志服务实例
@@ -128,6 +138,19 @@ func (s *LogService) logWorker() {
 	}
 }
 
+// publishUsageEvents 将批次内携带用量事件的日志投递到事件总线。
+// 仅在落库成功后调用，保证事件 ≈ 账单真值。
+func (s *LogService) publishUsageEvents(logs []*model.LogEntry) {
+	if s.eventPublisher == nil {
+		return
+	}
+	for _, entry := range logs {
+		if entry != nil && entry.UsageEvent != nil {
+			s.eventPublisher.Publish(entry.UsageEvent)
+		}
+	}
+}
+
 // flushLogs 批量写入日志
 func (s *LogService) flushLogs(logs []*model.LogEntry) {
 	if len(logs) == 0 {
@@ -153,6 +176,8 @@ retryLoop:
 			if attempt > 1 {
 				log.Printf("[WARN] 日志批量写入重试成功 (attempt=%d/%d, batch_size=%d)", attempt, maxRetries, len(logs))
 			}
+			// 落库成功后发布 attempt 用量事件（复用 LogEntry 上已归一化的 usage/cost）。
+			s.publishUsageEvents(logs)
 			return
 		}
 

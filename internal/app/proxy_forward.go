@@ -1523,6 +1523,8 @@ func (s *Server) forwardAttempt(
 	// 记录渠道尝试开始时间（用于日志记录，每次渠道/Key切换时更新）
 	reqCtx.attemptStartTime = time.Now()
 	reqCtx.baseURL = baseURL
+	// 每次真实上游尝试自增序号（用于用量事件区分 attempt）
+	reqCtx.attemptSeq++
 
 	// 转发请求（传递实际的API Key字符串和观测回调）
 	// [FIX] 2026-01: 使用传入的 requestPath（可能已替换模型名）而非 reqCtx.requestPath

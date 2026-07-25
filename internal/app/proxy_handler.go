@@ -347,6 +347,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		activeReqID:    activeID,
 		startTime:      startTime,
 		thinkingEffort: thinkingEffort,
+		requestID:      util.NewUUIDv4(),
 	}
 	reqCtx.observer = &ForwardObserver{
 		OnBytesRead: func(n int64) {
@@ -359,6 +360,10 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			s.activeRequests.SetDebugCapture(activeID, dc)
 		},
 	}
+
+	// 请求收尾即发 request 级瘦汇总事件（不带 usage/cost，仅供按 request_id 关联）。
+	// 用 defer 捕获最终写给客户端的状态码，覆盖成功/失败/提前返回各路径。
+	defer s.publishRequestUsageEvent(c, reqCtx)
 
 	lastResult, succeeded := s.runProxyAttemptLoop(ctx, cands, reqCtx, c.Writer)
 	if succeeded {

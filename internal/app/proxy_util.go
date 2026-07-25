@@ -154,6 +154,8 @@ type proxyRequestContext struct {
 	baseURL          string               // 当前尝试使用的上游URL（多URL场景）
 	debugData        *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 	thinkingEffort   string
+	requestID        string // 关联同一用户请求的所有用量事件
+	attemptSeq       int    // 真实上游尝试序号（每次转发前自增）
 }
 
 // proxyResult 代理请求结果
@@ -841,6 +843,9 @@ type logEntryParams struct {
 	DebugData      *model.DebugLogEntry // Debug日志数据
 	CostMultiplier float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
 	ThinkingEffort string
+	TokenHash      string // 认证 token 哈希（用量事件维度）
+	RequestID      string // 关联同一用户请求的用量事件
+	AttemptSeq     int    // 真实上游尝试序号
 }
 
 // resolveProxyBillingModel 选择代理请求的计费模型。
@@ -905,6 +910,11 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			}
 		}
 		entry.Message = msg
+		// 499 客户端取消但上游已产 usage：按实际 usage 计费，日志行需带 usage/cost
+		// （与 token_stats 中性计费口径一致，也让用量事件携带真实 usage）。
+		if p.StatusCode == 499 && p.Result != nil && hasConsumedTokens(p.Result) {
+			fillEntryUsage(entry, p.Result, billingModel)
+		}
 	} else if p.Result != nil {
 		res := p.Result
 		if p.StatusCode >= 200 && p.StatusCode < 300 {
@@ -932,21 +942,8 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			entry.FirstByteTime = res.FirstByteTime
 		}
 
-		// Token统计（2025-11新增，从SSE响应中提取）
-		entry.InputTokens = res.InputTokens
-		entry.OutputTokens = res.OutputTokens
-		entry.ReasoningTokens = res.ReasoningTokens
-		entry.CacheReadInputTokens = res.CacheReadInputTokens
-		entry.CacheCreationInputTokens = res.CacheCreationInputTokens
-		entry.Cache5mInputTokens = res.Cache5mInputTokens
-		entry.Cache1hInputTokens = res.Cache1hInputTokens
-		entry.ServiceTier = res.ServiceTier
-
-		// 使用实际转发的模型计算成本（重定向时价格可能不同）；
-		// 始终调用以支持按次计费图像模型（tokens=0 时返回固定成本）。
-		// 优先 actual（重定向可能换价）；无定价时回退 request（渠道第一列作定价别名）
-		// alpha/search 固定按 search_call 计费。
-		entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+		// Token统计（2025-11新增，从SSE响应中提取）+ 成本
+		fillEntryUsage(entry, res, billingModel)
 	} else {
 		entry.Message = "unknown"
 	}
@@ -957,7 +954,58 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		}
 	}
 	entry.DebugData = p.DebugData
+	entry.UsageEvent = buildAttemptUsageEvent(p, entry)
 	return entry
+}
+
+// fillEntryUsage 将转发结果的 usage 与成本写入日志条目。
+// 成本使用实际转发的模型计算（重定向时价格可能不同）；始终调用 computeRequestCost
+// 以支持按次计费图像模型（tokens=0 时返回固定成本）。alpha/search 固定按 search_call 计费。
+func fillEntryUsage(entry *model.LogEntry, res *fwResult, billingModel string) {
+	entry.InputTokens = res.InputTokens
+	entry.OutputTokens = res.OutputTokens
+	entry.ReasoningTokens = res.ReasoningTokens
+	entry.CacheReadInputTokens = res.CacheReadInputTokens
+	entry.CacheCreationInputTokens = res.CacheCreationInputTokens
+	entry.Cache5mInputTokens = res.Cache5mInputTokens
+	entry.Cache1hInputTokens = res.Cache1hInputTokens
+	entry.ServiceTier = res.ServiceTier
+	entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+}
+
+// buildAttemptUsageEvent 从已归一化的 LogEntry 复用 usage/cost，构建 attempt 用量事件。
+// 不重新解析 usage 或重算成本；request_id 缺失时返回 nil（非代理路径日志不产生事件）。
+func buildAttemptUsageEvent(p logEntryParams, entry *model.LogEntry) *model.UsageEvent {
+	if p.RequestID == "" {
+		return nil
+	}
+	return &model.UsageEvent{
+		RequestID:                p.RequestID,
+		AttemptSeq:               p.AttemptSeq,
+		Kind:                     model.UsageEventAttempt,
+		Time:                     entry.Time,
+		TokenHash:                p.TokenHash,
+		AuthTokenID:              entry.AuthTokenID,
+		ChannelID:                entry.ChannelID,
+		Model:                    entry.Model,
+		ActualModel:              entry.ActualModel,
+		StatusCode:               entry.StatusCode,
+		IsStreaming:              entry.IsStreaming,
+		Duration:                 entry.Duration,
+		FirstByte:                entry.FirstByteTime,
+		ClientIP:                 entry.ClientIP,
+		InputTokens:              entry.InputTokens,
+		OutputTokens:             entry.OutputTokens,
+		ReasoningTokens:          entry.ReasoningTokens,
+		CacheReadInputTokens:     entry.CacheReadInputTokens,
+		CacheCreationInputTokens: entry.CacheCreationInputTokens,
+		Cache5mInputTokens:       entry.Cache5mInputTokens,
+		Cache1hInputTokens:       entry.Cache1hInputTokens,
+		StandardCostUSD:          entry.Cost,
+		CostMultiplier:           entry.CostMultiplier,
+		EffectiveCostUSD:         entry.Cost * entry.CostMultiplier,
+		ServiceTier:              entry.ServiceTier,
+	}
 }
 
 func appendRetryStrategyToMessage(message, strategy string) string {

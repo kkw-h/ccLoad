@@ -17,6 +17,7 @@ import (
 
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
+	"ccLoad/internal/eventbus"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	protocolbuiltin "ccLoad/internal/protocol/builtin"
@@ -92,6 +93,9 @@ type Server struct {
 
 	// 指纹任务管理器（内存）
 	fingerprintJobs *FingerprintJobManager
+
+	// 用量事件发布器（Redis）；未配置时为 NoopPublisher
+	eventPublisher eventbus.Publisher
 }
 
 // NewServer 创建并初始化一个新的 Server 实例
@@ -227,6 +231,9 @@ func NewServer(store storage.Store) *Server {
 	// 创建服务层（仅保留有价值的服务）
 	// ============================================================================
 
+	// 0. 用量事件发布器（Redis）：未配置 CCLOAD_REDIS 时为 NoopPublisher（禁用）
+	s.eventPublisher = newEventPublisherFromEnv()
+
 	// 1. LogService（负责日志管理）
 	s.logService = NewLogService(
 		store,
@@ -237,6 +244,7 @@ func NewServer(store storage.Store) *Server {
 		&s.isShuttingDown,
 		&s.wg,
 	)
+	s.logService.SetEventPublisher(s.eventPublisher)
 	// 启动日志 Workers
 	s.logService.StartWorkers()
 
@@ -1150,6 +1158,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if err == nil {
 			err = ctx.Err()
 		}
+	}
+
+	// 关闭用量事件发布器：置于日志 worker 之后，确保 attempt 事件已入队再排空。
+	if s.eventPublisher != nil {
+		s.eventPublisher.Close()
 	}
 
 	// 关闭渠道级代理 Transport 的空闲连接
