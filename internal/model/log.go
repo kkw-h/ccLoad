@@ -97,6 +97,10 @@ type LogEntry struct {
 
 	// 瞬态字段：不持久化到 logs 表，仅用于传递 debug 数据到写入管道
 	DebugData *DebugLogEntry `json:"-"`
+
+	// 瞬态字段：不持久化。落库成功后由 LogService 发布到事件总线（Redis）。
+	// nil 表示该日志不产生用量事件。
+	UsageEvent *UsageEvent `json:"-"`
 }
 
 // LogFilter 日志查询过滤条件
