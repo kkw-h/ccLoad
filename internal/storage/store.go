@@ -10,6 +10,16 @@ import (
 // ErrSettingNotFound 系统设置未找到错误（重导出自 model 包以保持兼容性）
 var ErrSettingNotFound = model.ErrSettingNotFound
 
+// TokenStatOutcome 记账语义（定义于 model，storage 层重导出以便调用方就近引用）。
+type TokenStatOutcome = model.TokenStatOutcome
+
+// 记账语义构造器（重导出自 model）。
+var (
+	TokenStatSuccess       = model.TokenStatSuccess
+	TokenStatFailure       = model.TokenStatFailure
+	TokenStatBilledNeutral = model.TokenStatBilledNeutral
+)
+
 // Store 数据持久化接口
 // [REFACTOR] 2025-12：合并子接口，所有方法平铺
 // 理由：8个子接口无任何地方被独立使用，所有消费者都依赖完整 Store
@@ -103,7 +113,7 @@ type Store interface {
 	UpdateAuthToken(ctx context.Context, token *model.AuthToken) error
 	DeleteAuthToken(ctx context.Context, id int64) error
 	UpdateTokenLastUsed(ctx context.Context, tokenHash string, now time.Time) error
-	UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64) error
+	UpdateTokenStats(ctx context.Context, tokenHash string, outcome model.TokenStatOutcome, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64) error
 	GetAuthTokenStatsInRange(ctx context.Context, startTime, endTime time.Time) (map[int64]*model.AuthTokenRangeStats, error)
 	FillAuthTokenRPMStats(ctx context.Context, stats map[int64]*model.AuthTokenRangeStats, startTime, endTime time.Time, isToday bool) error
 

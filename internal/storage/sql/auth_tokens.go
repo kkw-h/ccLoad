@@ -59,7 +59,7 @@ const updateTokenStatsQuery = `
 		success_count = success_count + CASE WHEN ? = 1 THEN 1 ELSE 0 END,
 		failure_count = failure_count + CASE WHEN ? = 1 THEN 1 ELSE 0 END,
 
-		-- 只有成功请求才累加 token 与费用（与内存费用缓存语义保持一致）
+		-- 计费请求才累加 token 与费用（成功=计费；499 中性计费也累加，与内存费用缓存语义一致）
 		prompt_tokens_total = prompt_tokens_total + CASE WHEN ? = 1 THEN ? ELSE 0 END,
 		completion_tokens_total = completion_tokens_total + CASE WHEN ? = 1 THEN ? ELSE 0 END,
 		cache_read_tokens_total = cache_read_tokens_total + CASE WHEN ? = 1 THEN ? ELSE 0 END,
@@ -773,7 +773,7 @@ func (s *SQLStore) UpdateTokenLastUsed(ctx context.Context, tokenHash string, no
 func (s *SQLStore) UpdateTokenStats(
 	ctx context.Context,
 	tokenHash string,
-	isSuccess bool,
+	outcome model.TokenStatOutcome,
 	duration float64,
 	isStreaming bool,
 	firstByteTime float64,
@@ -786,8 +786,11 @@ func (s *SQLStore) UpdateTokenStats(
 ) error {
 	// 单条 UPDATE 保证原子性：避免每次请求都做 BEGIN+SELECT+UPDATE+COMMIT
 	// 这对 SQLite（减少写锁持有时间/往返）和 MySQL（减少往返/行锁竞争）都更友好。
-	successFlag := boolToInt(isSuccess)
-	failureFlag := boolToInt(!isSuccess)
+	// 记账语义解耦：成功/失败计数与「usage/费用累加」分别由独立 flag 控制，
+	// 支持 499 中性计费（Bill 而不计成功/失败）。
+	successFlag := boolToInt(outcome.CountSuccess)
+	failureFlag := boolToInt(outcome.CountFailure)
+	billFlag := boolToInt(outcome.Bill)
 	streamUpdateFlag := boolToInt(isStreaming && firstByteTime > 0)
 	nonStreamUpdateFlag := boolToInt(!isStreaming)
 	nowMs := time.Now().UnixMilli()
@@ -796,13 +799,13 @@ func (s *SQLStore) UpdateTokenStats(
 	result, err := s.ExecContext(ctx, updateTokenStatsQuery,
 		successFlag,
 		failureFlag,
-		successFlag, promptTokens,
-		successFlag, completionTokens,
-		successFlag, cacheReadTokens,
-		successFlag, cacheCreationTokens,
-		successFlag, costUSD,
-		successFlag, effectiveCostUSD,
-		successFlag, costMicroUSD,
+		billFlag, promptTokens,
+		billFlag, completionTokens,
+		billFlag, cacheReadTokens,
+		billFlag, cacheCreationTokens,
+		billFlag, costUSD,
+		billFlag, effectiveCostUSD,
+		billFlag, costMicroUSD,
 		streamUpdateFlag, firstByteTime,
 		streamUpdateFlag,
 		nonStreamUpdateFlag, duration,

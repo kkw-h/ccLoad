@@ -40,7 +40,7 @@ func TestUpdateTokenStats_SingleUpdateSemantics(t *testing.T) {
 	}
 
 	// 失败请求：只累加失败次数；平均值仍应更新；token与费用不应累加。
-	if err := store.UpdateTokenStats(ctx, tokenHash, false, 2.0, false, 0, 10, 20, 3, 4, 1.23, 0.25); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatFailure(), 2.0, false, 0, 10, 20, 3, 4, 1.23, 0.25); err != nil {
 		t.Fatalf("update token stats (failure): %v", err)
 	}
 
@@ -63,7 +63,7 @@ func TestUpdateTokenStats_SingleUpdateSemantics(t *testing.T) {
 	}
 
 	// 成功请求：累加成功次数、token与费用；平均值继续更新。
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 4.0, false, 0, 10, 20, 3, 4, 0.5, 0.25); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 4.0, false, 0, 10, 20, 3, 4, 0.5, 0.25); err != nil {
 		t.Fatalf("update token stats (success): %v", err)
 	}
 
@@ -95,6 +95,47 @@ func TestUpdateTokenStats_SingleUpdateSemantics(t *testing.T) {
 	}
 }
 
+// 中性计费（499 客户端取消）：累加 token/费用与 cost_used，但成功/失败计数均不变。
+func TestUpdateTokenStats_BilledNeutralAccumulatesUsageButNotHealth(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	store, err := storage.CreateSQLiteStore(filepath.Join(tmp, "neutral.db"))
+	if err != nil {
+		t.Fatalf("create sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+	tokenHash := "neutral_hash"
+	if err := store.CreateAuthToken(ctx, &model.AuthToken{
+		Token: tokenHash, Description: "t", CreatedAt: time.Now(), IsActive: true,
+	}); err != nil {
+		t.Fatalf("create auth token: %v", err)
+	}
+
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatBilledNeutral(), 1.5, false, 0, 10, 20, 3, 4, 1.0, 0.5); err != nil {
+		t.Fatalf("update (billed neutral): %v", err)
+	}
+
+	got, err := store.GetAuthTokenByValue(ctx, tokenHash)
+	if err != nil {
+		t.Fatalf("get auth token: %v", err)
+	}
+	// 健康度：成功/失败都不 +1。
+	if got.SuccessCount != 0 || got.FailureCount != 0 {
+		t.Fatalf("中性计费不应计成功/失败: success=%d failure=%d", got.SuccessCount, got.FailureCount)
+	}
+	// 计费：token 与费用照常累加。
+	if got.PromptTokensTotal != 10 || got.CompletionTokensTotal != 20 ||
+		got.CacheReadTokensTotal != 3 || got.CacheCreationTokensTotal != 4 {
+		t.Fatalf("中性计费应累加 token: %+v", got)
+	}
+	if got.TotalCostUSD != 1.0 || got.EffectiveCostUSD != 0.5 || got.CostUsedMicroUSD != util.USDToMicroUSD(0.5) {
+		t.Fatalf("中性计费应累加费用: total=%v eff=%v used=%d", got.TotalCostUSD, got.EffectiveCostUSD, got.CostUsedMicroUSD)
+	}
+}
+
 func TestUpdateTokenStats_StreamingRequest(t *testing.T) {
 	t.Parallel()
 
@@ -119,7 +160,7 @@ func TestUpdateTokenStats_StreamingRequest(t *testing.T) {
 	}
 
 	// 第一次流式请求：TTFB = 100ms
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 0, true, 100.0, 10, 20, 0, 0, 0.1, 0.1); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 0, true, 100.0, 10, 20, 0, 0, 0.1, 0.1); err != nil {
 		t.Fatalf("update token stats (streaming 1): %v", err)
 	}
 
@@ -135,7 +176,7 @@ func TestUpdateTokenStats_StreamingRequest(t *testing.T) {
 	}
 
 	// 第二次流式请求：TTFB = 200ms，期望平均值 = (100+200)/2 = 150
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 0, true, 200.0, 5, 10, 0, 0, 0.05, 0.05); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 0, true, 200.0, 5, 10, 0, 0, 0.05, 0.05); err != nil {
 		t.Fatalf("update token stats (streaming 2): %v", err)
 	}
 
