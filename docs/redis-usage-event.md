@@ -1,7 +1,8 @@
 # ccLoad Redis 用量事件 —— 设计文档
 
-> 状态:设计定稿,待实现
+> 状态:✅ 已实现(Step 1-6 全部落地,含测试;`internal/...` 全绿、lint 零警告)
 > 范围:在请求结束、用量确定后,复用已归一化的 usage/cost,向 Redis 发布用量事件。
+> 关键落点:`internal/eventbus/`、`model/usage_event.go`、`model/token_stat.go`、`app/event_publisher.go`、`app/proxy_util.go:buildAttemptUsageEvent/fillEntryUsage`、`storage` 层 `TokenStatOutcome`。
 
 ## 1. 目标与原则
 

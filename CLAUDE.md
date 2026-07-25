@@ -86,7 +86,15 @@ internal/{model,config,version,testutil}/   web/  前端(HTML+assets/{css,js,loc
 - **Auth Token**:`cost_*_microusd`(微美元整数避浮点);仅 2xx 累加费用,失败只计次,允许「超额一个请求」;`CCLOAD_API_TOKENS` 启动预置
 - **Auth Token 访问控制**(`model/auth_token.go`、`auth_service.go`):`allowed_models` 模型白名单(空=无限制);`allowed_channel_ids`+`channel_restriction_mode`(`allow` 白名单/`deny` 黑名单,空 mode 视为 allow,空列表始终无限制),`ChannelRestriction.Allows` 封装极性,选择链路走 `FilterAllowedChannels`;`max_concurrency` 令牌级并发上限(0=无限),`acquireTokenConcurrencySlot` 获取槽位
 - **渠道每日限额** `daily_cost_limit`(美元,0=无限);`CostCache` 内存缓存按天重置
+- **499 中性计费**(客户端取消但上游已产 usage):按实际 usage 计费(进 `token_stats`/`CostCache`/auth_token 限额防薅),但不计成功/失败健康度。记账语义由 `model.TokenStatOutcome`(`TokenStatSuccess/Failure/BilledNeutral`)解耦「usage/费用累加」与「成功率计数」;`token_stats` token/cost 累加改用 `billFlag`(见 `sql/auth_tokens.go`)。注意:统计页 token/花费 SUM 含 499,调用数/成功率仍排除 499(刻意非对称)
 - **定价细节**(service_tier 倍率、GPT-5.4/Qwen-Plus 分层降档、Gemini 长上下文翻倍、缓存读折扣/写乘数):读 `cost_calculator.go`
+
+## 用量事件(Redis,可选)
+
+- 开关:`CCLOAD_REDIS`(DSN,空=`NoopPublisher` 禁用);`CCLOAD_REDIS_EVENT_STREAM`/`_MODE`(stream/pubsub)/`_BUFFER`
+- 设计:`internal/eventbus/`(`Publisher`+异步 worker+redis sink);事件字段复用请求结束时已归一化的 `LogEntry`(`buildAttemptUsageEvent`),不再解析 usage/重算成本
+- **attempt 事件**=计费权威,`LogService` 批量落库成功后发布(账实一致);**request 事件**=瘦汇总视图,请求收尾即发(`HandleProxyRequest` defer,不带 usage/cost)。消费端按 `request_id` 关联,禁止对两者同时求和;允许 request 先于 attempt 到达
+- Fail-open:Redis 不可用/队列满只丢弃计数,代理主链路零影响;详见 `docs/redis-usage-event.md`
 
 ## 存储
 
