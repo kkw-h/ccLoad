@@ -53,8 +53,8 @@ const (
 	DefaultBufferSize = 1024
 )
 
-// normalize 填充缺省值并归一化字段。
-func (c Config) normalize() Config {
+// Normalize 填充缺省值并归一化字段（幂等）。
+func (c Config) Normalize() Config {
 	c.DSN = strings.TrimSpace(c.DSN)
 	if c.Stream == "" {
 		c.Stream = DefaultStream
@@ -76,7 +76,7 @@ func (c Config) normalize() Config {
 // DSN 为空时返回 NoopPublisher（禁用）。构建 Redis 连接失败（DSN 非法）
 // 返回错误，交由调用方 Fail-Fast。
 func New(cfg Config) (Publisher, error) {
-	cfg = cfg.normalize()
+	cfg = cfg.Normalize()
 	if cfg.DSN == "" {
 		return NoopPublisher{}, nil
 	}

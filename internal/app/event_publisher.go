@@ -38,6 +38,8 @@ func newEventPublisherFromEnv() eventbus.Publisher {
 		}
 	}
 
+	// 归一化后再记录，日志才反映实际生效的 mode/stream（而非用户留空的原值）。
+	cfg = cfg.Normalize()
 	pub, err := eventbus.New(cfg)
 	if err != nil {
 		log.Fatalf("[FATAL] 初始化 Redis 用量事件发布器失败: %v", err)
