@@ -12,16 +12,17 @@ func TestBuildLogEntry_UsageEventReusesNormalizedFields(t *testing.T) {
 	t.Parallel()
 
 	entry := buildLogEntry(logEntryParams{
-		RequestModel:   "claude-sonnet",
-		ActualModel:    "claude-sonnet-real",
-		StatusCode:     http.StatusOK,
-		ChannelID:      42,
-		AuthTokenID:    7,
-		ClientIP:       "1.2.3.4",
-		CostMultiplier: 2,
-		TokenHash:      "hash-abc",
-		RequestID:      "req-1",
-		AttemptSeq:     3,
+		RequestModel:     "claude-sonnet",
+		ActualModel:      "claude-sonnet-real",
+		StatusCode:       http.StatusOK,
+		ChannelID:        42,
+		AuthTokenID:      7,
+		ClientIP:         "1.2.3.4",
+		CostMultiplier:   2,
+		TokenHash:        "hash-abc",
+		TokenEnvironment: "dev",
+		RequestID:        "req-1",
+		AttemptSeq:       3,
 		Result: &fwResult{
 			InputTokens:          100,
 			OutputTokens:         200,
@@ -39,6 +40,9 @@ func TestBuildLogEntry_UsageEventReusesNormalizedFields(t *testing.T) {
 	if ev.RequestID != "req-1" || ev.AttemptSeq != 3 || ev.TokenHash != "hash-abc" {
 		t.Fatalf("关联字段不符: %+v", ev)
 	}
+	if ev.Environment != "dev" {
+		t.Fatalf("environment=%q, want dev", ev.Environment)
+	}
 	// usage 逐字段复用 entry。
 	if ev.InputTokens != entry.InputTokens || ev.OutputTokens != entry.OutputTokens ||
 		ev.CacheReadInputTokens != entry.CacheReadInputTokens {
@@ -50,6 +54,31 @@ func TestBuildLogEntry_UsageEventReusesNormalizedFields(t *testing.T) {
 	}
 	if want := entry.Cost * entry.CostMultiplier; ev.EffectiveCostUSD != want {
 		t.Fatalf("effective=%v, want %v", ev.EffectiveCostUSD, want)
+	}
+}
+
+func TestExtractUsageEventEnvironmentFromTokenDescription(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		description string
+		want        string
+	}{
+		{name: "medge dev token", description: "sedna-dev-user-123", want: "dev"},
+		{name: "medge test token", description: "sedna-test-user-456", want: "test"},
+		{name: "hyphen env", description: "sedna-staging-cn-user-456", want: "staging-cn"},
+		{name: "legacy description", description: "manual token", want: ""},
+		{name: "empty env rejected", description: "sedna--user-1", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := extractUsageEventEnvironment(tt.description); got != tt.want {
+				t.Fatalf("extractUsageEventEnvironment(%q)=%q, want %q", tt.description, got, tt.want)
+			}
+		})
 	}
 }
 

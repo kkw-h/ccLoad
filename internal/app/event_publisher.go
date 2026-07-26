@@ -16,7 +16,7 @@ import (
 // newEventPublisherFromEnv 从环境变量构建用量事件发布器。
 //
 //   - CCLOAD_REDIS 为空 → NoopPublisher（禁用，代理主链路零影响）
-//   - CCLOAD_REDIS_EVENT_STREAM / _MODE / _BUFFER 覆盖默认值
+//   - CCLOAD_REDIS_EVENT_STREAM / _STREAM_PATTERN / _MODE / _BUFFER 覆盖默认值
 //
 // DSN 非法时按项目 Fail-Fast 约定 log.Fatal 退出。
 func newEventPublisherFromEnv() eventbus.Publisher {
@@ -26,9 +26,10 @@ func newEventPublisherFromEnv() eventbus.Publisher {
 	}
 
 	cfg := eventbus.Config{
-		DSN:    dsn,
-		Stream: strings.TrimSpace(os.Getenv("CCLOAD_REDIS_EVENT_STREAM")),
-		Mode:   eventbus.TransportMode(strings.TrimSpace(os.Getenv("CCLOAD_REDIS_EVENT_MODE"))),
+		DSN:           dsn,
+		Stream:        strings.TrimSpace(os.Getenv("CCLOAD_REDIS_EVENT_STREAM")),
+		StreamPattern: strings.TrimSpace(os.Getenv("CCLOAD_REDIS_EVENT_STREAM_PATTERN")),
+		Mode:          eventbus.TransportMode(strings.TrimSpace(os.Getenv("CCLOAD_REDIS_EVENT_MODE"))),
 	}
 	if v := strings.TrimSpace(os.Getenv("CCLOAD_REDIS_EVENT_BUFFER")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -44,7 +45,7 @@ func newEventPublisherFromEnv() eventbus.Publisher {
 	if err != nil {
 		log.Fatalf("[FATAL] 初始化 Redis 用量事件发布器失败: %v", err)
 	}
-	log.Printf("[INFO] 用量事件已启用（Redis mode=%s stream=%s）", cfg.Mode, cfg.Stream)
+	log.Printf("[INFO] 用量事件已启用（Redis mode=%s stream=%s stream_pattern=%s）", cfg.Mode, cfg.Stream, cfg.StreamPattern)
 	return pub
 }
 
@@ -65,6 +66,7 @@ func (s *Server) publishRequestUsageEvent(c *gin.Context, reqCtx *proxyRequestCo
 		AttemptSeq:  0,
 		Kind:        model.UsageEventRequest,
 		Time:        model.JSONTime{Time: time.Now()},
+		Environment: reqCtx.tokenEnvironment,
 		TokenHash:   reqCtx.tokenHash,
 		AuthTokenID: reqCtx.tokenID,
 		Model:       reqCtx.originalModel,

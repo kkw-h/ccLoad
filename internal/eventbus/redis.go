@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/bytedance/sonic"
 	"github.com/redis/go-redis/v9"
@@ -12,9 +13,10 @@ import (
 
 // redisSink 将用量事件序列化为 JSON 后写入 Redis。
 type redisSink struct {
-	client *redis.Client
-	stream string
-	mode   TransportMode
+	client        *redis.Client
+	stream        string
+	streamPattern string
+	mode          TransportMode
 }
 
 func newRedisSink(cfg Config) (*redisSink, error) {
@@ -23,9 +25,10 @@ func newRedisSink(cfg Config) (*redisSink, error) {
 		return nil, fmt.Errorf("解析 CCLOAD_REDIS DSN 失败: %w", err)
 	}
 	return &redisSink{
-		client: redis.NewClient(opt),
-		stream: cfg.Stream,
-		mode:   cfg.Mode,
+		client:        redis.NewClient(opt),
+		stream:        cfg.Stream,
+		streamPattern: cfg.StreamPattern,
+		mode:          cfg.Mode,
 	}, nil
 }
 
@@ -36,13 +39,23 @@ func (s *redisSink) send(ctx context.Context, ev *model.UsageEvent) error {
 	}
 	switch s.mode {
 	case ModePubSub:
-		return s.client.Publish(ctx, s.stream, payload).Err()
+		return s.client.Publish(ctx, s.streamName(ev), payload).Err()
 	default:
 		return s.client.XAdd(ctx, &redis.XAddArgs{
-			Stream: s.stream,
+			Stream: s.streamName(ev),
 			Values: map[string]any{"data": payload},
 		}).Err()
 	}
+}
+
+func (s *redisSink) streamName(ev *model.UsageEvent) string {
+	if ev == nil || ev.Environment == "" || s.streamPattern == "" {
+		return s.stream
+	}
+	if !strings.Contains(s.streamPattern, "{env}") {
+		return s.stream
+	}
+	return strings.ReplaceAll(s.streamPattern, "{env}", ev.Environment)
 }
 
 func (s *redisSink) Close() error {

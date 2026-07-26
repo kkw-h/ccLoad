@@ -125,9 +125,12 @@ UsageEvent *UsageEvent `json:"-"` // 落库成功后发布
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `CCLOAD_REDIS` | 空 | DSN,如 `redis://:pass@host:6379/0`;空 = 装配 Noop,整链关闭 |
-| `CCLOAD_REDIS_EVENT_STREAM` | `ccload:usage` | Stream/channel 名 |
+| `CCLOAD_REDIS_EVENT_STREAM` | `ccload:usage` | 默认 Stream/channel 名 |
+| `CCLOAD_REDIS_EVENT_STREAM_PATTERN` | 空 | 多环境 Stream 模板，例如 `ccload:{env}:usage`；事件带环境时替换 `{env}`，否则回退默认 Stream |
 | `CCLOAD_REDIS_EVENT_MODE` | `stream` | `stream`(XADD)/ `pubsub` |
 | `CCLOAD_REDIS_EVENT_BUFFER` | 沿用 `DefaultTokenStatsBufferSize` 量级 | 事件队列容量 |
+
+多环境部署时，medge 注册到 ccLoad 的 API 令牌描述需使用 `sedna-<env>-user-<uid>` 约定。ccLoad 会从描述中提取 `<env>` 写入事件 `environment` 字段，并在配置了 `CCLOAD_REDIS_EVENT_STREAM_PATTERN=ccload:{env}:usage` 时分别写入 `ccload:dev:usage`、`ccload:test:usage` 等环境流。旧令牌或非约定描述不会带环境，继续写入 `CCLOAD_REDIS_EVENT_STREAM`。
 
 ## 6. 改动清单(逐文件)
 

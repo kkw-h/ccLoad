@@ -41,10 +41,11 @@ const (
 
 // Config 描述事件总线配置，通常从环境变量解析。
 type Config struct {
-	DSN        string        // Redis DSN；空表示禁用（装配 NoopPublisher）
-	Stream     string        // Stream / 频道名
-	Mode       TransportMode // stream / pubsub
-	BufferSize int           // 事件队列容量
+	DSN           string        // Redis DSN；空表示禁用（装配 NoopPublisher）
+	Stream        string        // 默认 Stream / 频道名
+	StreamPattern string        // 多环境 Stream 模板，支持 {env} 占位符；事件无环境时回退 Stream
+	Mode          TransportMode // stream / pubsub
+	BufferSize    int           // 事件队列容量
 }
 
 // 默认值。
@@ -59,6 +60,7 @@ func (c Config) Normalize() Config {
 	if c.Stream == "" {
 		c.Stream = DefaultStream
 	}
+	c.StreamPattern = strings.TrimSpace(c.StreamPattern)
 	switch c.Mode {
 	case ModePubSub:
 		// keep

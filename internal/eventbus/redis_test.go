@@ -66,6 +66,65 @@ func TestRedisSink_Stream(t *testing.T) {
 	assertPayload(t, streamFieldValue(t, stream[0].Values, "data"))
 }
 
+func TestRedisSink_StreamPatternRoutesByEnvironment(t *testing.T) {
+	mr := miniredis.RunT(t)
+	sink, err := newRedisSink(Config{
+		DSN:           "redis://" + mr.Addr(),
+		Stream:        "ccload:usage",
+		StreamPattern: "ccload:{env}:usage",
+		Mode:          ModeStream,
+	})
+	if err != nil {
+		t.Fatalf("newRedisSink: %v", err)
+	}
+	defer func() { _ = sink.Close() }()
+
+	ev := sampleEvent()
+	ev.Environment = "dev"
+	if err := sink.send(context.Background(), ev); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	stream, err := mr.Stream("ccload:dev:usage")
+	if err != nil {
+		t.Fatalf("读取 env stream: %v", err)
+	}
+	if len(stream) != 1 {
+		t.Fatalf("env stream 条目数=%d, 期望 1", len(stream))
+	}
+	assertPayload(t, streamFieldValue(t, stream[0].Values, "data"))
+	defaultStream, _ := mr.Stream("ccload:usage")
+	if len(defaultStream) != 0 {
+		t.Fatalf("带 environment 的事件不应写入默认 stream，实际条目数=%d", len(defaultStream))
+	}
+}
+
+func TestRedisSink_StreamPatternFallsBackWithoutEnvironment(t *testing.T) {
+	mr := miniredis.RunT(t)
+	sink, err := newRedisSink(Config{
+		DSN:           "redis://" + mr.Addr(),
+		Stream:        "ccload:usage",
+		StreamPattern: "ccload:{env}:usage",
+		Mode:          ModeStream,
+	})
+	if err != nil {
+		t.Fatalf("newRedisSink: %v", err)
+	}
+	defer func() { _ = sink.Close() }()
+
+	if err := sink.send(context.Background(), sampleEvent()); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	stream, err := mr.Stream("ccload:usage")
+	if err != nil {
+		t.Fatalf("读取默认 stream: %v", err)
+	}
+	if len(stream) != 1 {
+		t.Fatalf("默认 stream 条目数=%d, 期望 1", len(stream))
+	}
+}
+
 // streamFieldValue 从 miniredis StreamEntry 的扁平 field/value 切片中取指定字段。
 func streamFieldValue(t *testing.T, values []string, field string) string {
 	t.Helper()

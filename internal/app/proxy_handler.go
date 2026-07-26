@@ -274,6 +274,8 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 	tokenID, _ := c.Get("token_id")
 	tokenIDInt64, _ := tokenID.(int64)
+	tokenEnvironment, _ := c.Get("token_environment")
+	tokenEnvironmentStr, _ := tokenEnvironment.(string)
 
 	if !s.enforceTokenLimits(c, tokenHashStr, incoming.authorizationModel()) {
 		return
@@ -332,22 +334,23 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 
 	reqCtx := &proxyRequestContext{
-		originalModel:  originalModel,
-		clientProtocol: clientProtocol,
-		requestMethod:  requestMethod,
-		requestPath:    effectiveRequestPath,
-		rawQuery:       c.Request.URL.RawQuery,
-		body:           all,
-		translatedBody: all,
-		header:         c.Request.Header,
-		isStreaming:    isStreaming,
-		tokenHash:      tokenHashStr,
-		tokenID:        tokenIDInt64,
-		clientIP:       c.ClientIP(),
-		activeReqID:    activeID,
-		startTime:      startTime,
-		thinkingEffort: thinkingEffort,
-		requestID:      util.NewUUIDv4(),
+		originalModel:    originalModel,
+		clientProtocol:   clientProtocol,
+		requestMethod:    requestMethod,
+		requestPath:      effectiveRequestPath,
+		rawQuery:         c.Request.URL.RawQuery,
+		body:             all,
+		translatedBody:   all,
+		header:           c.Request.Header,
+		isStreaming:      isStreaming,
+		tokenHash:        tokenHashStr,
+		tokenEnvironment: tokenEnvironmentStr,
+		tokenID:          tokenIDInt64,
+		clientIP:         c.ClientIP(),
+		activeReqID:      activeID,
+		startTime:        startTime,
+		thinkingEffort:   thinkingEffort,
+		requestID:        util.NewUUIDv4(),
 	}
 	reqCtx.observer = &ForwardObserver{
 		OnBytesRead: func(n int64) {
