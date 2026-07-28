@@ -365,11 +365,11 @@ rtk git commit -m "feat: edit external auth environments"
 - 修改：`internal/app/proxy_responses_websocket.go`
 - 修改相应的 Go 测试和原外部鉴权实现计划完成标记。
 
-- [ ] **步骤 1：完成原计划 HTTP/SSE 与 WebSocket 接入时的环境测试**
+- [x] **步骤 1：完成原计划 HTTP/SSE 与 WebSocket 接入时的环境测试**
 
 HTTP/SSE 请求从 Gin 原始 Header 使用 `c.Request.Header.Values("X-Sedna-Env")`，要求恰好一份；迁移 CIDR 绕过发生在环境要求之前。WebSocket 握手保存已规范化环境，每个 `response.create` 使用同一环境重新鉴权。
 
-- [ ] **步骤 2：运行定向测试**
+- [x] **步骤 2：运行定向测试**
 
 ```bash
 rtk go test -tags sonic ./internal/app -run 'ExternalAuth|ResponsesWebsocket.*Auth'
@@ -377,7 +377,7 @@ rtk go test -tags sonic ./internal/app -run 'ExternalAuth|ResponsesWebsocket.*Au
 
 预期：PASS。
 
-- [ ] **步骤 3：运行静态与全量验证**
+- [x] **步骤 3：运行静态与全量验证**
 
 ```bash
 rtk gofmt -w internal/app internal/model internal/storage
@@ -388,7 +388,7 @@ rtk npm test
 
 预期：全部通过且无诊断。
 
-- [ ] **步骤 4：执行敏感数据回归搜索**
+- [x] **步骤 4：执行敏感数据回归搜索**
 
 ```bash
 rtk rg -n 'X-Sedna-Env|X-Ccload-Token|X-Original-Authorization' internal web
@@ -396,7 +396,7 @@ rtk rg -n 'X-Sedna-Env|X-Ccload-Token|X-Original-Authorization' internal web
 
 预期：`X-Sedna-Env` 只进入规范化、路由、authz 出站请求和非敏感审计；JWT 与 ccLoad Token 不进入日志、数据库、Redis 或客户端响应。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 rtk git add internal web docs/superpowers/plans

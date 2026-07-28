@@ -430,9 +430,14 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 		var token string
 		var tokenFound bool
 
+		if identity, ok := externalAuthIdentityFromContext(c); ok {
+			token = identity.CCLoadToken
+			tokenFound = token != ""
+		}
+
 		// 检查 Authorization 头（Bearer token）
 		authHeader := c.GetHeader("Authorization")
-		if authHeader != "" {
+		if !tokenFound && authHeader != "" {
 			const prefix = "Bearer "
 			if strings.HasPrefix(authHeader, prefix) {
 				token = strings.TrimPrefix(authHeader, prefix)

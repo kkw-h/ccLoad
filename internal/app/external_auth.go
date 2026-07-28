@@ -19,6 +19,7 @@ import (
 
 	"ccLoad/internal/model"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
@@ -58,6 +59,14 @@ type externalAuthRequest struct {
 }
 
 type externalAuthResult struct {
+	ExternalUserID string
+	CCLoadToken    string
+	ExpiresAt      time.Time
+}
+
+const externalAuthIdentityContextKey = "ccLoad.externalAuthIdentity"
+
+type externalAuthIdentity struct {
 	ExternalUserID string
 	CCLoadToken    string
 	ExpiresAt      time.Time
@@ -143,6 +152,107 @@ func (s *ExternalAuthService) Metrics() externalAuthMetricsSnapshot {
 		Bypassed:        s.stats.bypassed.Load(),
 		DurationMSTotal: s.stats.durationNanos.Load() / int64(time.Millisecond),
 	}
+}
+
+func (s *ExternalAuthService) Middleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || !s.config.Enabled {
+			c.Next()
+			return
+		}
+		if s.bypassesClientIP(c.ClientIP()) {
+			s.stats.bypassed.Add(1)
+			c.Next()
+			return
+		}
+
+		originalAuthorization := c.GetHeader("Authorization")
+		if originalAuthorization == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or missing authorization"})
+			c.Abort()
+			return
+		}
+		environmentHeaders := c.Request.Header.Values("X-Sedna-Env")
+		if len(environmentHeaders) != 1 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "external authorization environment denied"})
+			c.Abort()
+			return
+		}
+		modelName, stream := readExternalAuthRequestMetadata(c.Request)
+
+		result, err := s.Authorize(c.Request.Context(), externalAuthRequest{
+			Environment:           environmentHeaders[0],
+			RequestID:             c.GetHeader("X-Request-Id"),
+			Method:                c.Request.Method,
+			Path:                  c.Request.URL.Path,
+			Model:                 modelName,
+			Stream:                stream,
+			ClientIP:              c.ClientIP(),
+			OriginalAuthorization: originalAuthorization,
+		})
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if isExternalAuthErrorKind(err, externalAuthErrorDenied) {
+				status = http.StatusForbidden
+			}
+			c.JSON(status, gin.H{"error": err.Error()})
+			c.Abort()
+			return
+		}
+		c.Set(externalAuthIdentityContextKey, externalAuthIdentity{
+			ExternalUserID: result.ExternalUserID,
+			CCLoadToken:    result.CCLoadToken,
+			ExpiresAt:      result.ExpiresAt,
+		})
+		c.Next()
+	}
+}
+
+func readExternalAuthRequestMetadata(req *http.Request) (string, bool) {
+	if req == nil || req.Body == nil {
+		return "", false
+	}
+	var captured bytes.Buffer
+	reader := io.TeeReader(req.Body, &captured)
+	var metadata struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	err := json.NewDecoder(io.LimitReader(reader, 1<<20)).Decode(&metadata)
+	req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(captured.Bytes()), req.Body))
+	if err != nil {
+		return "", false
+	}
+	return metadata.Model, metadata.Stream
+}
+
+func (s *ExternalAuthService) bypassesClientIP(raw string) bool {
+	if s == nil || len(s.config.BypassPrefixes) == 0 {
+		return false
+	}
+	ip, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	for _, prefix := range s.config.BypassPrefixes {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func externalAuthIdentityFromContext(c *gin.Context) (externalAuthIdentity, bool) {
+	if c == nil {
+		return externalAuthIdentity{}, false
+	}
+	value, ok := c.Get(externalAuthIdentityContextKey)
+	if !ok {
+		return externalAuthIdentity{}, false
+	}
+	identity, ok := value.(externalAuthIdentity)
+	return identity, ok
 }
 
 func (s *ExternalAuthService) Authorize(
@@ -378,6 +488,84 @@ func parseExternalAuthBypassPrefixes(raw string) ([]netip.Prefix, error) {
 		prefixes = append(prefixes, prefix.Masked())
 	}
 	return prefixes, nil
+}
+
+func externalAuthConfigFromConfigService(configService *ConfigService) (externalAuthConfig, error) {
+	if configService == nil {
+		return externalAuthConfig{}, fmt.Errorf("external auth config service is required")
+	}
+	timeoutMS := configService.GetInt("external_auth_timeout_ms", 2000)
+	maxRetries := configService.GetInt("external_auth_max_retries", 2)
+	if timeoutMS < externalAuthMinTimeoutMS || timeoutMS > externalAuthMaxTimeoutMS {
+		return externalAuthConfig{}, fmt.Errorf(
+			"external auth timeout must be between %d and %d milliseconds",
+			externalAuthMinTimeoutMS,
+			externalAuthMaxTimeoutMS,
+		)
+	}
+	if maxRetries < 0 || maxRetries > externalAuthMaxRetries {
+		return externalAuthConfig{}, fmt.Errorf("external auth max retries must be between 0 and %d", externalAuthMaxRetries)
+	}
+	prefixes, err := parseExternalAuthBypassPrefixes(configService.GetString("external_auth_bypass_cidrs", ""))
+	if err != nil {
+		return externalAuthConfig{}, err
+	}
+	return externalAuthConfig{
+		Enabled:        configService.GetBool("external_auth_enabled", false),
+		Environments:   make(map[string]externalAuthEnvironmentTarget),
+		Timeout:        time.Duration(timeoutMS) * time.Millisecond,
+		MaxRetries:     maxRetries,
+		BypassPrefixes: prefixes,
+	}, nil
+}
+
+func newExternalAuthHTTPClient(resolver externalAuthResolver) *http.Client {
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	transport := &http.Transport{
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	transport.Proxy = nil
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("parse external auth address: %w", err)
+		}
+		addrs, err := resolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("resolve external auth host: %w", err)
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("external auth host resolved to no addresses")
+		}
+		for _, resolved := range addrs {
+			addr, ok := netip.AddrFromSlice(resolved.IP)
+			if !ok || isUnsafeExternalAuthIP(addr.Unmap()) {
+				return nil, fmt.Errorf("external auth host resolved to a non-public address")
+			}
+		}
+		var lastErr error
+		for _, resolved := range addrs {
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, fmt.Errorf("connect external auth host: %w", lastErr)
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 func validateExternalAuthEndpoint(

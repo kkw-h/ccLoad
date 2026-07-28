@@ -199,6 +199,14 @@ func validateSettingValue(key, valueType, value string) error {
 		}
 		// 按配置项定义具体约束
 		switch key {
+		case "external_auth_timeout_ms":
+			if intVal < externalAuthMinTimeoutMS || intVal > externalAuthMaxTimeoutMS {
+				return fmt.Errorf("external_auth_timeout_ms must be between %d and %d", externalAuthMinTimeoutMS, externalAuthMaxTimeoutMS)
+			}
+		case "external_auth_max_retries":
+			if intVal < 0 || intVal > externalAuthMaxRetries {
+				return fmt.Errorf("external_auth_max_retries must be between 0 and %d", externalAuthMaxRetries)
+			}
 		case "max_key_retries":
 			if intVal < 1 {
 				return fmt.Errorf("max_key_retries must be >= 1")
@@ -271,6 +279,10 @@ func validateSettingValue(key, valueType, value string) error {
 		case "log_channel_click_action":
 			if value != "edit" && value != "navigate" {
 				return fmt.Errorf("log_channel_click_action must be edit or navigate")
+			}
+		case "external_auth_bypass_cidrs":
+			if _, err := parseExternalAuthBypassPrefixes(value); err != nil {
+				return err
 			}
 		}
 

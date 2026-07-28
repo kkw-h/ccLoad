@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"ccLoad/internal/model"
 )
 
 type staticExternalAuthResolver struct {
@@ -70,6 +72,25 @@ func TestParseExternalAuthConfigRejectsInvalidValues(t *testing.T) {
 				t.Fatal("parseExternalAuthConfig() error = nil, want error")
 			}
 		})
+	}
+}
+
+func TestExternalAuthConfigFromConfigServiceUsesManagedEnvironments(t *testing.T) {
+	service := &ConfigService{cache: map[string]*model.SystemSetting{
+		"external_auth_enabled":      {Value: "true"},
+		"external_auth_timeout_ms":   {Value: "1500"},
+		"external_auth_max_retries":  {Value: "1"},
+		"external_auth_bypass_cidrs": {Value: "203.0.113.7"},
+	}}
+	cfg, err := externalAuthConfigFromConfigService(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Enabled || cfg.Timeout != 1500*time.Millisecond || cfg.MaxRetries != 1 {
+		t.Fatalf("config = %+v", cfg)
+	}
+	if cfg.Environments == nil {
+		t.Fatal("managed environments map must be non-nil to fail closed")
 	}
 }
 
