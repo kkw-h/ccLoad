@@ -186,6 +186,74 @@ func TestExternalAuthAuthorizeRejectsExpiringToken(t *testing.T) {
 	}
 }
 
+func TestExternalAuthAuthorizeSelectsConfiguredEnvironment(t *testing.T) {
+	var developCalls atomic.Int32
+	develop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		developCalls.Add(1)
+		if got := r.Header.Get("X-Sedna-Env"); got != "develop" {
+			t.Errorf("X-Sedna-Env = %q, want develop", got)
+		}
+		w.Header().Set("X-User-Id", "d9428888-122b-11e1-b85c-61cd3cbb3210")
+		w.Header().Set("X-Ccload-Token", "develop-local-secret")
+		w.Header().Set("X-Authz-Token-Exp", strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer develop.Close()
+
+	service := newTestExternalAuthServiceWithEnvironments(t, develop.Client(), map[string]string{
+		"develop": develop.URL,
+	})
+	result, err := service.Authorize(context.Background(), externalAuthRequest{
+		Environment:           "develop",
+		OriginalAuthorization: "Bearer platform-jwt",
+	})
+	if err != nil {
+		t.Fatalf("Authorize() error = %v", err)
+	}
+	if result.CCLoadToken != "develop-local-secret" || developCalls.Load() != 1 {
+		t.Fatalf("result = %#v, calls = %d", result, developCalls.Load())
+	}
+}
+
+func TestExternalAuthAuthorizeRejectsUnknownEnvironmentBeforeNetwork(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	defer server.Close()
+
+	service := newTestExternalAuthServiceWithEnvironments(t, server.Client(), map[string]string{
+		"develop": server.URL,
+	})
+	_, err := service.Authorize(context.Background(), externalAuthRequest{
+		Environment:           "test",
+		OriginalAuthorization: "Bearer platform-jwt",
+	})
+	if !isExternalAuthErrorKind(err, externalAuthErrorDenied) {
+		t.Fatalf("Authorize() error = %v, want denied", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("network calls = %d, want 0", calls.Load())
+	}
+}
+
+func newTestExternalAuthServiceWithEnvironments(t *testing.T, client *http.Client, raw map[string]string) *ExternalAuthService {
+	t.Helper()
+	targets := make(map[string]externalAuthEnvironmentTarget, len(raw))
+	for environment, endpoint := range raw {
+		parsed, err := url.Parse(endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets[environment] = externalAuthEnvironmentTarget{Environment: environment, AuthzURL: parsed}
+	}
+	return newExternalAuthService(externalAuthConfig{
+		Enabled:      true,
+		Environments: targets,
+		Timeout:      time.Second,
+	}, client, func(time.Duration) time.Duration { return 0 })
+}
+
 func newTestExternalAuthService(t *testing.T, server *httptest.Server, retries int) *ExternalAuthService {
 	t.Helper()
 	endpoint, err := url.Parse(server.URL)

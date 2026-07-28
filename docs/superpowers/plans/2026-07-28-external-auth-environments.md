@@ -138,7 +138,7 @@ rtk git commit -m "feat: persist external auth environments"
 - 修改：`internal/app/external_auth.go`
 - 修改：`internal/app/external_auth_test.go`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```go
 func TestExternalAuthAuthorizeSelectsConfiguredEnvironment(t *testing.T) {
@@ -167,7 +167,7 @@ func TestExternalAuthAuthorizeRejectsUnknownEnvironmentBeforeNetwork(t *testing.
 
 增加缺失、空白、重复 Header解析、非法大写、停用环境以及 develop/test 分别选择不同 URL 的测试。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -177,7 +177,7 @@ rtk go test -tags sonic ./internal/app -run 'ExternalAuth.*Environment'
 
 预期：FAIL，`externalAuthRequest` 没有 `Environment`，服务仍使用单一 `WebhookURL`。
 
-- [ ] **步骤 3：编写最少实现**
+- [x] **步骤 3：编写最少实现**
 
 ```go
 type externalAuthEnvironmentTarget struct {
@@ -209,7 +209,7 @@ req.Header.Set("X-Original-Authorization", originalAuthorization)
 
 未知、缺失、非法和停用环境统一返回 denied，不在错误中包含已配置环境列表或 URL。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：
 
@@ -219,7 +219,7 @@ rtk go test -tags sonic ./internal/app -run 'ExternalAuth.*Environment|ExternalA
 
 预期：PASS。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 rtk git add internal/app/external_auth.go internal/app/external_auth_test.go

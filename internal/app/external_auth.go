@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ccLoad/internal/model"
+
 	"github.com/google/uuid"
 )
 
@@ -28,9 +30,15 @@ const (
 type externalAuthConfig struct {
 	Enabled        bool
 	WebhookURL     *url.URL
+	Environments   map[string]externalAuthEnvironmentTarget
 	Timeout        time.Duration
 	MaxRetries     int
 	BypassPrefixes []netip.Prefix
+}
+
+type externalAuthEnvironmentTarget struct {
+	Environment string
+	AuthzURL    *url.URL
 }
 
 type externalAuthResolver interface {
@@ -38,6 +46,7 @@ type externalAuthResolver interface {
 }
 
 type externalAuthRequest struct {
+	Environment           string `json:"-"`
 	RequestID             string `json:"request_id"`
 	Method                string `json:"method"`
 	Path                  string `json:"path"`
@@ -143,6 +152,11 @@ func (s *ExternalAuthService) Authorize(
 	defer func() {
 		s.stats.durationNanos.Add(s.now().Sub(started).Nanoseconds())
 	}()
+	target, err := s.environmentTarget(input.Environment)
+	if err != nil {
+		s.stats.denied.Add(1)
+		return externalAuthResult{}, err
+	}
 
 	payload, err := json.Marshal(input)
 	if err != nil {
@@ -157,7 +171,7 @@ func (s *ExternalAuthService) Authorize(
 				return externalAuthResult{}, unavailableExternalAuthError("authorization request canceled")
 			}
 		}
-		result, retry, err := s.authorizeAttempt(ctx, input.OriginalAuthorization, payload)
+		result, retry, err := s.authorizeAttempt(ctx, target, input.OriginalAuthorization, payload)
 		if err == nil {
 			s.stats.allowed.Add(1)
 			return result, nil
@@ -176,17 +190,21 @@ func (s *ExternalAuthService) Authorize(
 
 func (s *ExternalAuthService) authorizeAttempt(
 	ctx context.Context,
+	target externalAuthEnvironmentTarget,
 	originalAuthorization string,
 	payload []byte,
 ) (externalAuthResult, bool, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, s.config.WebhookURL.String(), bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, target.AuthzURL.String(), bytes.NewReader(payload))
 	if err != nil {
 		return externalAuthResult{}, false, unavailableExternalAuthError("build authorization request")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Original-Authorization", originalAuthorization)
+	if target.Environment != "" {
+		req.Header.Set("X-Sedna-Env", target.Environment)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return externalAuthResult{}, true, unavailableExternalAuthError("authorization service request failed")
@@ -226,6 +244,24 @@ func (s *ExternalAuthService) authorizeAttempt(
 		CCLoadToken:    ccLoadToken,
 		ExpiresAt:      expiresAt,
 	}, false, nil
+}
+
+func (s *ExternalAuthService) environmentTarget(raw string) (externalAuthEnvironmentTarget, error) {
+	if len(s.config.Environments) == 0 {
+		if s.config.WebhookURL != nil {
+			return externalAuthEnvironmentTarget{AuthzURL: s.config.WebhookURL}, nil
+		}
+		return externalAuthEnvironmentTarget{}, unavailableExternalAuthError("authorization service is not configured")
+	}
+	environment, err := model.NormalizeExternalAuthEnvironment(raw)
+	if err != nil {
+		return externalAuthEnvironmentTarget{}, &externalAuthError{kind: externalAuthErrorDenied, msg: "external authorization environment denied"}
+	}
+	target, ok := s.config.Environments[environment]
+	if !ok || target.AuthzURL == nil || target.Environment != environment {
+		return externalAuthEnvironmentTarget{}, &externalAuthError{kind: externalAuthErrorDenied, msg: "external authorization environment denied"}
+	}
+	return target, nil
 }
 
 func unavailableExternalAuthError(msg string) error {
