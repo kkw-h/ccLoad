@@ -57,6 +57,8 @@ type Server struct {
 	skipTLSVerify                 bool                  // 透传给渠道级 Transport
 	activeRequests                *activeRequestManager // 进行中请求（内存状态，不持久化）
 	responsesExecutionSessions    *responsesExecutionSessionStore
+	externalAuthService           *ExternalAuthService
+	externalAuthResolver          externalAuthResolver
 	scheduledChannelChecksRunning atomic.Bool
 
 	// 异步统计（有界队列，避免每请求起goroutine）
@@ -1028,6 +1030,10 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.PUT("/settings/:key", s.AdminUpdateSetting)
 		admin.POST("/settings/:key/reset", s.AdminResetSetting)
 		admin.POST("/settings/batch", s.AdminBatchUpdateSettings)
+		admin.GET("/external-auth/environments", s.AdminListExternalAuthEnvironments)
+		admin.POST("/external-auth/environments", s.AdminCreateExternalAuthEnvironment)
+		admin.PUT("/external-auth/environments/:id", s.AdminUpdateExternalAuthEnvironment)
+		admin.DELETE("/external-auth/environments/:id", s.AdminDeleteExternalAuthEnvironment)
 
 		// 模型指纹
 		admin.GET("/fingerprints", s.HandleListFingerprints)

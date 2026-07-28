@@ -234,7 +234,7 @@ rtk git commit -m "feat: route external auth by environment"
 - 修改：`internal/app/server.go`
 - 修改：`internal/app/server_test.go`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```go
 func TestAdminExternalAuthEnvironmentCRUD(t *testing.T) {
@@ -257,7 +257,7 @@ func TestAdminExternalAuthEnvironmentCRUD(t *testing.T) {
 
 增加 GET、PUT、DELETE、404、非法环境名、HTTP URL、私网/环回 SSRF 地址、保存后快照立即更新，以及启用总开关但没有活动环境时拒绝的测试。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -267,7 +267,7 @@ rtk go test -tags sonic ./internal/app -run 'AdminExternalAuthEnvironment|Extern
 
 预期：FAIL，handler 和路由尚不存在。
 
-- [ ] **步骤 3：编写最少实现**
+- [x] **步骤 3：编写最少实现**
 
 管理路由：
 
@@ -280,7 +280,7 @@ admin.DELETE("/external-auth/environments/:id", s.AdminDeleteExternalAuthEnviron
 
 创建和更新先调用 `NormalizeExternalAuthEnvironment`，再复用 `validateExternalAuthEndpoint` 做 HTTPS/SSRF 校验。写入成功后从 Store 重载全部启用环境，并通过原子指针发布新的只读 map；读请求永远只读取完整快照。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：
 
@@ -290,7 +290,7 @@ rtk go test -tags sonic ./internal/app -run 'AdminExternalAuthEnvironment|Extern
 
 预期：PASS。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 rtk git add internal/app/admin_external_auth_environments.go internal/app/admin_external_auth_environments_test.go internal/app/server.go internal/app/server_test.go

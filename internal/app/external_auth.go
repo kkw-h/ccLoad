@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -102,11 +103,12 @@ type externalAuthMetricsSnapshot struct {
 }
 
 type ExternalAuthService struct {
-	config externalAuthConfig
-	client *http.Client
-	jitter func(time.Duration) time.Duration
-	now    func() time.Time
-	stats  externalAuthMetrics
+	config        externalAuthConfig
+	environmentMu sync.RWMutex
+	client        *http.Client
+	jitter        func(time.Duration) time.Duration
+	now           func() time.Time
+	stats         externalAuthMetrics
 }
 
 func newExternalAuthService(
@@ -247,7 +249,9 @@ func (s *ExternalAuthService) authorizeAttempt(
 }
 
 func (s *ExternalAuthService) environmentTarget(raw string) (externalAuthEnvironmentTarget, error) {
-	if len(s.config.Environments) == 0 {
+	s.environmentMu.RLock()
+	defer s.environmentMu.RUnlock()
+	if s.config.Environments == nil {
 		if s.config.WebhookURL != nil {
 			return externalAuthEnvironmentTarget{AuthzURL: s.config.WebhookURL}, nil
 		}
@@ -262,6 +266,19 @@ func (s *ExternalAuthService) environmentTarget(raw string) (externalAuthEnviron
 		return externalAuthEnvironmentTarget{}, &externalAuthError{kind: externalAuthErrorDenied, msg: "external authorization environment denied"}
 	}
 	return target, nil
+}
+
+func (s *ExternalAuthService) ReplaceEnvironments(targets map[string]externalAuthEnvironmentTarget) {
+	if s == nil {
+		return
+	}
+	snapshot := make(map[string]externalAuthEnvironmentTarget, len(targets))
+	for key, target := range targets {
+		snapshot[key] = target
+	}
+	s.environmentMu.Lock()
+	s.config.Environments = snapshot
+	s.environmentMu.Unlock()
 }
 
 func unavailableExternalAuthError(msg string) error {
