@@ -131,6 +131,12 @@ type Store interface {
 	UpdateSetting(ctx context.Context, key, value string) error
 	BatchUpdateSettings(ctx context.Context, updates map[string]string) error
 
+	// === External Auth Environments ===
+	CreateExternalAuthEnvironment(ctx context.Context, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error)
+	ListExternalAuthEnvironments(ctx context.Context) ([]*model.ExternalAuthEnvironment, error)
+	UpdateExternalAuthEnvironment(ctx context.Context, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error)
+	DeleteExternalAuthEnvironment(ctx context.Context, id int64) error
+
 	// === Model Fingerprint Management ===
 	ListModelFingerprints(ctx context.Context) ([]*model.ModelFingerprint, error)
 	GetModelFingerprint(ctx context.Context, id int64) (*model.ModelFingerprint, error)

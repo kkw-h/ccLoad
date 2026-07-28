@@ -36,7 +36,7 @@
 - 测试：`internal/storage/migrate_mysql_test.go`
 - 测试：`internal/storage/migrate_postgres_test.go`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```go
 func TestExternalAuthEnvironmentCRUD(t *testing.T) {
@@ -65,7 +65,7 @@ func TestExternalAuthEnvironmentCRUD(t *testing.T) {
 
 迁移测试同时断言 `external_auth_environments` 存在，`environment` 唯一，字段包含 `id/environment/authz_url/is_active/created_at/updated_at`。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -75,7 +75,7 @@ rtk go test -tags sonic ./internal/storage/... -run 'ExternalAuthEnvironment|Ext
 
 预期：FAIL，模型、表和 Store 方法尚未定义。
 
-- [ ] **步骤 3：编写最少实现**
+- [x] **步骤 3：编写最少实现**
 
 ```go
 var ErrExternalAuthEnvironmentConflict = errors.New("external auth environment already exists")
@@ -115,7 +115,7 @@ func DefineExternalAuthEnvironmentsTable() *TableBuilder {
 
 CRUD 使用现有方言 rebind 和显式 ID 辅助逻辑；删除不存在返回 `model.ErrExternalAuthEnvironmentNotFound`，唯一约束统一映射为 conflict。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：
 
@@ -125,7 +125,7 @@ rtk go test -tags sonic ./internal/storage/... -run 'ExternalAuthEnvironment|Ext
 
 预期：PASS。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 rtk git add internal/model/external_auth_environment.go internal/storage
