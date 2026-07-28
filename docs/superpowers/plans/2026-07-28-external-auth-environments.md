@@ -306,7 +306,7 @@ rtk git commit -m "feat: manage external auth environments"
 - 修改：`web/assets/locales/en.js`
 - 修改或创建：`web/assets/js/settings.test.js`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```javascript
 test('external auth environment editor serializes enabled environment rows', () => {
@@ -326,7 +326,7 @@ test('external auth environment editor serializes enabled environment rows', () 
 
 增加加载列表、新增、编辑、启停、删除确认、行内错误和服务端失败保留用户输入的测试。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -336,11 +336,11 @@ rtk npm test -- --run settings
 
 预期：FAIL，环境编辑器函数和 DOM 不存在。
 
-- [ ] **步骤 3：编写最少实现**
+- [x] **步骤 3：编写最少实现**
 
 设置页“外部请求鉴权”分组下新增环境表格，列为环境、Authz URL、启用、操作。保存使用专用 CRUD API；环境输入设置 `pattern="[a-z0-9_-]+"`，URL 输入使用 `type="url"`。删除必须二次确认，后端错误通过现有 `showError` 显示。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：
 
@@ -350,7 +350,7 @@ rtk npm test -- --run settings
 
 预期：PASS。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 rtk git add web/settings.html web/assets/js/settings.js web/assets/js/settings.test.js web/assets/locales/zh-CN.js web/assets/locales/en.js
