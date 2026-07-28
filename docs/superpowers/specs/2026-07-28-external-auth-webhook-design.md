@@ -10,6 +10,7 @@ ccLoad 当前使用本地 API Token 对模型请求进行认证，并基于该 T
 
 - 外部平台成为用户身份的认证方。
 - ccLoad 继续作为模型、渠道、费用和并发权限的最终授权方。
+- 客户端通过 `X-Sedna-Env` 选择管理员已配置且启用的鉴权环境，ccLoad 按环境调用对应的 authz URL。
 - 普通 HTTP、SSE 和 Responses WebSocket 模型请求使用一致的鉴权语义。
 - 外部用户 UUID 进入请求日志和 Redis 用量事件，便于外部平台结算关联。
 - 通过来源 IP/CIDR 白名单支持旧调用方渐进迁移。
@@ -32,6 +33,7 @@ ccLoad 当前使用本地 API Token 对模型请求进行认证，并基于该 T
 只负责外部身份认证：
 
 - 读取已经生效的外部鉴权配置。
+- 读取并校验当前请求中唯一的 `X-Sedna-Env`，查找对应的启用环境配置。
 - 构造 Webhook 请求。
 - 从当前用户请求提取原始 `Authorization`。
 - 强制设置 `X-Original-Authorization`。
@@ -63,6 +65,7 @@ ccLoad 当前使用本地 API Token 对模型请求进行认证，并基于该 T
 用户请求 Authorization
   → 解析可信客户端 IP
   → 迁移白名单判断
+  → 校验 X-Sedna-Env 并选择对应环境的 authz URL
   → ExternalAuthService 调用 Webhook
   → 获取 X-User-Id / X-Ccload-Token / X-Authz-Token-Exp
   → AuthService 校验返回的 ccLoad Token
@@ -75,11 +78,13 @@ ccLoad 当前使用本地 API Token 对模型请求进行认证，并基于该 T
 
 ### 3.2 Responses WebSocket
 
-WebSocket 握手必须携带原始 `Authorization`，ccLoad 将其安全保存在连接上下文中，不记录、不回显。
+WebSocket 握手必须携带原始 `Authorization` 和唯一的 `X-Sedna-Env`。ccLoad
+校验环境配置后，将原始 Authorization 和规范环境标识安全保存在连接上下文中，
+不记录、不回显。
 
 每个 `response.create`：
 
-1. 使用握手时保存的原始 Authorization 调用 Webhook。
+1. 使用握手时保存的原始 Authorization 和规范环境标识选择并调用 Webhook。
 2. 使用当前 `response.create` 的模型信息构造鉴权元数据。
 3. 校验响应头和授权过期时间。
 4. 使用返回的 ccLoad Token执行本地 Token、模型、渠道、额度和并发校验。
@@ -112,12 +117,13 @@ WebSocket 握手必须携带原始 `Authorization`，ccLoad 将其安全保存�
 
 ### 5.1 请求
 
-ccLoad 使用 `POST` 调用管理员配置的固定 URL：
+ccLoad 使用 `POST` 调用 `X-Sedna-Env` 对应环境配置中的 authz URL：
 
 ```http
-POST <external_auth_webhook_url>
+POST https://sedna-dev.example.com/internal/llm/authz
 Content-Type: application/json
 X-Original-Authorization: <用户当前请求的原始 Authorization 值>
+X-Sedna-Env: develop
 ```
 
 请求体：
@@ -137,6 +143,9 @@ X-Original-Authorization: <用户当前请求的原始 Authorization 值>
 
 - `X-Original-Authorization` 逐字取自用户当前请求的 `Authorization`。
 - 忽略并覆盖客户端主动提交的 `X-Original-Authorization`。
+- 未命中迁移白名单时，`X-Sedna-Env` 必须恰好出现一次；首尾空白清理后按小写环境标识精确匹配。
+- ccLoad 不盲目透传客户端的 `X-Sedna-Env`，而是用已匹配配置的规范环境标识覆盖出站请求头。
+- 缺失、重复、非法、未配置或已停用的环境统一返回 `403 Forbidden`，不暴露已配置环境列表，且不调用 authz 或模型上游。
 - 启用外部鉴权且未命中迁移白名单时，缺少 `Authorization` 返回 `401`。
 - 不从 `X-API-Key`、`x-goog-api-key` 或 Gemini `?key=` 转换外部身份。
 - 不发送提示词、消息、文件、工具参数或完整请求正文。
@@ -222,20 +231,45 @@ Webhook 响应正文不透传客户端。
 | 设置 | 默认值 | 说明 |
 |---|---:|---|
 | `external_auth_enabled` | `false` | 总开关 |
-| `external_auth_webhook_url` | 空 | 固定 HTTPS Webhook URL |
 | `external_auth_timeout_ms` | `2000` | 单次调用总超时 |
 | `external_auth_max_retries` | `2` | 首次调用后的最大重试次数 |
 | `external_auth_bypass_cidrs` | 空 | 迁移绕过来源 IP/CIDR |
 
+环境路由使用独立的 `external_auth_environments` 表，不将多条结构化配置塞入单个字符串设置：
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 内部主键 |
+| `environment` | 唯一环境标识，例如 `develop`、`test` |
+| `authz_url` | 该环境的完整 HTTPS authz URL |
+| `is_active` | 是否允许客户端选择该环境 |
+| `created_at` / `updated_at` | 审计时间 |
+
+环境标识只允许小写字母、数字、`-` 和 `_`，不能为空且全表唯一。管理后台支持新增、编辑、启用、停用和删除环境配置。删除或停用后，新请求立即不能再选择该环境。
+
+专用管理 API：
+
+- `GET /admin/external-auth/environments`
+- `POST /admin/external-auth/environments`
+- `PUT /admin/external-auth/environments/:id`
+- `DELETE /admin/external-auth/environments/:id`
+
+写操作复用现有管理员认证和请求校验。删除不存在的记录返回 `404`；环境名冲突
+返回 `409`；非法环境名或 URL 返回 `400`。启用总开关时若没有有效环境，更新
+请求返回 `400`，保留原有关闭状态。
+
 校验：
 
-- 开启时必须填写合法 HTTPS URL。
+- 开启时必须至少存在一个启用且 URL 合法的环境。
+- 每个 authz URL 必须为合法 HTTPS URL。
 - 超时范围为 100～10000 ms。
 - 重试次数范围为 0～5。
 - 白名单逐项解析，任一非法值都拒绝保存。
-- Webhook URL 默认禁止环回、链路本地和私网目标，降低 SSRF 风险。
+- authz URL 默认禁止环回、链路本地和私网目标，降低 SSRF 风险。
 - 如未来需要私网 Webhook，另行设计显式开关，不在本次范围内。
-- 配置沿用现有系统设置保存和重启生效机制。
+- 超时、重试和白名单沿用现有系统设置保存和重启生效机制。
+- 环境路由通过专用管理 API 更新；保存成功后刷新不可变内存快照，无需重启 ccLoad。
+- 每个模型请求从内存快照按环境标识查找，不在热路径查询数据库。
 
 ## 9. 身份传播与数据模型
 
@@ -316,7 +350,9 @@ external_auth_duration
 ### 12.1 配置
 
 - 外部鉴权默认关闭。
-- 开启时 URL 必填且必须是允许的 HTTPS 目标。
+- 开启时至少有一个启用环境，且所有启用环境 URL 都是允许的 HTTPS 目标。
+- 环境标识唯一并符合格式；重复、空值、大写和非法字符拒绝保存。
+- 环境配置新增、编辑、启停和删除后刷新运行时快照。
 - 超时和重试范围校验。
 - 单 IP、CIDR、多个条目和非法白名单校验。
 - SSRF 目标被拒绝。
@@ -325,6 +361,10 @@ external_auth_duration
 
 - 关闭外部鉴权时现有 Bearer、X-API-Key、Google Key 和 query key 行为不变。
 - 开启后非白名单请求缺少 Authorization 返回 401。
+- 缺少、空白、重复、非法、未知或已停用的 `X-Sedna-Env` Fail-closed。
+- 合法 `X-Sedna-Env` 选择对应的 authz URL。
+- ccLoad 只向 authz 发送规范环境标识，不盲目透传客户端值。
+- 环境不合法时不调用 authz、不选择渠道、不请求上游。
 - 客户端伪造 `X-Original-Authorization` 被覆盖。
 - Webhook 收到当前请求的原始 Authorization 和正确元数据。
 - 成功响应三个 Header 均被解析。
@@ -374,7 +414,7 @@ external_auth_duration
 ## 13. 部署顺序
 
 1. 部署包含新设置但默认关闭的 ccLoad。
-2. 配置并验证外部 Webhook HTTPS 与出口 IP 白名单。
+2. 在管理后台配置并验证 develop/test 环境的 authz HTTPS URL 与出口 IP 白名单。
 3. 配置迁移来源 CIDR。
 4. 开启外部鉴权并重启。
 5. 观察允许、拒绝、错误、重试和绕过指标。
