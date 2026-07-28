@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,8 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -191,6 +194,11 @@ func (s *Server) handleRequestError(
 		}
 		err = fmt.Errorf("%s: %w", timeoutMsg, util.ErrUpstreamFirstByteTimeout)
 		log.Printf("[TIMEOUT] [上游首字节超时] 渠道ID=%d, 阈值=%v, 实际耗时=%.2fs", cfg.ID, timeout, durationSec)
+	} else if reqCtx.streamTimeoutTriggered() {
+		statusCode = util.StatusStreamIncomplete
+		err = fmt.Errorf("upstream stream timeout after %.2fs (threshold=%v): %w",
+			durationSec, reqCtx.streamTimeout, util.ErrUpstreamStreamTimeout)
+		log.Printf("[TIMEOUT] [流式请求总超时] 渠道ID=%d, 阈值=%v, 实际耗时=%.2fs", cfg.ID, reqCtx.streamTimeout, durationSec)
 	} else if errors.Is(err, context.DeadlineExceeded) {
 		if reqCtx.isStreaming {
 			// 流式请求超时
@@ -819,6 +827,7 @@ func (s *Server) handleSuccessResponse(
 			result.SSEErrorEvent = errorEvent
 		}
 		streamComplete = parser.IsStreamComplete()
+		result.ResponsesTurnResult, result.HasResponsesTurnResult = parser.GetResponsesTurnResult()
 	}
 
 	// 生成流诊断消息（仅流请求）
@@ -1020,6 +1029,7 @@ func (s *Server) handleTranslatedStreamSuccessResponse(
 	result.ToolCostUSD = parser.GetToolCostUSD()
 	result.ThinkingEffort = parser.GetThinkingEffort()
 	result.SSEErrorEvent = parser.GetLastError()
+	result.ResponsesTurnResult, result.HasResponsesTurnResult = parser.GetResponsesTurnResult()
 	streamComplete := parser.IsStreamComplete() || translatedComplete
 
 	if diagMsg := buildStreamDiagnostics(streamErr, readStats, streamComplete, channelType, resp.Header.Get("Content-Type")); diagMsg != "" {
@@ -1149,6 +1159,9 @@ func shouldProbeSoftError(reqCtx *requestContext, resp *http.Response, channelTy
 // classifySSEErrorStatus 根据响应体内容判定 SSE 错误的内部状态码：
 // 1308 配额超限 → 596；明确限流 → 429；其他 → 597。
 func classifySSEErrorStatus(body []byte) int {
+	if status, _ := websocketErrorStatusAndHeaders(body); status >= 400 && status <= 599 {
+		return status
+	}
 	if _, is1308 := util.ParseResetTimeFrom1308Error(body); is1308 {
 		return util.StatusQuotaExceeded
 	}
@@ -1183,10 +1196,57 @@ func isSSERateLimitError(body []byte) bool {
 
 func isRateLimitErrorType(value string) bool {
 	switch strings.ToLower(value) {
-	case "rate_limit_error", "rate_limit_exceeded", "too_many_requests", "model_cooldown":
+	case "rate_limit_error", "rate_limit_exceeded", "too_many_requests", "model_cooldown", "websocket_connection_limit_reached":
 		return true
 	default:
 		return false
+	}
+}
+
+func websocketErrorStatusAndHeaders(body []byte) (int, http.Header) {
+	var payload struct {
+		Status     int            `json:"status"`
+		StatusCode int            `json:"status_code"`
+		Headers    map[string]any `json:"headers"`
+	}
+	if sonic.Unmarshal(body, &payload) != nil {
+		return 0, nil
+	}
+	status := payload.Status
+	if status == 0 {
+		status = payload.StatusCode
+	}
+	if status < 400 || status > 599 {
+		status = 0
+	}
+	headers := make(http.Header)
+	for name, raw := range payload.Headers {
+		name = strings.TrimSpace(name)
+		if !isForwardableWebsocketErrorHeader(name) {
+			continue
+		}
+		switch value := raw.(type) {
+		case string:
+			if value = strings.TrimSpace(value); value != "" {
+				headers.Set(name, value)
+			}
+		case float64, bool:
+			headers.Set(name, fmt.Sprint(value))
+		}
+	}
+	if len(headers) == 0 {
+		headers = nil
+	}
+	return status, headers
+}
+
+func isForwardableWebsocketErrorHeader(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	switch lower {
+	case "retry-after", "request-id", "x-request-id", "openai-request-id":
+		return true
+	default:
+		return strings.HasPrefix(lower, "ratelimit-") || strings.HasPrefix(lower, "x-ratelimit-")
 	}
 }
 
@@ -1280,6 +1340,32 @@ func probeEmptyOKResponse(reqCtx *requestContext, resp *http.Response, hdrClone 
 	return false, nil, 0, nil
 }
 
+func invalidHTMLSuccessResponseResult(
+	reqCtx *requestContext,
+	resp *http.Response,
+	hdrClone http.Header,
+	readStats *streamReadStats,
+) (*fwResult, float64, error) {
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(config.DefaultMaxBodyBytes)))
+	err := fmt.Errorf(
+		"%w (HTTP %d Content-Type %q)",
+		util.ErrUpstreamInvalidResponse,
+		resp.StatusCode,
+		resp.Header.Get("Content-Type"),
+	)
+	if readErr != nil {
+		err = fmt.Errorf("%w: read body: %v", err, readErr)
+	}
+	return &fwResult{
+		Status:         resp.StatusCode,
+		UpstreamStatus: resp.StatusCode,
+		Header:         hdrClone,
+		Body:           body,
+		FirstByteTime:  readStats.firstByteSec,
+		BytesReceived:  readStats.totalBytes,
+	}, reqCtx.Duration().Seconds(), err
+}
+
 // handleResponse 处理 HTTP 响应（错误或成功）
 // 从proxy.go提取，遵循SRP原则
 // channelType: 渠道类型,用于精确识别usage格式
@@ -1302,6 +1388,14 @@ func (s *Server) handleResponse(
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return s.handleErrorResponse(reqCtx, resp, hdrClone, readStats)
 	}
+	if looksLikeHTMLResponse(resp.Header.Get("Content-Type"), "") {
+		log.Printf(
+			"[WARN] 渠道ID=%d 返回 HTTP %d HTML 页面，拒绝作为 API 成功响应",
+			cfg.ID,
+			resp.StatusCode,
+		)
+		return invalidHTMLSuccessResponseResult(reqCtx, resp, hdrClone, readStats)
+	}
 
 	if handled, res, duration, err := probeEmptyOKResponse(reqCtx, resp, hdrClone, readStats); handled {
 		return res, duration, err
@@ -1323,6 +1417,29 @@ func (s *Server) handleResponse(
 // 参数新增 apiKey 用于直接传递已选中的API Key（从KeySelector获取）
 // 参数新增 method 用于支持任意HTTP方法（GET、POST、PUT、DELETE等）
 func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey string, method string, plan protocol.TransformPlan, hdr http.Header, rawQuery string, baseURL string, w http.ResponseWriter, observer *ForwardObserver) (*fwResult, float64, error) {
+	return s.forwardOnceAsyncWithNativeCodexWebsocket(
+		ctx, cfg, apiKey, method, plan, hdr, rawQuery, baseURL, w, observer, nil,
+	)
+}
+
+type nativeCodexWebsocketAttempt struct {
+	session         *codexUpstreamWebsocketSession
+	incrementalBody []byte
+}
+
+func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
+	ctx context.Context,
+	cfg *model.Config,
+	apiKey string,
+	method string,
+	plan protocol.TransformPlan,
+	hdr http.Header,
+	rawQuery string,
+	baseURL string,
+	w http.ResponseWriter,
+	observer *ForwardObserver,
+	native *nativeCodexWebsocketAttempt,
+) (*fwResult, float64, error) {
 	// 1. 创建请求上下文（处理超时）
 	reqCtx := s.newRequestContextWithTimeouts(ctx, plan.UpstreamPath, plan.TranslatedBody, s.resolveProtocolTimeouts(cfg, plan))
 	reqCtx.transformPlan = plan
@@ -1358,15 +1475,95 @@ func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey
 	if err != nil {
 		return nil, 0, err
 	}
+	replayBody := bytes.Clone(reqCtx.transformPlan.TranslatedBody)
 
-	// 2.5 Debug捕获：记录发送前的请求信息
-	dc := s.captureDebugRequest(req, reqCtx.transformPlan.TranslatedBody)
+	// 2.5 发送请求。原生 Codex WS 会在持锁后决定发送增量请求还是完整回放请求。
+	var resp *http.Response
+	var sentBody []byte
+	usedNativeWebsocket := false
+	if native != nil && native.session != nil {
+		incrementalBody := bytes.Clone(native.incrementalBody)
+		incrementalReq, errBuild := s.buildProxyRequest(
+			reqCtx, cfg, apiKey, method, incrementalBody, hdr, rawQuery,
+			reqCtx.transformPlan.UpstreamPath, baseURL,
+		)
+		if errBuild != nil {
+			return nil, 0, errBuild
+		}
+		// buildProxyRequest applies body rules and prompt_cache_key; send the
+		// resulting wire body, not the pre-normalized caller input.
+		incrementalBody = bytes.Clone(reqCtx.transformPlan.TranslatedBody)
+		resp, req, sentBody, err = s.doCodexWebsocketRequest(
+			reqCtx.ctx, cfg, native.session,
+			req, replayBody, incrementalReq, incrementalBody,
+		)
+		if err != nil && isCodexWebsocketHandshakeFallbackError(err) {
+			log.Printf("[INFO] 渠道 %d WebSocket 握手协商失败 (%v)，同 Key/URL 回退 HTTP", cfg.ID, err)
+			sentBody = responsesBodyForHTTPTransport(plan, replayBody)
+			req = cloneRequestWithBody(req.WithContext(reqCtx.ctx), sentBody)
+			resp, err = s.doUpstreamRequest(cfg, req)
+		} else {
+			usedNativeWebsocket = err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300
+		}
+		if err == nil && resp != nil && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+			// A concrete HTTP response here is a rejected WebSocket handshake. The
+			// selected channel may still support the ordinary Responses HTTP endpoint.
+			_ = resp.Body.Close()
+			log.Printf("[INFO] 渠道 %d WebSocket 握手返回 %d，同 Key/URL 回退 HTTP", cfg.ID, resp.StatusCode)
+			sentBody = responsesBodyForHTTPTransport(plan, replayBody)
+			req = cloneRequestWithBody(req.WithContext(reqCtx.ctx), sentBody)
+			resp, err = s.doUpstreamRequest(cfg, req)
+			usedNativeWebsocket = false
+		}
+	} else {
+		sentBody = responsesBodyForHTTPTransport(plan, replayBody)
+		req = cloneRequestWithBody(req, sentBody)
+		resp, err = s.doUpstreamRequest(cfg, req)
+	}
+	if observer != nil && observer.OnUpstreamWebsocket != nil {
+		observer.OnUpstreamWebsocket(usedNativeWebsocket)
+	}
+	if req != nil {
+		reqCtx.translatedBody = sentBody
+		reqCtx.transformPlan.TranslatedBody = sentBody
+	}
+
+	// 2.6 Debug捕获：记录真正发出的请求，而不是未采用的 replay/incremental 候选。
+	debugReq := req
+	debugBody := sentBody
+	var websocketDebug codexWebsocketDebugSnapshot
+	if usedNativeWebsocket && req != nil {
+		websocketDebug = native.session.debugSnapshot()
+		debugReq = req.Clone(req.Context())
+		if websocketDebug.RequestHeaders != nil {
+			debugReq.Header = websocketDebug.RequestHeaders.Clone()
+		}
+		if wsURL, errURL := codexWebsocketURL(req.URL.String()); errURL == nil {
+			if parsedURL, errParse := url.Parse(wsURL); errParse == nil {
+				debugReq.URL = parsedURL
+			}
+		}
+		debugReq.Method = "WEBSOCKET"
+		if wireBody, errWire := buildCodexWebsocketRequestBody(sentBody); errWire == nil {
+			debugBody = wireBody
+		}
+	}
+	dc := s.captureDebugRequest(debugReq, debugBody)
+	if reqCtx.transformPlan.NeedsTransform {
+		originalReqURL := reqCtx.transformPlan.OriginalPath
+		if rawQuery != "" {
+			separator := "?"
+			if strings.Contains(originalReqURL, "?") {
+				separator = "&"
+			}
+			originalReqURL += separator + rawQuery
+		}
+		dc.markProtocolTransform(originalReqURL, hdr, reqCtx.transformPlan.OriginalBody)
+	}
 	if observer != nil && observer.OnDebugCapture != nil {
 		observer.OnDebugCapture(dc)
 	}
 
-	// 3. 发送请求
-	resp, err := s.doUpstreamRequest(cfg, req)
 	if err != nil && (errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrChannelConcurrencyExceeded)) {
 		return nil, reqCtx.Duration().Seconds(), err
 	}
@@ -1399,6 +1596,9 @@ func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey
 		errRes, errDur, errErr := s.handleRequestError(reqCtx, cfg, err)
 		if errRes != nil {
 			errRes.DebugData = dc.buildEntry(resp)
+			if usedNativeWebsocket {
+				annotateNativeWebsocketDebug(errRes.DebugData, websocketDebug)
+			}
 		}
 		return errRes, errDur, errErr
 	}
@@ -1406,7 +1606,31 @@ func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey
 	// 4. 处理响应(传递channelType用于精确识别usage格式,传递渠道信息用于日志记录,传递观测回调)
 	var res *fwResult
 	var duration float64
-	res, duration, err = s.handleResponse(reqCtx, resp, w, string(reqCtx.upstreamProtocol), cfg, apiKey, observer)
+	responseWriter := w
+	if reqCtx.transformPlan.NeedsTransform && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		responseWriter = dc.wrapTranslatedResponseWriter(w)
+	}
+	res, duration, err = s.handleResponse(reqCtx, resp, responseWriter, string(reqCtx.upstreamProtocol), cfg, apiKey, observer)
+	if usedNativeWebsocket {
+		// Reconnects happen while handleResponse drains the upstream frames. Take
+		// the final snapshot here so the persisted debug log describes the actual
+		// transport lifecycle instead of the state immediately after the first dial.
+		websocketDebug = native.session.debugSnapshot()
+	}
+	var reconnectFallbackErr *codexWebsocketHTTPFallbackError
+	if err != nil && usedNativeWebsocket && res != nil && !res.ResponseCommitted &&
+		errors.As(err, &reconnectFallbackErr) {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		log.Printf("[INFO] 渠道 %d WebSocket 重连握手失败，同 Key/URL 回退 HTTP: %v", cfg.ID, reconnectFallbackErr)
+		return s.forwardOnceAsyncWithNativeCodexWebsocket(
+			ctx, cfg, apiKey, method, plan, hdr, rawQuery, baseURL, w, observer, nil,
+		)
+	}
+	if res != nil {
+		res.UpstreamWebsocket = usedNativeWebsocket
+	}
 
 	// [FIX] 2025-12: 流式传输过程中首字节超时的错误修正
 	// 场景：响应头已收到(200 OK)，但在读取响应体时超时定时器触发
@@ -1424,14 +1648,51 @@ func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey
 		err = fmt.Errorf("%s: %w", timeoutMsg, util.ErrUpstreamFirstByteTimeout)
 		res.Status = util.StatusFirstByteTimeout
 		log.Printf("[TIMEOUT] [上游首字节超时-流传输中断] 渠道ID=%d, 阈值=%v, 实际耗时=%.2fs", cfg.ID, timeout, duration)
+	} else if err != nil && reqCtx.streamTimeoutTriggered() {
+		err = fmt.Errorf("upstream stream timeout after %.2fs (threshold=%v): %w",
+			duration, reqCtx.streamTimeout, util.ErrUpstreamStreamTimeout)
+		if res != nil {
+			res.Status = util.StatusStreamIncomplete
+		}
+		log.Printf("[TIMEOUT] [流式请求总超时-流传输中断] 渠道ID=%d, 阈值=%v, 实际耗时=%.2fs", cfg.ID, reqCtx.streamTimeout, duration)
 	}
 
 	// 5. Debug捕获：构建完整的 debug 日志条目（响应体已通过 TeeReader 收集完毕）
 	if res != nil {
 		res.DebugData = dc.buildEntry(resp)
+		if usedNativeWebsocket {
+			annotateNativeWebsocketDebug(res.DebugData, websocketDebug)
+		}
 	}
 
 	return res, duration, err
+}
+
+func responsesBodyForHTTPTransport(plan protocol.TransformPlan, body []byte) []byte {
+	if plan.ClientProtocol != protocol.Codex || plan.RequestFamily != protocol.RequestFamilyResponses {
+		return body
+	}
+	if !gjson.GetBytes(body, "generate").Exists() {
+		return body
+	}
+	stripped, err := sjson.DeleteBytes(body, "generate")
+	if err != nil {
+		return body
+	}
+	return stripped
+}
+
+func cloneRequestWithBody(req *http.Request, body []byte) *http.Request {
+	if req == nil {
+		return nil
+	}
+	cloned := req.Clone(req.Context())
+	cloned.Body = io.NopCloser(bytes.NewReader(body))
+	cloned.ContentLength = int64(len(body))
+	cloned.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	return cloned
 }
 
 // ============================================================================
@@ -1441,6 +1702,11 @@ func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey
 func markSSEErrorForwardResult(res *fwResult) {
 	res.Body = res.SSEErrorEvent
 	res.Status = classifySSEErrorStatus(res.SSEErrorEvent)
+	if upstreamStatus, headers := websocketErrorStatusAndHeaders(res.SSEErrorEvent); upstreamStatus != 0 {
+		res.Status = upstreamStatus
+		res.UpstreamStatus = upstreamStatus
+		res.Header = headers
+	}
 	if res.Status == util.StatusQuotaExceeded {
 		res.StreamDiagMsg = fmt.Sprintf("Quota Exceeded (1308): %s", safeBodyToString(res.SSEErrorEvent))
 		return
@@ -1551,9 +1817,26 @@ func (s *Server) forwardAttempt(
 			nextAction: cooldown.ActionRetryChannel,
 		}, cooldown.ActionRetryChannel, nil
 	}
+	var nativeAttempt *nativeCodexWebsocketAttempt
+	if reqCtx.nativeCodexWS != nil && cfg.Websockets && upstreamProtocol == protocol.Codex &&
+		protocol.DetectRequestFamily(requestPath) == protocol.RequestFamilyResponses && !plan.NeedsTransform {
+		incrementalBody := replaceJSONRequestModel(reqCtx.nativeCodexBody, reqCtx.originalModel, actualModel)
+		incrementalBody = prepareCodexResponsesBodyForUpstream(cfg, upstreamProtocol, requestPath, incrementalBody)
+		nativeAttempt = &nativeCodexWebsocketAttempt{
+			session:         reqCtx.nativeCodexWS,
+			incrementalBody: incrementalBody,
+		}
+	} else if reqCtx.nativeCodexWS != nil {
+		// The conversation state belongs to the execution session, not the socket.
+		// Once this turn changes transport, the old upstream connection must not
+		// remain reusable with a response ID that belongs to the previous target.
+		reqCtx.nativeCodexWS.Close()
+	}
 
-	res, duration, err := s.forwardOnceAsync(ctx, cfg, selectedKey, reqCtx.requestMethod,
-		plan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer)
+	res, duration, err := s.forwardOnceAsyncWithNativeCodexWebsocket(
+		ctx, cfg, selectedKey, reqCtx.requestMethod,
+		plan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt,
+	)
 
 	// 传递 debug 数据到 proxyRequestContext（用于日志记录）
 	if res != nil && res.DebugData != nil {
@@ -1570,8 +1853,11 @@ func (s *Server) forwardAttempt(
 		retryStrategies = append(retryStrategies, retryStrategy)
 		retryPlan := plan
 		retryPlan.TranslatedBody = retryBody
-		res, duration, err = s.forwardOnceAsync(ctx, cfg, selectedKey, reqCtx.requestMethod,
-			retryPlan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer)
+		s.activeRequests.Retry(reqCtx.activeReqID)
+		res, duration, err = s.forwardOnceAsyncWithNativeCodexWebsocket(
+			ctx, cfg, selectedKey, reqCtx.requestMethod,
+			retryPlan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt,
+		)
 		if res != nil && res.DebugData != nil {
 			reqCtx.debugData = res.DebugData
 		}
@@ -1602,6 +1888,14 @@ func (s *Server) forwardAttempt(
 		}
 		if errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrChannelConcurrencyExceeded) {
 			return nil, cooldown.ActionRetryChannel, err
+		}
+		if errors.Is(err, util.ErrUpstreamStreamTimeout) && res != nil {
+			res.Body = []byte(err.Error())
+			res.StreamDiagMsg = err.Error()
+			result, action := s.handleCommittedAwareProxyError(
+				ctx, cfg, keyIndex, actualModel, selectedKey, res, duration, reqCtx, deferChannelCooldown,
+			)
+			return result, action, nil
 		}
 		result, action := s.handleNetworkError(
 			ctx, cfg, keyIndex, actualModel, selectedKey, reqCtx.tokenID, reqCtx.clientIP,
@@ -1879,6 +2173,7 @@ func prepareCodexResponsesBodyForUpstream(cfg *model.Config, upstreamProtocol pr
 		protocol.DetectRequestFamily(requestPath) != protocol.RequestFamilyResponses {
 		return body
 	}
+	body = sanitizeCodexInputItemIDs(body)
 	if normalized, ok := normalizeCodexToolSearchInputItems(body); ok {
 		body = normalized
 	}
@@ -2075,6 +2370,28 @@ func (s *Server) selectKeyWithFallback(cfg *model.Config, apiKeys []*model.APIKe
 	return keyIndex, selectedKey, nil
 }
 
+func selectPinnedCodexWebsocketKey(
+	cfg *model.Config,
+	apiKeys []*model.APIKey,
+	triedKeys map[int]bool,
+	session *codexUpstreamWebsocketSession,
+) (int, string, bool) {
+	target, ok := session.targetSnapshot()
+	if !ok || target.channelID != cfg.ID {
+		return 0, "", false
+	}
+	now := time.Now()
+	for _, apiKey := range apiKeys {
+		if apiKey == nil || apiKey.Disabled || apiKey.IsCoolingDown(now) || triedKeys[apiKey.KeyIndex] {
+			continue
+		}
+		if codexWebsocketKeyHash(apiKey.APIKey) == target.keyHash {
+			return apiKey.KeyIndex, apiKey.APIKey, true
+		}
+	}
+	return 0, "", false
+}
+
 // recordSuccessTTFBToSelector 在多URL场景的2xx响应里把TTFB回报给URLSelector，
 // 单URL/非2xx/无延迟数据直接跳过。优先用 firstByteTime，缺失时回退到 duration。
 func recordSuccessTTFBToSelector(selector *URLSelector, channelID int64, urlsCount int, urlStr string, result *proxyResult) {
@@ -2113,16 +2430,30 @@ func (s *Server) attemptKeyAcrossURLs(
 	w http.ResponseWriter,
 ) (immediate *proxyResult, urlLastFailure *proxyResult, err error) {
 	sortedURLs := orderURLsWithSelector(selector, cfg.ID, urls)
+	if target, ok := reqCtx.nativeCodexWS.targetSnapshot(); ok &&
+		target.channelID == cfg.ID && target.keyHash == codexWebsocketKeyHash(selectedKey) {
+		sortedURLs = prioritizePinnedCodexWebsocketURL(sortedURLs, target.url, requestPath, reqCtx.rawQuery)
+	}
 	urlsCount := len(urls)
 	for urlIdx, urlEntry := range sortedURLs {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return buildCtxDoneResult(cfg, ctxErr), nil, nil
 		}
 
-		// 更新活跃请求的当前URL（用于前端显示）
-		if reqCtx.activeReqID > 0 {
-			s.activeRequests.SetBaseURL(reqCtx.activeReqID, urlEntry.url)
-		}
+		reqCtx.activeReqID = s.activeRequests.BeginAttempt(reqCtx.activeReqID, activeRequestAttempt{
+			StartTime:      time.Now(),
+			Model:          reqCtx.originalModel,
+			ClientIP:       reqCtx.clientIP,
+			Streaming:      reqCtx.isStreaming,
+			ChannelID:      cfg.ID,
+			ChannelName:    cfg.Name,
+			ChannelType:    cfg.GetChannelType(),
+			APIKey:         selectedKey,
+			TokenID:        reqCtx.tokenID,
+			BaseURL:        urlEntry.url,
+			CostMultiplier: cfg.CostMultiplier,
+			ThinkingEffort: reqCtx.thinkingEffort,
+		})
 
 		shouldDeferChannelCooldown := urlsCount > 1 && urlIdx < len(sortedURLs)-1
 		result, nextAction, attemptErr := s.forwardAttempt(
@@ -2139,6 +2470,11 @@ func (s *Server) attemptKeyAcrossURLs(
 
 		if result != nil {
 			urlLastFailure = result
+		}
+		if result != nil && result.alphaSearchUnsupported {
+			// 能力缺失不是 URL 健康故障，不进入通用 URL 冷却。
+			s.markAlphaSearchUnsupported(cfg.ID, urlEntry.url)
+			continue
 		}
 
 		// Key级错误：换URL无意义，跳出URL循环
@@ -2176,6 +2512,25 @@ func (s *Server) attemptKeyAcrossURLs(
 		break
 	}
 	return nil, urlLastFailure, nil
+}
+
+func prioritizePinnedCodexWebsocketURL(
+	urls []sortedURL,
+	targetURL string,
+	requestPath string,
+	rawQuery string,
+) []sortedURL {
+	for index, entry := range urls {
+		if buildUpstreamURL(entry.url, requestPath, rawQuery) != targetURL || index == 0 {
+			continue
+		}
+		ordered := make([]sortedURL, 0, len(urls))
+		ordered = append(ordered, entry)
+		ordered = append(ordered, urls[:index]...)
+		ordered = append(ordered, urls[index+1:]...)
+		return ordered
+	}
+	return urls
 }
 
 func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqCtx *proxyRequestContext, w http.ResponseWriter) (*proxyResult, error) {
@@ -2236,18 +2591,17 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		}
 
 		// 选择可用的API Key（直接传入apiKeys，避免重复查询）
-		keyIndex, selectedKey, selectErr := s.selectKeyWithFallback(cfg, apiKeys, triedKeys)
+		keyIndex, selectedKey, pinned := selectPinnedCodexWebsocketKey(cfg, apiKeys, triedKeys, reqCtx.nativeCodexWS)
+		var selectErr error
+		if !pinned {
+			keyIndex, selectedKey, selectErr = s.selectKeyWithFallback(cfg, apiKeys, triedKeys)
+		}
 		if selectErr != nil {
 			return nil, selectErr
 		}
 
 		// 标记Key为已尝试
 		triedKeys[keyIndex] = true
-
-		// 更新活跃请求的渠道信息（用于前端显示）
-		if reqCtx.activeReqID > 0 {
-			s.activeRequests.Update(reqCtx.activeReqID, cfg.ID, cfg.Name, cfg.GetChannelType(), selectedKey, reqCtx.tokenID, cfg.CostMultiplier)
-		}
 
 		// URL循环（单URL时退化为单次迭代）
 		immediate, urlLastFailure, attemptErr := s.attemptKeyAcrossURLs(

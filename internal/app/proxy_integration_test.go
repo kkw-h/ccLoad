@@ -19,6 +19,7 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // ============================================================================
@@ -30,6 +31,7 @@ import (
 type testChannel struct {
 	name                   string
 	channelType            string
+	websockets             bool
 	protocolTransformMode  string
 	protocolTransforms     []string
 	customRequestRules     *model.CustomRequestRules
@@ -44,6 +46,31 @@ type proxyTestEnv struct {
 	server *Server
 	store  storage.Store
 	engine *gin.Engine
+}
+
+func TestProxy_NonResponsesGenerateFieldIsPreserved(t *testing.T) {
+	requestBody := make(chan []byte, 1)
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requestBody <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chat-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "preserve-generate", channelType: "openai", models: "gpt-test", priority: 100,
+	}}, map[int]string{0: upstream.URL})
+
+	response := doProxyRequest(t, env.engine, "/v1/chat/completions", map[string]any{
+		"model": "gpt-test", "generate": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("non-Responses request status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !gjson.GetBytes(<-requestBody, "generate").Bool() {
+		t.Fatal("non-Responses generate field was stripped before reaching upstream")
+	}
 }
 
 // setupProxyTestEnv 创建指向 mockUpstream 的完整测试 Server
@@ -86,6 +113,7 @@ func setupProxyTestEnv(t testing.TB, channels []testChannel, upstreamURLs map[in
 			Name:                   ch.name,
 			URL:                    upURL,
 			ChannelType:            chType,
+			Websockets:             ch.websockets,
 			ProtocolTransformMode:  ch.protocolTransformMode,
 			ProtocolTransforms:     ch.protocolTransforms,
 			CustomRequestRules:     ch.customRequestRules,
@@ -456,6 +484,112 @@ func TestProxy_AlphaSearchPassthroughWithRestrictedToken(t *testing.T) {
 	}
 }
 
+func TestProxy_AlphaSearchUnsupportedFallsBackToEmptyResult(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"Invalid URL (POST /v1/alpha/search)"}}`))
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "alpha-search-failure", channelType: util.ChannelTypeCodex, models: "gpt-5"},
+	}, map[int]string{0: upstream.URL})
+
+	request := func() *httptest.ResponseRecorder {
+		return doProxyRequest(t, env.engine, "/v1/alpha/search", map[string]any{
+			"query": "codegraph",
+		}, nil)
+	}
+
+	w := request()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200: %s", w.Code, w.Body.String())
+	}
+	var fallback struct {
+		EncryptedOutput *string `json:"encrypted_output"`
+		Output          string  `json:"output"`
+		Results         []any   `json:"results"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &fallback)
+	if fallback.EncryptedOutput != nil || fallback.Output != "" || len(fallback.Results) != 0 {
+		t.Fatalf("unexpected empty search fallback: %+v", fallback)
+	}
+	entry := waitForProxyLog(t, env, util.BillingModelSearchCall)
+	if entry.Cost != 0 {
+		t.Fatalf("failed request Cost=%v, want 0", entry.Cost)
+	}
+	if got := env.server.costCache.Get(entry.ChannelID); got != 0 {
+		t.Fatalf("failed request cached cost=%v, want 0", got)
+	}
+	cooldowns, err := env.store.GetAllChannelCooldowns(context.Background())
+	if err != nil {
+		t.Fatalf("GetAllChannelCooldowns failed: %v", err)
+	}
+	if until := cooldowns[entry.ChannelID]; until.After(time.Now()) {
+		t.Fatalf("alpha search capability miss cooled channel until %v", until)
+	}
+
+	w = request()
+	if w.Code != http.StatusOK {
+		t.Fatalf("cached fallback status=%d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("unsupported alpha search upstream hits=%d, want 1", got)
+	}
+}
+
+func TestProxy_AlphaSearchUnsupportedFallsBackToNextChannel(t *testing.T) {
+	var unsupportedHits atomic.Int64
+	unsupported := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		unsupportedHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"Invalid URL (POST /v1/alpha/search)"}}`))
+	}))
+	defer unsupported.Close()
+
+	var supportedHits atomic.Int64
+	supported := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		supportedHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"encrypted_output":null,"output":"search result","results":[]}`))
+	}))
+	defer supported.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "alpha-search-unsupported", channelType: util.ChannelTypeCodex, models: "gpt-5", priority: 100},
+		{name: "alpha-search-supported", channelType: util.ChannelTypeCodex, models: "gpt-5", priority: 90},
+	}, map[int]string{0: unsupported.URL, 1: supported.URL})
+
+	request := func() *httptest.ResponseRecorder {
+		return doProxyRequest(t, env.engine, "/v1/alpha/search", map[string]any{
+			"query": "codegraph",
+		}, nil)
+	}
+	for i := 0; i < 2; i++ {
+		w := request()
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d status=%d, want 200: %s", i+1, w.Code, w.Body.String())
+		}
+		var response struct {
+			Output string `json:"output"`
+		}
+		mustUnmarshalJSON(t, w.Body.Bytes(), &response)
+		if response.Output != "search result" {
+			t.Fatalf("request %d output=%q, want search result", i+1, response.Output)
+		}
+	}
+	if got := unsupportedHits.Load(); got != 1 {
+		t.Fatalf("unsupported upstream hits=%d, want 1", got)
+	}
+	if got := supportedHits.Load(); got != 2 {
+		t.Fatalf("supported upstream hits=%d, want 2", got)
+	}
+}
+
 func TestProxy_AlphaSearchSelectsOnlyNativeCompatibleChannels(t *testing.T) {
 	t.Run("local transform is not a native search upstream", func(t *testing.T) {
 		var upstreamHits atomic.Int64
@@ -477,8 +611,16 @@ func TestProxy_AlphaSearchSelectsOnlyNativeCompatibleChannels(t *testing.T) {
 			"query": "codegraph",
 		}, nil)
 
-		if w.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status=%d, want 503: %s", w.Code, w.Body.String())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 fallback: %s", w.Code, w.Body.String())
+		}
+		var fallback struct {
+			Output  string `json:"output"`
+			Results []any  `json:"results"`
+		}
+		mustUnmarshalJSON(t, w.Body.Bytes(), &fallback)
+		if fallback.Output != "" || len(fallback.Results) != 0 {
+			t.Fatalf("unexpected empty search fallback: %+v", fallback)
 		}
 		if upstreamHits.Load() != 0 {
 			t.Fatalf("local transform upstream hits=%d, want 0", upstreamHits.Load())
@@ -1140,6 +1282,69 @@ func TestProxy_Success_NonStreaming_OpenAIToGeminiTransform(t *testing.T) {
 	}
 }
 
+func TestProxy_LocalTransformRejectsHTMLSuccessResponse(t *testing.T) {
+	t.Parallel()
+
+	const maintenancePage = `<!DOCTYPE html><html lang="zh-CN"><head><title>维护中</title></head><body><h1>正在进行系统维护</h1></body></html>`
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "gemini-html", channelType: "gemini", models: "gemini-2.5-pro", apiKey: "sk-gem"},
+	}, map[int]string{0: "https://gemini-upstream.example.com"})
+	env.server.client = &http.Client{
+		Transport: roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"text/html; charset=utf-8"},
+				},
+				Body: io.NopCloser(strings.NewReader(maintenancePage)),
+			}, nil
+		}),
+	}
+
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil || len(configs) != 1 {
+		t.Fatalf("ListConfigs failed: configs=%d err=%v", len(configs), err)
+	}
+	cfg := configs[0]
+	cfg.ProtocolTransforms = []string{"openai"}
+	cfg.ProtocolTransformMode = model.ProtocolTransformModeLocal
+	if _, err := env.store.UpdateConfig(context.Background(), cfg.ID, cfg); err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	env.server.InvalidateChannelListCache()
+	env.server.configService.mu.Lock()
+	env.server.configService.cache["debug_log_enabled"] = &model.SystemSetting{Key: "debug_log_enabled", Value: "true"}
+	env.server.configService.mu.Unlock()
+
+	w := doProxyRequest(t, env.engine, "/v1/chat/completions", map[string]any{
+		"model":    "gemini-2.5-pro",
+		"stream":   true,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}, nil)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("HTTP 200 HTML upstream should become 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(strings.ToLower(w.Body.String()), "<!doctype html") {
+		t.Fatalf("maintenance page leaked as a successful client response: %s", w.Body.String())
+	}
+
+	entry := waitForProxyLog(t, env, "gemini-2.5-pro")
+	if entry.StatusCode != http.StatusBadGateway {
+		t.Fatalf("persisted status=%d, want 502", entry.StatusCode)
+	}
+	debugLog, err := env.store.GetDebugLogByLogID(context.Background(), entry.ID)
+	if err != nil || debugLog == nil {
+		t.Fatalf("GetDebugLogByLogID failed: debug=%+v err=%v", debugLog, err)
+	}
+	if string(debugLog.RespBody) != maintenancePage {
+		t.Fatalf("debug original response=%q, want maintenance page", debugLog.RespBody)
+	}
+	if len(debugLog.TranslatedRespBody) != 0 {
+		t.Fatalf("invalid HTML response must not have translated content: %s", debugLog.TranslatedRespBody)
+	}
+}
+
 func TestProxy_Success_NonStreaming_AnthropicToGeminiTransform(t *testing.T) {
 	t.Parallel()
 
@@ -1335,6 +1540,7 @@ func TestProxy_Success_Streaming_OpenAIToGeminiTransform(t *testing.T) {
 
 	var gotPath string
 	var gotBody []byte
+	rawUpstreamBody := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" World\"}]}}]}\n\ndata: [DONE]\n\n"
 
 	env := setupProxyTestEnv(t, []testChannel{
 		{name: "gemini-ch", channelType: "gemini", models: "gemini-2.5-pro", apiKey: "sk-gem"},
@@ -1344,11 +1550,12 @@ func TestProxy_Success_Streaming_OpenAIToGeminiTransform(t *testing.T) {
 		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			gotPath = r.URL.Path
 			gotBody, _ = io.ReadAll(r.Body)
-			body := bytes.NewBufferString("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" World\"}]}}]}\n\ndata: [DONE]\n\n")
+			body := bytes.NewBufferString(rawUpstreamBody)
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header: http.Header{
-					"Content-Type": []string{"text/event-stream"},
+					"Content-Type":     []string{"text/event-stream"},
+					"X-Upstream-Trace": []string{"stream-response"},
 				},
 				Body: io.NopCloser(body),
 			}, nil
@@ -1366,12 +1573,15 @@ func TestProxy_Success_Streaming_OpenAIToGeminiTransform(t *testing.T) {
 		t.Fatalf("UpdateConfig failed: %v", err)
 	}
 	env.server.InvalidateChannelListCache()
+	env.server.configService.mu.Lock()
+	env.server.configService.cache["debug_log_enabled"] = &model.SystemSetting{Key: "debug_log_enabled", Value: "true"}
+	env.server.configService.mu.Unlock()
 
 	w := doProxyRequest(t, env.engine, "/v1/chat/completions", map[string]any{
 		"model":    "gemini-2.5-pro",
 		"stream":   true,
 		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	}, nil)
+	}, map[string]string{"X-Client-Trace": "stream-request"})
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -1391,6 +1601,39 @@ func TestProxy_Success_Streaming_OpenAIToGeminiTransform(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected done marker, got %s", body)
+	}
+
+	entry := waitForProxyLog(t, env, "gemini-2.5-pro")
+	debugLog, err := env.store.GetDebugLogByLogID(context.Background(), entry.ID)
+	if err != nil {
+		t.Fatalf("GetDebugLogByLogID failed: %v", err)
+	}
+	if debugLog == nil || !debugLog.ProtocolTransformed {
+		t.Fatalf("expected persisted protocol transform debug log, got %+v", debugLog)
+	}
+	if got := gjson.GetBytes(debugLog.OriginalReqBody, "messages.0.content").String(); got != "hi" {
+		t.Fatalf("original request content=%q, want hi; body=%s", got, debugLog.OriginalReqBody)
+	}
+	if debugLog.OriginalReqURL != "/v1/chat/completions" {
+		t.Fatalf("original request URL=%q, want /v1/chat/completions", debugLog.OriginalReqURL)
+	}
+	if got := gjson.Get(debugLog.OriginalReqHeaders, "X-Client-Trace").String(); got != "stream-request" {
+		t.Fatalf("original request header=%q, want stream-request; headers=%s", got, debugLog.OriginalReqHeaders)
+	}
+	if string(debugLog.RespBody) != rawUpstreamBody {
+		t.Fatalf("original response body mismatch:\ngot=%s\nwant=%s", debugLog.RespBody, rawUpstreamBody)
+	}
+	if string(debugLog.TranslatedRespBody) != w.Body.String() {
+		t.Fatalf("translated response should match client body:\ndebug=%s\nclient=%s", debugLog.TranslatedRespBody, w.Body.String())
+	}
+	if debugLog.TranslatedRespStatus != http.StatusOK {
+		t.Fatalf("translated response status=%d, want 200", debugLog.TranslatedRespStatus)
+	}
+	if got := gjson.Get(debugLog.TranslatedRespHeaders, "Content-Type").String(); got != "text/event-stream" {
+		t.Fatalf("translated response content type=%q, want text/event-stream; headers=%s", got, debugLog.TranslatedRespHeaders)
+	}
+	if got := gjson.Get(debugLog.TranslatedRespHeaders, "X-Upstream-Trace").String(); got != "stream-response" {
+		t.Fatalf("translated response trace header=%q, want stream-response; headers=%s", got, debugLog.TranslatedRespHeaders)
 	}
 }
 
@@ -3954,6 +4197,55 @@ func TestProxy_MultiURLFallbackOn598_DoesNotChannelCooldownEarly(t *testing.T) {
 	}
 	if _, exists := cooldowns[channelID]; exists {
 		t.Fatalf("unexpected channel cooldown for multi-url fallback success, channel_id=%d", channelID)
+	}
+}
+
+func TestProxy_StreamTimeoutDoesNotRetryAfterResponseCommit(t *testing.T) {
+	t.Parallel()
+
+	upstreamStarted := make(chan struct{})
+	upstreamTimedOut := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(upstreamStarted)
+		<-r.Context().Done()
+	}))
+	defer upstreamTimedOut.Close()
+
+	var fallbackCalls atomic.Int64
+	upstreamFallback := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstreamFallback.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "timeout", models: "gpt-4", priority: 100},
+		{name: "fallback", models: "gpt-4", priority: 1},
+	}, map[int]string{0: upstreamTimedOut.URL, 1: upstreamFallback.URL})
+	env.server.streamTimeout = 50 * time.Millisecond
+
+	response := doProxyRequest(t, env.engine, "/v1/chat/completions", map[string]any{
+		"model":    "gpt-4",
+		"stream":   true,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}, nil)
+
+	select {
+	case <-upstreamStarted:
+	default:
+		t.Fatal("timed-out upstream was not selected first")
+	}
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "partial") {
+		t.Fatalf("response status=%d body=%q, want committed partial stream", response.Code, response.Body.String())
+	}
+	if calls := fallbackCalls.Load(); calls != 0 {
+		t.Fatalf("fallback calls=%d, want 0 after response commit", calls)
 	}
 }
 

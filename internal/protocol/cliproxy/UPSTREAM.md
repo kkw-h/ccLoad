@@ -2,8 +2,8 @@
 
 - Repository: `https://github.com/caidaoli/CLIProxyAPI`
 - Module source path: `github.com/router-for-me/CLIProxyAPI/v7`
-- Last synchronized commit: `4edfb63e62537362a44ac4ae0bc695d4e344d446` (`fork/v8.34.0`)
-- Synchronized at: `2026-07-19`
+- Last synchronized commit: `e5ffb790d703e8320c2d4a4f841c9969e2e67b3f` (`fork/v8.43.0`)
+- Synchronized at: `2026-07-26`
 
 This directory contains the four-protocol conversion core only. Authentication,
 configuration, routing, caches, plugins, dynamic registries, network refreshers,
@@ -12,7 +12,7 @@ adaptation lives in `internal/protocol/builtin`, not in this directory.
 
 ## Synchronized tests
 
-The snapshot includes 29 upstream `_test.go` files from the same commit as the
+The snapshot includes 38 upstream `_test.go` files from the same commit as the
 production sources:
 
 - `claude/gemini`: 2
@@ -22,18 +22,25 @@ production sources:
 - `codex/gemini`: 2
 - `codex/openai/chat-completions`: 2
 - `codex/openai/responses`: 2
-- `common`: 2
+- `common`: 3
 - `gemini/claude`: 2
-- `gemini/openai/chat-completions`: 3
-- `gemini/openai/responses`: 2
+- `gemini/openai/chat-completions`: 4
+- `gemini/openai/responses`: 3
 - `openai/claude`: 2
 - `openai/gemini`: 2
 - `openai/openai/responses`: 2
+- `signature`: 4
+- `util`: 2
 
 Tests for excluded packages are not copied. Performance-only benchmarks are
 also excluded: the translator-wide benchmark requires the excluded dynamic
 Registry, Antigravity, and Interactions paths, while the Claude-to-Codex
-benchmark measures allocation details rather than a wire contract.
+benchmark measures allocation details rather than a wire contract. Upstream
+`noop_optimization_test.go` files and allocation-reuse assertions are likewise
+excluded because they test private implementation and memory reuse instead of
+the public conversion contract. The signature sanitizer's logging-only test is
+also excluded because ccLoad keeps the synchronized conversion core free of
+upstream runtime logging side effects and dependencies.
 
 ## Local contract fixes
 
@@ -53,6 +60,11 @@ documented adaptations:
   Gemini camelCase fields, Codex top-level `instructions`, terminal `[DONE]`,
   top-level cache-creation usage, and unsigned Anthropic thinking preserved as
   OpenAI reasoning.
+- Gemini Responses `[DONE]` finalizes pending reasoning and emits the local
+  terminal `response.completed` event; upstream's core-only handler stops after
+  flushing pending reasoning.
+- Gemini signature sanitization keeps upstream signature ownership and parallel
+  function-call semantics without importing its runtime debug logger.
 
 ## Updating from CLIProxyAPI
 
@@ -61,7 +73,7 @@ Codex or `/sync-cliproxy-core` in Claude Code. Both entry points resolve to the
 canonical skill under `.agents/skills/sync-cliproxy-core`.
 
 1. Fetch the ccLoad CLIProxyAPI fork and choose one immutable commit or tag.
-2. Diff both production sources and the corresponding 29 test files against
+2. Diff both production sources and the corresponding 32 test files against
    the commit above. Source and tests must always come from the same commit.
 3. Copy the changed pure conversion files and matching tests only; do not add a
    Go module import, `replace`, authentication, configuration, routing, caches,

@@ -323,12 +323,20 @@ func chatRequestErrorResult(start time.Time, testReq *testutil.TestChannelReques
 	if timeout != nil && timeout.firstStreamContentTimeoutTriggered() {
 		threshold := timeout.firstByteTimeout
 		errorMsg = fmt.Sprintf(
-			"上游首个有效流内容超时: upstream first valid stream content timeout after %.2fs (threshold=%v): %v",
+			"流式请求首个有效内容超时: upstream first valid stream content timeout after %.2fs (threshold=%v): %v",
 			time.Since(start).Seconds(),
 			threshold,
 			err,
 		)
 		statusCode = util.StatusFirstByteTimeout
+	} else if timeout != nil && timeout.streamTimeoutTriggered() {
+		errorMsg = fmt.Sprintf(
+			"流式请求总超时: upstream stream timeout after %.2fs (threshold=%v): %v",
+			time.Since(start).Seconds(),
+			timeout.streamTimeout,
+			err,
+		)
+		statusCode = util.StatusStreamIncomplete
 	} else if testReq != nil && !testReq.Stream && timeout != nil && timeout.nonStreamTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
 		errorMsg = fmt.Sprintf(
 			"非流式请求超时: upstream timeout after %.2fs (threshold=%v): %v",
@@ -550,6 +558,7 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 	var state any
 	frontendState := &chatFrontendStreamState{}
 	ctx := c.Request.Context()
+	requestPlan.debugCapture.captureTranslatedResponseMeta(resp.StatusCode, resp.Header)
 
 	src := readerWithCloser{Reader: resp.Body, Closer: resp.Body}
 	return streamTransformSSEEvents(ctx, src, c.Writer,
@@ -572,6 +581,9 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 			)
 			if err != nil {
 				return nil, err
+			}
+			for _, chunk := range translated {
+				requestPlan.debugCapture.captureTranslatedResponse(chunk)
 			}
 			var chunks [][]byte
 			for _, chunk := range translated {

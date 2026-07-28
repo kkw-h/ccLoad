@@ -98,14 +98,21 @@ func TestLog_AddLogPersistsDebugData(t *testing.T) {
 		StatusCode: 200,
 		Message:    "ok",
 		DebugData: &model.DebugLogEntry{
-			CreatedAt:   now.Unix(),
-			ReqMethod:   http.MethodPost,
-			ReqURL:      "https://api.example.com/v1/chat/completions",
-			ReqHeaders:  `{"Content-Type":"application/json"}`,
-			ReqBody:     []byte(`{"model":"gpt-4"}`),
-			RespStatus:  200,
-			RespHeaders: `{"Content-Type":"application/json"}`,
-			RespBody:    []byte(`{"ok":true}`),
+			CreatedAt:             now.Unix(),
+			ReqMethod:             http.MethodPost,
+			ReqURL:                "https://api.example.com/v1/chat/completions",
+			ReqHeaders:            `{"Content-Type":"application/json"}`,
+			ReqBody:               []byte(`{"contents":[{"role":"user"}]}`),
+			RespStatus:            200,
+			RespHeaders:           `{"Content-Type":"application/json"}`,
+			RespBody:              []byte(`{"candidates":[{"content":"ok"}]}`),
+			ProtocolTransformed:   true,
+			OriginalReqURL:        "/v1/chat/completions",
+			OriginalReqHeaders:    `{"X-Client-Trace":"original"}`,
+			OriginalReqBody:       []byte(`{"messages":[{"role":"user"}]}`),
+			TranslatedRespStatus:  http.StatusOK,
+			TranslatedRespHeaders: `{"Content-Type":"application/json"}`,
+			TranslatedRespBody:    []byte(`{"choices":[{"message":{"content":"ok"}}]}`),
 		},
 	}); err != nil {
 		t.Fatalf("add log with debug data: %v", err)
@@ -128,8 +135,62 @@ func TestLog_AddLogPersistsDebugData(t *testing.T) {
 	if debugLog.RespStatus != http.StatusOK {
 		t.Fatalf("debug resp status=%d, want 200", debugLog.RespStatus)
 	}
-	if string(debugLog.RespBody) != `{"ok":true}` {
+	if string(debugLog.RespBody) != `{"candidates":[{"content":"ok"}]}` {
 		t.Fatalf("debug resp body=%q", string(debugLog.RespBody))
+	}
+	if !debugLog.ProtocolTransformed {
+		t.Fatal("debug protocol transform flag was not persisted")
+	}
+	if string(debugLog.OriginalReqBody) != `{"messages":[{"role":"user"}]}` {
+		t.Fatalf("debug original req body=%q", string(debugLog.OriginalReqBody))
+	}
+	if debugLog.OriginalReqURL != "/v1/chat/completions" || debugLog.OriginalReqHeaders != `{"X-Client-Trace":"original"}` {
+		t.Fatalf("debug original request metadata=%+v", debugLog)
+	}
+	if debugLog.TranslatedRespStatus != http.StatusOK || debugLog.TranslatedRespHeaders != `{"Content-Type":"application/json"}` {
+		t.Fatalf("debug translated response metadata=%+v", debugLog)
+	}
+	if string(debugLog.TranslatedRespBody) != `{"choices":[{"message":{"content":"ok"}}]}` {
+		t.Fatalf("debug translated resp body=%q", string(debugLog.TranslatedRespBody))
+	}
+}
+
+func TestDebugLog_AddPersistsProtocolMetadata(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t, "add_debug_log.db")
+	entry := &model.DebugLogEntry{
+		LogID:                 42,
+		ReqMethod:             http.MethodPost,
+		ReqURL:                "https://upstream.example.com/v1/messages",
+		ReqHeaders:            `{}`,
+		ReqBody:               []byte(`{"upstream":true}`),
+		RespStatus:            http.StatusOK,
+		RespHeaders:           `{}`,
+		ProtocolTransformed:   true,
+		OriginalReqURL:        "/v1/chat/completions",
+		OriginalReqHeaders:    `{"X-Client-Trace":"direct"}`,
+		OriginalReqBody:       []byte(`{"client":true}`),
+		TranslatedRespStatus:  http.StatusOK,
+		TranslatedRespHeaders: `{"Content-Type":"application/json"}`,
+		TranslatedRespBody:    []byte(`{"translated":true}`),
+	}
+	if err := store.AddDebugLog(t.Context(), entry); err != nil {
+		t.Fatalf("AddDebugLog: %v", err)
+	}
+
+	got, err := store.GetDebugLogByLogID(t.Context(), entry.LogID)
+	if err != nil {
+		t.Fatalf("GetDebugLogByLogID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("debug log not found")
+	}
+	if got.OriginalReqURL != entry.OriginalReqURL || got.OriginalReqHeaders != entry.OriginalReqHeaders {
+		t.Fatalf("original request metadata=%+v", got)
+	}
+	if got.TranslatedRespStatus != entry.TranslatedRespStatus || got.TranslatedRespHeaders != entry.TranslatedRespHeaders {
+		t.Fatalf("translated response metadata=%+v", got)
 	}
 }
 
@@ -306,15 +367,16 @@ func TestLog_ListRangeWithCount_PreservesZeroCostMultiplier(t *testing.T) {
 
 	now := time.Now()
 	if err := store.AddLog(ctx, &model.LogEntry{
-		Time:           newJSONTime(now),
-		Model:          "gpt-5.4-mini",
-		ChannelID:      channelID,
-		StatusCode:     200,
-		Message:        "success",
-		Duration:       1.2,
-		APIKeyUsed:     "key...key",
-		Cost:           0.019,
-		CostMultiplier: 0,
+		Time:              newJSONTime(now),
+		Model:             "gpt-5.4-mini",
+		ChannelID:         channelID,
+		StatusCode:        200,
+		Message:           "success",
+		Duration:          1.2,
+		APIKeyUsed:        "key...key",
+		Cost:              0.019,
+		CostMultiplier:    0,
+		UpstreamWebsocket: true,
 	}); err != nil {
 		t.Fatalf("add log: %v", err)
 	}
@@ -334,5 +396,8 @@ func TestLog_ListRangeWithCount_PreservesZeroCostMultiplier(t *testing.T) {
 	}
 	if logs[0].CostMultiplier != 0 {
 		t.Fatalf("cost_multiplier=%v, want 0", logs[0].CostMultiplier)
+	}
+	if !logs[0].UpstreamWebsocket {
+		t.Fatal("upstream_websocket=false, want true")
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
-	"strconv"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -53,8 +53,10 @@ type Server struct {
 	protocolRegistry              *protocol.Registry
 	client                        *http.Client          // HTTP客户端（全局默认）
 	proxyTransports               sync.Map              // proxyURL → *http.Transport（渠道级代理缓存）
+	alphaSearchUnsupportedURLs    sync.Map              // alphaSearchEndpointKey → 探测失败时间
 	skipTLSVerify                 bool                  // 透传给渠道级 Transport
 	activeRequests                *activeRequestManager // 进行中请求（内存状态，不持久化）
+	responsesExecutionSessions    *responsesExecutionSessionStore
 	scheduledChannelChecksRunning atomic.Bool
 
 	// 异步统计（有界队列，避免每请求起goroutine）
@@ -62,10 +64,15 @@ type Server struct {
 	tokenStatsDropCount atomic.Int64
 
 	// 运行时配置（启动时从数据库加载，修改后重启生效）
-	maxKeyRetries       int                                 // 单个渠道内最大Key重试次数
-	firstByteTimeout    time.Duration                       // 上游首字节超时（流式请求）
-	nonStreamTimeout    time.Duration                       // 非流式请求超时
-	channelTypeTimeouts map[string]channelTypeTimeoutConfig // 按运行时上游协议覆盖超时，0=回退全局
+	maxKeyRetries    int           // 单个渠道内最大Key重试次数
+	firstByteTimeout time.Duration // 上游首字节超时（流式请求）
+	streamTimeout    time.Duration // 流式请求总超时
+	nonStreamTimeout time.Duration // 非流式请求超时
+	// 仅供测试注入（缩短 idle/ping 间隔以覆盖保活路径）；生产始终为零值，
+	// 实际取值回退到 proxy_responses_websocket.go 的常量，见 responsesWebsocketTimeouts()。
+	responsesWebsocketIdleTimeoutOverride  time.Duration
+	responsesWebsocketPingIntervalOverride time.Duration
+	channelTypeTimeouts                    map[string]channelTypeTimeoutConfig // 按运行时上游协议覆盖超时，0=回退全局
 	// 模型匹配配置（启动时从数据库加载，修改后重启生效）
 	modelFuzzyMatch bool // 未命中时启用模糊匹配（子串匹配+版本排序）
 
@@ -130,14 +137,13 @@ func NewServer(store storage.Store) *Server {
 
 	// 从ConfigService读取运行时配置（启动时加载一次，修改后重启生效）
 	runtimeCfg := loadServerRuntimeConfig(configService)
+	warnMigratedEnvSettings()
 
-	// 最大并发数保留环境变量读取（启动参数，不支持Web管理）
-	maxConcurrency := config.DefaultMaxConcurrency
-	if concEnv := os.Getenv("CCLOAD_MAX_CONCURRENCY"); concEnv != "" {
-		if val, err := strconv.Atoi(concEnv); err == nil && val > 0 {
-			maxConcurrency = val
-		}
-	}
+	// 请求体上限与冷却时长是包级状态，启动期一次性注入后由请求链路只读消费
+	setMaxBodyBytesLimits(runtimeCfg.MaxBodyBytes, runtimeCfg.MaxImageBodyBytes)
+	util.ApplyCooldownSettings(runtimeCfg.Cooldown)
+
+	maxConcurrency := runtimeCfg.MaxConcurrency
 
 	// TLS证书验证配置（仅环境变量）
 	// 这是一个危险开关：一旦关闭证书校验，上游 HTTPS 等同明文 + 任意中间人。
@@ -161,6 +167,7 @@ func NewServer(store storage.Store) *Server {
 		// 运行时配置（启动时加载，修改后重启生效）
 		maxKeyRetries:       runtimeCfg.MaxKeyRetries,
 		firstByteTimeout:    runtimeCfg.FirstByteTimeout,
+		streamTimeout:       runtimeCfg.StreamTimeout,
 		nonStreamTimeout:    runtimeCfg.NonStreamTimeout,
 		channelTypeTimeouts: runtimeCfg.ChannelTypeTimeouts,
 		// 模型匹配配置（启动时加载，修改后重启生效）
@@ -186,9 +193,10 @@ func NewServer(store storage.Store) *Server {
 		// Token统计队列（避免每请求起goroutine）
 		tokenStatsCh: make(chan tokenStatsUpdate, config.DefaultTokenStatsBufferSize),
 
-		activeRequests:            newActiveRequestManager(),
-		channelRPMLimiter:         newChannelRPMLimiter(time.Now),
-		channelConcurrencyLimiter: newChannelConcurrencyLimiter(),
+		activeRequests:             newActiveRequestManager(),
+		responsesExecutionSessions: newResponsesExecutionSessionStore(configService),
+		channelRPMLimiter:          newChannelRPMLimiter(time.Now),
+		channelConcurrencyLimiter:  newChannelConcurrencyLimiter(),
 	}
 
 	reg := protocol.NewRegistry()
@@ -315,17 +323,53 @@ func (s *Server) StartModelCatalogSync() {
 
 type channelTypeTimeoutConfig struct {
 	FirstByteTimeout time.Duration
+	StreamTimeout    time.Duration
 	NonStreamTimeout time.Duration
 }
 
 // serverRuntimeConfig 启动期从数据库读取的运行时配置（修改后重启生效）
 type serverRuntimeConfig struct {
 	MaxKeyRetries       int
+	MaxConcurrency      int
+	MaxBodyBytes        int
+	MaxImageBodyBytes   int
 	FirstByteTimeout    time.Duration
+	StreamTimeout       time.Duration
 	NonStreamTimeout    time.Duration
 	ChannelTypeTimeouts map[string]channelTypeTimeoutConfig
 	LogRetentionDays    int
 	ModelFuzzyMatch     bool
+	Cooldown            util.CooldownSettings
+}
+
+// loadPositiveInt 读取必须为正数的配置项，非法值回退默认并告警。
+func loadPositiveInt(cs *ConfigService, key string, defaultValue int) int {
+	value := cs.GetInt(key, defaultValue)
+	if value <= 0 {
+		log.Printf("[WARN] 无效的 %s=%d（必须 > 0），已使用默认值 %d", key, value, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+// loadCooldownSettings 从系统设置读取冷却时长（秒），非法值回退默认。
+func loadCooldownSettings(cs *ConfigService) util.CooldownSettings {
+	settings := util.CooldownSettings{
+		AuthSec:      loadPositiveInt(cs, "cooldown_auth_seconds", config.DefaultCooldownAuthSeconds),
+		ServerSec:    loadPositiveInt(cs, "cooldown_server_seconds", config.DefaultCooldownServerSeconds),
+		TimeoutSec:   loadPositiveInt(cs, "cooldown_timeout_seconds", config.DefaultCooldownTimeoutSeconds),
+		RateLimitSec: loadPositiveInt(cs, "cooldown_rate_limit_seconds", config.DefaultCooldownRateLimitSeconds),
+		MaxSec:       loadPositiveInt(cs, "cooldown_max_seconds", config.DefaultCooldownMaxSeconds),
+		MinSec:       loadPositiveInt(cs, "cooldown_min_seconds", config.DefaultCooldownMinSeconds),
+	}
+	// 上下限倒挂会让指数退避直接被 max 钳死在下限之下，语义不可用，回退默认对。
+	if settings.MinSec > settings.MaxSec {
+		log.Printf("[WARN] cooldown_min_seconds=%d 大于 cooldown_max_seconds=%d，已回退默认值 %d/%d",
+			settings.MinSec, settings.MaxSec, config.DefaultCooldownMinSeconds, config.DefaultCooldownMaxSeconds)
+		settings.MinSec = config.DefaultCooldownMinSeconds
+		settings.MaxSec = config.DefaultCooldownMaxSeconds
+	}
+	return settings
 }
 
 // loadServerRuntimeConfig 从 ConfigService 加载运行时配置并校验，无效值兜底为默认值
@@ -340,6 +384,12 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 	if firstByteTimeout < 0 {
 		log.Printf("[WARN] 无效的 upstream_first_byte_timeout=%v（必须 >= 0），已设为 0（禁用首字节超时，仅流式生效）", firstByteTimeout)
 		firstByteTimeout = 0
+	}
+
+	streamTimeout := cs.GetDuration("stream_timeout", 0)
+	if streamTimeout < 0 {
+		log.Printf("[WARN] 无效的 stream_timeout=%v（必须 >= 0，0=禁用），已设为 0", streamTimeout)
+		streamTimeout = 0
 	}
 
 	nonStreamTimeout := cs.GetDuration("non_stream_timeout", 120*time.Second)
@@ -359,11 +409,16 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 
 	return serverRuntimeConfig{
 		MaxKeyRetries:       maxKeyRetries,
+		MaxConcurrency:      loadPositiveInt(cs, "max_concurrency", config.DefaultMaxConcurrency),
+		MaxBodyBytes:        loadPositiveInt(cs, "max_body_bytes", config.DefaultMaxBodyBytes),
+		MaxImageBodyBytes:   loadPositiveInt(cs, "max_image_body_bytes", config.DefaultMaxImageBodyBytes),
 		FirstByteTimeout:    firstByteTimeout,
+		StreamTimeout:       streamTimeout,
 		NonStreamTimeout:    nonStreamTimeout,
 		ChannelTypeTimeouts: channelTypeTimeouts,
 		LogRetentionDays:    logRetentionDays,
 		ModelFuzzyMatch:     modelFuzzyMatch,
+		Cooldown:            loadCooldownSettings(cs),
 	}
 }
 
@@ -390,6 +445,32 @@ func loadChannelTypeTimeouts(cs *ConfigService) map[string]channelTypeTimeoutCon
 		}
 	}
 	return timeouts
+}
+
+// migratedEnvSettings 已迁移到系统设置的旧环境变量 → 新配置项。
+// 保留告警而非静默忽略：老部署仍在 .env 里设着这些值，不提示会让人以为限额还生效。
+var migratedEnvSettings = map[string]string{
+	"CCLOAD_MAX_CONCURRENCY":         "max_concurrency",
+	"CCLOAD_MAX_BODY_BYTES":          "max_body_bytes / max_image_body_bytes",
+	"CCLOAD_COOLDOWN_AUTH_SEC":       "cooldown_auth_seconds",
+	"CCLOAD_COOLDOWN_SERVER_SEC":     "cooldown_server_seconds",
+	"CCLOAD_COOLDOWN_TIMEOUT_SEC":    "cooldown_timeout_seconds",
+	"CCLOAD_COOLDOWN_RATE_LIMIT_SEC": "cooldown_rate_limit_seconds",
+	"CCLOAD_COOLDOWN_MAX_SEC":        "cooldown_max_seconds",
+	"CCLOAD_COOLDOWN_MIN_SEC":        "cooldown_min_seconds",
+}
+
+func warnMigratedEnvSettings() {
+	keys := make([]string, 0, len(migratedEnvSettings))
+	for key := range migratedEnvSettings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if os.Getenv(key) != "" {
+			log.Printf("[WARN] 环境变量 %s 已废弃且不再生效，请改用系统设置项 %s", key, migratedEnvSettings[key])
+		}
+	}
 }
 
 func channelTypeFirstByteTimeoutSettingKey(channelType string) string {
@@ -491,7 +572,7 @@ func bootstrapCostAndURLStats(store storage.Store, costCache *CostCache, urlSele
 	}
 }
 
-// startBackgroundWorkers 启动 Token 统计 / Token 清理 / 状态清理三个后台协程。
+// startBackgroundWorkers 启动所有常驻后台协程。
 // 全部纳入 s.wg，Shutdown 时通过 shutdownCh 协调退出。
 func (s *Server) startBackgroundWorkers() {
 	// 启动Token统计Worker（有界队列：性能可控，Shutdown可等待）
@@ -505,6 +586,9 @@ func (s *Server) startBackgroundWorkers() {
 	// [FIX] P1: 启动后台状态清理协程（防止内存泄漏）
 	s.wg.Add(1)
 	go s.stateCleanupLoop()
+
+	s.wg.Add(1)
+	go s.responsesExecutionSessionCleanupLoop()
 }
 
 // ================== 缓存辅助函数 ==================
@@ -746,6 +830,8 @@ func (s *Server) InvalidateChannelListCache() {
 	s.channelTypesCacheMu.Lock()
 	s.channelTypesCache = nil
 	s.channelTypesCacheMu.Unlock()
+	// URL/协议配置可能已变化，允许重新探测 alpha/search 能力。
+	s.alphaSearchUnsupportedURLs.Clear()
 }
 
 // InvalidateAPIKeysCache 使指定渠道的 API Keys 缓存失效
@@ -781,10 +867,13 @@ func (s *Server) invalidateChannelRelatedCache(channelID int64) {
 }
 
 // GetWriteTimeout 返回建议的 HTTP WriteTimeout
-// 基于 nonStreamTimeout 动态计算，确保传输层超时 >= 业务层超时
+// 基于请求总超时动态计算，确保传输层不会早于业务层截断响应
 func (s *Server) GetWriteTimeout() time.Duration {
 	const minWriteTimeout = 120 * time.Second
 	maxTimeout := s.nonStreamTimeout
+	if s.streamTimeout > maxTimeout {
+		maxTimeout = s.streamTimeout
+	}
 	for _, timeouts := range s.channelTypeTimeouts {
 		if timeouts.NonStreamTimeout > maxTimeout {
 			maxTimeout = timeouts.NonStreamTimeout
@@ -799,6 +888,7 @@ func (s *Server) GetWriteTimeout() time.Duration {
 func (s *Server) resolveProtocolTimeouts(cfg *model.Config, plan protocol.TransformPlan) channelTypeTimeoutConfig {
 	timeouts := channelTypeTimeoutConfig{
 		FirstByteTimeout: s.firstByteTimeout,
+		StreamTimeout:    s.streamTimeout,
 		NonStreamTimeout: s.nonStreamTimeout,
 	}
 
@@ -848,6 +938,16 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		apiV1Beta.Any("/*path", s.HandleProxyRequest)
 	}
 
+	// Codex CLI 直连路由别名（chatgpt_base_url 兼容），对齐 CLIProxyAPI 的
+	// codexDirect 路由组。只注册 WS 升级用到的 GET：非 WS 流量落到这条路径在
+	// DetectRequestFamily 下解析不出协议族，超出「对齐 WS 别名」的范围，不注册 POST。
+	codexDirect := r.Group("/backend-api/codex")
+	codexDirect.Use(s.authService.RequireAPIAuth())
+	codexDirect.Use(captureClientRequestMetadata())
+	{
+		codexDirect.GET("/responses", s.HandleProxyRequest)
+	}
+
 	// 健康检查（公开访问，无需认证，K8s liveness/readiness probe）
 	r.GET("/health", s.HandleHealth)
 
@@ -891,6 +991,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/:id/key-disable", s.HandleAPIKeyDisable)
 		admin.POST("/channels/:id/key-enable", s.HandleAPIKeyEnable)
 		admin.POST("/channels/models/fetch", s.HandleFetchModelsPreview) // 临时渠道配置获取模型列表
+		admin.POST("/channels/websocket-probe", s.HandleChannelWebsocketProbe)
 		admin.POST("/channels/models/refresh-batch", s.HandleBatchRefreshModels)
 		admin.GET("/channels/:id/models/fetch", s.HandleFetchModels) // 获取渠道可用模型列表(新增)
 		admin.POST("/channels/:id/models", s.HandleAddModels)        // 添加渠道模型
@@ -908,6 +1009,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/debug-logs/merged-response", s.HandleMergeDebugResponse)
 		admin.GET("/debug-logs/:log_id", s.HandleGetDebugLog)
 		admin.GET("/active-requests", s.HandleActiveRequests) // 进行中请求（内存状态）
+		admin.GET("/runtime-metrics", s.HandleRuntimeMetrics)
 		admin.GET("/active-requests/:request_id/debug-log", s.HandleGetActiveRequestDebugLog)
 		admin.GET("/metrics", s.HandleMetrics)
 		admin.GET("/stats", s.HandleStats)
@@ -1114,6 +1216,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	// 取消server级context，通知所有派生的后台任务退出
 	s.baseCancel()
+	if s.responsesExecutionSessions != nil {
+		s.responsesExecutionSessions.close()
+	}
 
 	// 关闭shutdownCh，通知所有goroutine退出（幂等：由isShuttingDown守护）
 	close(s.shutdownCh)

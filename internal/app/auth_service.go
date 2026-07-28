@@ -372,6 +372,11 @@ func (s *AuthService) prepareAPIIdentity(c *gin.Context, tokenHash string, token
 	if !ok {
 		return nil, activeConns, maxConns, false
 	}
+	s.attachAPIIdentity(c, tokenHash, tokenID)
+	return release, activeConns, maxConns, true
+}
+
+func (s *AuthService) attachAPIIdentity(c *gin.Context, tokenHash string, tokenID int64) {
 	c.Set("token_hash", tokenHash)
 	if environment := s.authTokenEnvironment(tokenHash); environment != "" {
 		c.Set("token_environment", environment)
@@ -383,7 +388,6 @@ func (s *AuthService) prepareAPIIdentity(c *gin.Context, tokenHash string, token
 	case s.lastUsedCh <- tokenHash:
 	default:
 	}
-	return release, activeConns, maxConns, true
 }
 
 func (s *AuthService) resolveAuthToken(token string) (tokenHash string, expiresAt, tokenID int64, exists bool) {
@@ -499,6 +503,12 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "token expired"})
 			c.Abort()
+			return
+		}
+
+		if isResponsesWebsocketUpgradeRequest(c.Request) {
+			s.attachAPIIdentity(c, tokenHash, tokenID)
+			c.Next()
 			return
 		}
 

@@ -46,7 +46,8 @@ ccLoad handles those cases with:
 - **Automatic failover**: Failed keys, models, channels, and URLs are skipped according to the classified error scope.
 - **Model-aware cooldown**: Structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, and model-unavailable 404 errors all cool only the actual upstream model first; other models on the same channel remain available. The channel is promoted to cooldown only after every configured model or every enabled key is cooling.
 - **Multi-URL scheduling**: A single channel can use multiple upstream URLs, weighted by observed latency and health.
-- **Protocol transforms**: Anthropic, OpenAI, Gemini, and Codex request/response families can be converted at the gateway.
+- **Multi-protocol handling**: Each channel has one primary protocol plus optional additional protocols, handled by upstream passthrough or ccLoad translation.
+- **Responses WebSocket bridging**: Authenticated Codex clients can keep a downstream WebSocket while each candidate uses native Codex WebSocket or the existing HTTP/SSE transport.
 - **Live monitoring**: Active requests, logs, token usage, TTFB, cost, and upstream details are visible in the web dashboard.
 - **Soft-error detection**: HTTP 200 responses that are actually errors trigger the same failover path as regular upstream failures. Common cases include:
   - JSON responses containing `{"error": {...}}` structure
@@ -64,6 +65,7 @@ ccLoad handles those cases with:
 - 🔒 **Race-Safe** - Key selector race condition protection, startup config validation, automatic resource cleanup
 - 📊 **Real-time Monitoring** - Built-in trend analysis, logging, and stats dashboard, **Token usage stats** with time range selection and per-token classification
 - 🎯 **Transparent Proxy** - Supports Claude Code, Codex, Gemini, and OpenAI compatible APIs with smart auth detection
+- 🔌 **Responses WebSocket** - Downstream Codex WebSocket sessions bridge to native Codex WebSocket or HTTP/SSE candidates with transcript-aware failover
 - 📦 **Single Binary Deployment** - No external dependencies, embedded SQLite included
 - 🔒 **Secure Authentication** - Token-based admin interface and API access control
 - 🏷️ **Build Tags** - GOTAGS support, high-performance JSON library enabled by default
@@ -79,7 +81,7 @@ ccLoad handles those cases with:
 - 💵 **service_tier Pricing** - OpenAI priority/flex/default tier multipliers for accurate cost accounting
 - 🖼️ **Image Tool Billing** - Responses image_generation/gpt-image-2 cost accounting
 - 📉 **Tiered Pricing** - GPT-5.4/Qwen-Plus/Gemini long-context step pricing, auto-applies lower rate at token thresholds
-- 🔄 **Protocol Transform** - All 12 directed Anthropic/OpenAI/Gemini/Codex conversion paths for requests plus streaming and non-streaming responses, including tool, reasoning/signature, usage, and SSE normalization
+- 🔄 **Multi-Protocol Handling** - One primary protocol plus additional protocols, with all 12 local conversion paths available when upstream passthrough is not appropriate
 - 💬 **Conversational Model Testing** - Channel/model/chat testing modes with image upload, reasoning level, built-in search, and chat export
 - 🔍 **Debug Logs** - Upstream request/response raw data capture with sensitive header masking, essential for troubleshooting
 - 🕐 **Scheduled Checks** - Background periodic channel availability probing, auto-detect failed channels
@@ -88,6 +90,8 @@ ccLoad handles those cases with:
 - 🎛️ **Log Column Customization** - Show/hide table columns per preference, settings persist in browser localStorage
 
 ## 🏗️ Architecture Overview
+
+Each channel has one primary protocol and zero or more additional protocols. `upstream` (Upstream Passthrough) forwards each client protocol natively, while `local` (ccLoad Translation) converts additional protocols into the primary protocol at the Registry boundary.
 
 ```mermaid
 graph TB
@@ -149,8 +153,8 @@ Choose the deployment method that suits you best:
 ```bash
 # Option 1: Using docker-compose (Simplest)
 curl -o docker-compose.yml https://raw.githubusercontent.com/caidaoli/ccLoad/master/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.example
-# Edit .env file to set password
+curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.docker.example
+# Edit .env file to set CCLOAD_PASS (required, service exits without it)
 docker-compose up -d
 
 # Option 2: Run image directly
@@ -169,6 +173,7 @@ git clone https://github.com/caidaoli/ccLoad.git
 cd ccLoad
 
 # Build and run with docker-compose
+cp .env.docker.example .env  # edit .env to set CCLOAD_PASS
 docker-compose -f docker-compose.build.yml up -d
 
 # Or build manually
@@ -275,7 +280,7 @@ Hugging Face Spaces provides free container hosting with Docker support, ideal f
 
    | Variable | Value | Required | Description |
    |----------|-------|----------|-------------|
-   | `CCLOAD_PASS` | `your_admin_password` | ✅ **Required** | Admin interface password |
+   | `CCLOAD_PASS` | None | ✅ **Required** | Admin interface password |
    | `CCLOAD_API_TOKENS` | `token1\|production,token2\|development` | Optional | Pre-seed API access tokens on startup |
 
    **Note**: API access tokens can be pre-seeded with `CCLOAD_API_TOKENS` or managed in the Web admin interface `/web/tokens.html`.
@@ -558,6 +563,55 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+**Codex Responses WebSocket**:
+
+The downstream and upstream WebSockets are independent. Authenticated clients can always upgrade `GET /v1/responses` or the Codex direct-route alias `GET /backend-api/codex/responses`; a channel's `websockets` field only controls whether ccLoad tries a native Codex upstream WebSocket. Channels without that field still participate through the HTTP/SSE bridge and remain eligible for failover.
+
+In `/web/channels.html`, select a Codex channel, enable **Native WebSocket**, and run **Probe**. For the Admin API, the relevant fields are shown below. Keep `url` as an `http://` or `https://` URL; ccLoad converts the scheme to `ws://` or `wss://` for native upstream WebSocket requests:
+
+```json
+{
+  "channel_type": "codex",
+  "url": "https://upstream.example.com",
+  "websockets": true
+}
+```
+
+For example, connect to the downstream endpoint with `websocat`:
+
+```bash
+websocat \
+  -H='Authorization: Bearer your-api-token' \
+  -H='Session-Id: stable-conversation-id' \
+  ws://localhost:8080/v1/responses
+```
+
+Send text frames after connecting. The first turn must use `response.create` and include `model`; later turns may use `response.append` with the previous response's `response.id`:
+
+```json
+{"type":"response.create","model":"your-model","input":[{"type":"message","role":"user","content":"Hello"}]}
+```
+
+```json
+{"type":"response.append","previous_response_id":"resp_xxx","input":[{"type":"message","role":"user","content":"Continue"}]}
+```
+
+Read Responses events until `response.completed`, `response.done`, `response.incomplete`, `response.failed`, or `error`. Only text frames are accepted; binary frames receive an `unsupported_frame` error.
+
+Failover applies only to upstream errors classified as retryable key-, model-, or channel-level failures. Client input errors, unrepresentable protocol conversions, and oversized messages do not fail over. Switching across keys, URLs, channels, or transports occurs only before any visible non-heartbeat event has been committed downstream. One same-upstream native WebSocket reconnect uses the separate semantic boundary described below.
+
+| Current upstream | Next action | ccLoad behavior | Client behavior |
+|---|---|---|---|
+| HTTP/SSE fails before a visible event is committed | Try another HTTP/SSE candidate | Switches internally and replays the complete transcript | None |
+| Native WS disconnect or `previous_response_not_found` before a semantic event | Reconnect the same upstream | Reconnects once internally and replays the complete transcript | None |
+| Native WS fails before a visible event is committed | Switch to HTTP/SSE or another native WS candidate | Switches internally and replays the complete transcript | None |
+| Native WS handshake rejection or EOF | Fall back to HTTP/SSE on the same channel, key, and URL | Falls back internally and replays the complete transcript | None |
+| HTTP/SSE | The next candidate is native WS | Sends `502/server_error/upstream_unavailable`, then closes downstream with code `1011` | Reconnect with the same session hint and send the complete conversation input without `previous_response_id` |
+
+For the same-upstream native WebSocket reconnect, `response.created`, `response.queued`, and `response.in_progress` are non-semantic, so ccLoad may still reconnect once after those events; every other event crosses that reconnect boundary. Those three lifecycle events are still visible events committed downstream, so they do not imply that cross-candidate failover remains available. Once text, reasoning, a tool call, or another actual output has been forwarded, ccLoad does not switch or replay, avoiding duplicate output, tool calls, and charges. Oversized messages close with code `1009` and do not fail over.
+
+Reconnects must use the same API token and a stable `Session-Id` header. `prompt_cache_key`, `Session_id`, and other cache-routing hints do not identify an execution session and never serialize or share local conversation state. An execution session is in-memory and process-local: by default, at most 32 sessions are retained and idle sessions expire after 60 minutes; at capacity, the least-recently-used idle session is evicted first (its client recovers via full-transcript replay), and only when every session is actively attached does the gateway return a capacity error. Process restarts do not restore sessions. Multi-instance deployments need sticky routing so reconnects reach the same instance. Otherwise, the client must send the complete conversation input without `previous_response_id`. Adjust the limits with `responses_ws_max_sessions` and `responses_ws_session_ttl_minutes` in system settings; inspect current usage with `GET /admin/runtime-metrics`.
+
 **Codex Alpha Search (Native Passthrough Only)**:
 
 `POST /v1/alpha/search` accepts the native Codex search payload. The `model` field is optional. This endpoint is forwarded only to channels whose resolved upstream protocol is Codex; it is not handled by local cross-protocol transforms.
@@ -613,6 +667,9 @@ curl -X POST http://localhost:8080/admin/channels \
     "name": "Claude-API",
     "api_key": "sk-ant-api03-xxx",
     "url": "https://api.anthropic.com,https://api2.anthropic.com",
+    "channel_type": "anthropic",
+    "protocol_transforms": [],
+    "protocol_transform_mode": "upstream",
     "priority": 10,
     "rpm_limit": 0,
     "max_concurrency": 0,
@@ -620,6 +677,8 @@ curl -X POST http://localhost:8080/admin/channels \
     "enabled": true
   }'
 ```
+
+> **Multi-protocol configuration**: “Primary Protocol” maps to `channel_type`; it controls model discovery, scheduled checks, and fallback behavior when no client protocol is available. “Additional Protocols” map to `protocol_transforms`. The default `protocol_transform_mode=upstream` (Upstream Passthrough) forwards the client's actual protocol natively and is intended for upstreams where one URL/key supports several protocols. `local` (ccLoad Translation) converts additional protocols into the primary protocol. Protocol is not a unique property of a key or model name, so this configuration remains explicit instead of being guessed at runtime.
 
 > **Multi-URL Note**: The `url` field supports comma-separated multiple URLs. The system uses latency-weighted random selection for optimal URL choice, with automatic cooldown for failed URLs, enabling URL-level load balancing and failover within a single channel.
 
@@ -782,8 +841,8 @@ Check out the awesome admin dashboard 👇
   - `protocol/cliproxy/`: In-tree snapshot of the pure [CLIProxyAPI](https://github.com/caidaoli/CLIProxyAPI) conversion core; provenance and synchronization rules live in [`UPSTREAM.md`](internal/protocol/cliproxy/UPSTREAM.md)
   - Upstream refresh workflow: invoke `$sync-cliproxy-core` in Codex or `/sync-cliproxy-core` in Claude Code; both resolve to the same repository Skill under `.agents/skills/`
   - Requests that cannot be represented in the selected upstream protocol return `400 Bad Request`; they do not trigger channel failover or cooldown
-  - Two modes: `upstream` (default, handled natively by upstream) / `local` (local translation)
-  - Channel config: `ProtocolTransformMode` + `ProtocolTransforms`
+  - Two protocol handling modes: `upstream` (default, Upstream Passthrough) / `local` (ccLoad Translation)
+  - Channel config: `ChannelType` (primary protocol) + `ProtocolTransforms` (additional protocols) + `ProtocolTransformMode` (protocol handling)
   - Codex `/v1/alpha/search` is native passthrough only and never enters local protocol translation
 - **Cooldown Manager** (DRY):
   - `cooldown/manager.go`: Unified cooldown decision engine
@@ -841,6 +900,8 @@ Check out the awesome admin dashboard 👇
 
 ### Environment Variables
 
+Environment variables cover bootstrap configuration only — the values ccLoad needs before a database connection exists. Everything the gateway consumes after startup (limits, cooldown durations, timeouts, health scoring) is a system setting managed from the admin console. In particular, `SQLITE_PATH`, `SQLITE_JOURNAL_MODE`, `CCLOAD_MYSQL`, `CCLOAD_POSTGRES`, `CCLOAD_ENABLE_SQLITE_REPLICA`, and `CCLOAD_SQLITE_LOG_DAYS` decide *how the database is opened*, so they cannot be stored in that same database and will stay environment variables.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CCLOAD_PASS` | None | Admin password (**Required**, exits if not set) |
@@ -857,17 +918,10 @@ Check out the awesome admin dashboard 👇
 | `TRUSTED_PROXIES` | Private ranges + Loopback + `100.64.0.0/10` | Trusted proxy CIDRs (comma-separated); `none` = trust no proxies |
 | `SQLITE_PATH` | `data/ccload.db` | SQLite database file path (SQLite mode only) |
 | `SQLITE_JOURNAL_MODE` | `WAL` | SQLite Journal mode (WAL/TRUNCATE/DELETE, recommend TRUNCATE for containers) |
-| `CCLOAD_MAX_CONCURRENCY` | `1000` | Max concurrent requests (limits simultaneous proxy requests) |
-| `CCLOAD_MAX_BODY_BYTES` | `10485760` | Max request body bytes (10MB, Images API auto-expands to 20MB) |
-| `CCLOAD_COOLDOWN_AUTH_SEC` | `300` | Auth error (401/402/403) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_SERVER_SEC` | `120` | Server error (5xx) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_TIMEOUT_SEC` | `60` | Timeout error (597/598) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_RATE_LIMIT_SEC` | `60` | Rate limit error (429) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_MAX_SEC` | `1800` | Exponential backoff cooldown max (seconds, 30 minutes) |
-| `CCLOAD_COOLDOWN_MIN_SEC` | `10` | Exponential backoff cooldown min (seconds) |
 | `CCLOAD_HOST_OVERRIDES` | None | DNS override: pin upstream domains to fixed IPs, bypassing DNS resolution. Format: `host1=ip1,host2=ip2`, e.g. `anyrouter.top=47.246.23.200`. TLS SNI/cert/Host header unaffected |
 
 > If the service sits behind a reverse proxy or load balancer, set `TRUSTED_PROXIES` explicitly so spoofed `X-Forwarded-For` values cannot affect client IP detection or login rate limiting.
+> Responses WebSocket runtime usage and limits are available from `GET /admin/runtime-metrics`.
 
 #### Hybrid Storage Mode (Primary DB + SQLite Cache)
 
@@ -897,15 +951,25 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 | Pure PostgreSQL | Set `CCLOAD_POSTGRES` | Standard production (PG) |
 | Hybrid Mode | Primary DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` | HuggingFace Spaces / high-latency primary |
 
-### Web Admin Configuration (Hot Reload Supported)
+### Web Admin Configuration (Database-backed, Auto Restart)
 
-These settings have been migrated to database, managed via Web interface `/web/settings.html`, changes take effect immediately without restart:
+These settings live in the database and are managed from `/web/settings.html`. Saving a change writes it to the database and restarts the process about two seconds later; the restart is what applies the new value, so in-flight requests finish first and there is no hot reload:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `log_retention_days` | `7` | Log retention days (-1 for permanent, 1-365 days) |
 | `max_key_retries` | `3` | Max key retries within single channel |
+| `max_concurrency` | `1000` | Max concurrent proxy requests |
+| `max_body_bytes` | `10485760` | Max request body bytes, 10MB by default |
+| `max_image_body_bytes` | `20971520` | Max Images API request body bytes, 20MB by default |
+| `cooldown_auth_seconds` | `300` | Auth error (401/402/403) initial cooldown in seconds |
+| `cooldown_server_seconds` | `120` | Server error (5xx) initial cooldown in seconds |
+| `cooldown_timeout_seconds` | `60` | Timeout error (597/598) initial cooldown in seconds |
+| `cooldown_rate_limit_seconds` | `60` | Rate limit error (429) initial cooldown in seconds |
+| `cooldown_min_seconds` | `10` | Exponential backoff cooldown floor in seconds |
+| `cooldown_max_seconds` | `1800` | Exponential backoff cooldown ceiling in seconds (an inverted floor/ceiling pair falls back to both defaults) |
 | `upstream_first_byte_timeout` | `0` | Upstream first valid stream content timeout (seconds, 0=disabled, stream only) |
+| `stream_timeout` | `0` | Stream request total timeout (seconds, 0=disabled) |
 | `non_stream_timeout` | `120` | Non-stream request timeout (seconds, 0=disabled) |
 | `anthropic_first_byte_timeout` | `0` | Anthropic first valid stream content timeout (seconds, 0=use global `upstream_first_byte_timeout`) |
 | `anthropic_non_stream_timeout` | `0` | Anthropic non-stream request timeout (seconds, 0=use global `non_stream_timeout`) |
@@ -1057,7 +1121,7 @@ storage/
 - Primary DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` → Hybrid (primary write + SQLite read cache)
 
 **Core Table Structure** (SQLite / MySQL / PostgreSQL shared):
-- `channels` - Channel config (channel-level cooldown inline, UNIQUE constraint on name, with protocol transform config, scheduled check config, RPM/concurrency limit config)
+- `channels` - Channel config (channel-level cooldown inline, UNIQUE constraint on name, with multi-protocol handling config, scheduled check config, RPM/concurrency limit config)
 - `api_keys` - API keys (key-level cooldown inline, multi-key strategies)
 - `channel_model_cooldowns` - Model-level runtime cooldown keyed by channel and actual upstream model
 - `logs` - Request logs (with base_url upstream URL tracking)
@@ -1065,7 +1129,7 @@ storage/
 - `key_rr` - Round-robin pointers (channel_id → idx)
 - `auth_tokens` - Auth tokens (with cost limits, model/channel restrictions, concurrency limits, first byte time tracking)
 - `web_sessions` - Role-aware Web sessions bound to an optional API token
-- `system_settings` - System config (hot reload support)
+- `system_settings` - System config (database-backed, applied after automatic restart)
 
 **Architecture Features** (✅ 2025-12 through 2026-04 continuous improvements):
 - ✅ **Unified SQL Layer** (refactor): SQLite, MySQL, and PostgreSQL share `storage/sql/` implementation

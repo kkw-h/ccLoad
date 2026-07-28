@@ -38,6 +38,7 @@ internal/{model,config,version,testutil}/   web/  前端(HTML+assets/{css,js,loc
 | 任务 | 入口 |
 |------|------|
 | 代理主链路 | `proxy_handler.go:HandleProxyRequest` → `runProxyAttemptLoop` → `proxy_forward.go` → `proxy_stream.go` |
+| Responses WebSocket | `proxy_responses_websocket.go:HandleResponsesWebsocket` → `executeResponsesWebsocketTurn` → `runProxyAttemptLoopWithFailureBoundary`;会话状态见 `responses_execution_session.go` |
 | 渠道/Key/URL 选择 | `selector*.go`、`key_selector.go`、`smooth_weighted_rr.go`、`url_selector.go` |
 | 错误分类/冷却 | `util/classifier.go`、`cooldown/manager.go` |
 | 协议转换 | `protocol/registry.go` → `protocol/builtin/register.go` → `protocol/builtin/cliproxy_adapter.go`;核心实现/同步规则见 `protocol/cliproxy/{UPSTREAM.md,...}` |
@@ -53,6 +54,7 @@ internal/{model,config,version,testutil}/   web/  前端(HTML+assets/{css,js,loc
 - 客户端错误(406/413,404 非模型 `does not exist`)→ 直接返回,不重试
 - 成本限额达到 → 跳过该渠道
 - Key/渠道级默认指数退避:2 → 4 → 8 → 30 min;模型级优先使用上游 reset 截止时间,缺失时固定 5 min
+- Responses WebSocket 特例(仅首个语义输出前):非 WS→非 WS、原生 WS→非 WS/原生 WS 均在网关内部切换,其中 WS→非 WS 使用 execution session 的完整 transcript;非 WS 故障且下一候选为原生 WS 时返回 `status=502` 的 `server_error/upstream_unavailable` 并用 close code `1011` 断开,让 Codex 客户端完整 replay;已有语义输出后一律不切换或重放
 
 ## 自定义状态码(改相关代码前先读语义)
 
@@ -65,11 +67,14 @@ internal/{model,config,version,testutil}/   web/  前端(HTML+assets/{css,js,loc
 ## 关键机制(要点,细节读对应文件)
 
 - **选择**:渠道平滑加权轮询(按有效 Key 数)+ 渠道/Key/模型冷却感知,成本限额检查优先于冷却;模型冷却按每个渠道解析重定向/模糊匹配后的实际上游模型过滤;多 URL 探索优先→1/EWMA 加权随机,失败 URL 独立退避;渠道 URL 末尾 `#`(`ExactUpstreamURLMarker`)= 精确转发,不自动追加路径
-- **协议转换**:四协议 12 个有向转换对,覆盖请求、流式响应、非流式响应;`upstream`(原生)/`local`(本地翻译)两模式;渠道配 `ProtocolTransformMode`+`ProtocolTransforms`
+- **多协议处理**:渠道用 `ChannelType` 定主协议、`ProtocolTransforms` 定额外支持;`upstream` 上游直通,`local` 本地转换,覆盖四协议 12 个有向转换对的请求、流式与非流式响应
 - **自定义请求规则**(`custom_rules.go`):`channels.custom_request_rules` JSON;header remove/override/append、body remove/override(点分路径);`validateCustomRequestRules` 强制认证头黑名单 + 禁 CRLF
-- **上游超时**(`server.go:loadChannelTypeTimeouts`):`upstream_first_byte_timeout`(0=禁用,仅流式)、`non_stream_timeout`(120s),按渠道类型 `{type}_*` 覆盖;写回前调 `disableResponseWriteTimeout` 防 `WriteTimeout` 截断响应体
+- **系统设置无热重载**(`config_service.go`+`admin_settings.go`):`LoadDefaults` 启动读一次进内存,运行期只读;单改/重置/批量三个写入口都是写库后 `go triggerRestart()`,2 秒后重启进程生效。别在 `AdminUpdateSetting` 里加"顺手刷新缓存"——重启才是生效机制
+- **引导期配置只能是环境变量**:`ConfigService` 依赖已建好的 `storage.Store`,所以建库阶段消费的配置不可能迁进系统设置(要读设置得先开库,要开库得先知道设置)。`SQLITE_PATH`/`SQLITE_JOURNAL_MODE`(拼 DSN,`factory.go:buildSQLiteDSN`)、`CCLOAD_MYSQL`/`CCLOAD_POSTGRES`/`CCLOAD_ENABLE_SQLITE_REPLICA`/`CCLOAD_SQLITE_LOG_DAYS`(`factory.go:NewStore`)全部属于这一类,保持环境变量;运行期策略才进系统设置
+- **全局限额与冷却时长**(`server.go:loadServerRuntimeConfig`):均为系统设置,启动读一次,改后重启生效。`max_concurrency`(全局并发信号量,注意与 Auth Token 同名字段不是一回事)、`max_body_bytes`/`max_image_body_bytes`(Images 路径独立上限,同时约束 Responses WS 帧与 transcript,注入见 `setMaxBodyBytesLimits`)、`cooldown_{auth,server,timeout,rate_limit,min,max}_seconds`(注入 `util.ApplyCooldownSettings`;下限>上限时整对回退默认)。旧 `CCLOAD_MAX_CONCURRENCY`/`CCLOAD_MAX_BODY_BYTES`/`CCLOAD_COOLDOWN_*` 已废弃,仍设置时启动打 WARN
+- **上游超时**(`server.go:loadChannelTypeTimeouts`):`upstream_first_byte_timeout`(0=禁用,仅流式)、`stream_timeout`(0=禁用,流式总时长)、`non_stream_timeout`(120s),首字节与非流式超时可按渠道类型 `{type}_*` 覆盖;写回前调 `disableResponseWriteTimeout` 防 `WriteTimeout` 截断响应体
 - **Anthropic thinking**:项目生成的 Anthropic 请求用 `thinking.type=adaptive` + `output_config.effort`;anyrouter `/v1/messages` 兜底补 adaptive 并归一旧 `enabled`;anyrouter 额外注入 `anthropic-beta: context-1m`
-- **定时检测**(`channel_check_scheduler.go`):全局 `channel_check_interval_hours`(0=禁用,热重载)+ 渠道级开关
+- **定时检测**(`channel_check_scheduler.go`):全局 `channel_check_interval_hours`(0=禁用,启动读一次,改后重启生效)+ 渠道级开关
 
 ## 协议转换核心(改前必读)
 
@@ -98,6 +103,7 @@ internal/{model,config,version,testutil}/   web/  前端(HTML+assets/{css,js,loc
 
 ## 存储
 
+- 存储相关配置全是引导期环境变量,不进系统设置(原因见"关键机制"引导期配置条)
 - 模式:纯 SQLite(默认)/ 纯 MySQL(`CCLOAD_MYSQL`)/ 纯 PostgreSQL(`CCLOAD_POSTGRES`)/ 混合(主库 DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1`)
 - 互斥:`CCLOAD_MYSQL` 与 `CCLOAD_POSTGRES` 同时设置 → `log.Fatal`
 - PG DSN:URL(`postgres://user:pass@host:5432/db?sslmode=disable`)或 libpq 关键字串;驱动 `pgx/stdlib`

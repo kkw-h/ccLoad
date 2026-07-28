@@ -10,9 +10,8 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"ccLoad/internal/config"
@@ -47,17 +46,24 @@ var ErrChannelConcurrencyExceeded = errors.New("channel concurrency limit exceed
 // acquireConcurrencySlot 获取并发槽位，返回release函数和状态
 // ok=false 表示客户端已取消请求
 func (s *Server) acquireConcurrencySlot(c *gin.Context) (release func(), ok bool) {
+	release, err := s.acquireConcurrencySlotForContext(c.Request.Context())
+	if err == nil {
+		return release, true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout while waiting for slot"})
+		return nil, false
+	}
+	c.JSON(StatusClientClosedRequest, gin.H{"error": "request cancelled while waiting for slot"})
+	return nil, false
+}
+
+func (s *Server) acquireConcurrencySlotForContext(ctx context.Context) (func(), error) {
 	select {
 	case s.concurrencySem <- struct{}{}:
-		return func() { <-s.concurrencySem }, true
-	case <-c.Request.Context().Done():
-		ctxErr := c.Request.Context().Err()
-		if errors.Is(ctxErr, context.DeadlineExceeded) {
-			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout while waiting for slot"})
-			return nil, false
-		}
-		c.JSON(StatusClientClosedRequest, gin.H{"error": "request cancelled while waiting for slot"})
-		return nil, false
+		return func() { <-s.concurrencySem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -84,16 +90,7 @@ func parseIncomingRequest(c *gin.Context) (incomingRequest, error) {
 	requestMethod := c.Request.Method
 
 	// 读取请求体（带上限，防止大包打爆内存）
-	// 默认 10MB，images 路径 20MB，可通过 CCLOAD_MAX_BODY_BYTES 覆盖
-	maxBody := int64(config.DefaultMaxBodyBytes)
-	if strings.HasPrefix(requestPath, "/v1/images/") {
-		maxBody = int64(config.DefaultMaxImageBodyBytes)
-	}
-	if v := os.Getenv("CCLOAD_MAX_BODY_BYTES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxBody = int64(n)
-		}
-	}
+	maxBody := maxProxyBodyBytes(requestPath)
 	limited := io.LimitReader(c.Request.Body, maxBody+1)
 	all, err := io.ReadAll(limited)
 	if err != nil {
@@ -149,6 +146,37 @@ func parseIncomingRequest(c *gin.Context) (incomingRequest, error) {
 		isStreaming:   isStreaming,
 		hasModel:      hasModel,
 	}, nil
+}
+
+// 请求体上限（系统设置 max_body_bytes / max_image_body_bytes，启动时注入，修改后重启生效）。
+// 用 atomic 而非普通变量：值在启动期写入、请求期被多 goroutine 读取，测试也会覆写。
+var (
+	maxBodyBytesLimit      atomic.Int64
+	maxImageBodyBytesLimit atomic.Int64
+)
+
+func init() {
+	maxBodyBytesLimit.Store(config.DefaultMaxBodyBytes)
+	maxImageBodyBytesLimit.Store(config.DefaultMaxImageBodyBytes)
+}
+
+// setMaxBodyBytesLimits 注入请求体上限，非正值回退默认值。
+func setMaxBodyBytesLimits(maxBody, maxImageBody int) {
+	if maxBody <= 0 {
+		maxBody = config.DefaultMaxBodyBytes
+	}
+	if maxImageBody <= 0 {
+		maxImageBody = config.DefaultMaxImageBodyBytes
+	}
+	maxBodyBytesLimit.Store(int64(maxBody))
+	maxImageBodyBytesLimit.Store(int64(maxImageBody))
+}
+
+func maxProxyBodyBytes(requestPath string) int64 {
+	if strings.HasPrefix(requestPath, "/v1/images/") {
+		return maxImageBodyBytesLimit.Load()
+	}
+	return maxBodyBytesLimit.Load()
 }
 
 // extractModelFromMultipart 从 multipart/form-data 原始字节中提取 model 字段
@@ -224,6 +252,11 @@ func (s *Server) handleSpecialRoutes(c *gin.Context) bool {
 
 // HandleProxyRequest 通用透明代理处理器
 func (s *Server) HandleProxyRequest(c *gin.Context) {
+	if isResponsesWebsocketUpgradeRequest(c.Request) {
+		s.HandleResponsesWebsocket(c)
+		return
+	}
+
 	startTime := time.Now()
 
 	// 并发控制
@@ -281,17 +314,54 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		return
 	}
 
-	// 注册活跃请求（内存状态，用于前端实时显示）
-	activeID := s.activeRequests.Register(startTime, originalModel, c.ClientIP(), isStreaming)
-	s.activeRequests.SetThinkingEffort(activeID, thinkingEffort)
-	defer s.activeRequests.Remove(activeID)
-
 	timeout := parseTimeout(c.Request.URL.Query(), c.Request.Header)
 	ctx := c.Request.Context()
 	var cancel context.CancelFunc
 	if timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
+	}
+
+	var executionSession *responsesExecutionSession
+	var executionSessionRequestBody []byte
+	var nativeRequestBody []byte
+	if clientProtocol == protocol.Codex && isStreaming && requestMethod == http.MethodPost &&
+		protocol.DetectRequestFamily(effectiveRequestPath) == protocol.RequestFamilyResponses {
+		sessionID := responsesExecutionSessionID(c.Request.Header)
+		// Ordinary HTTP requests only need process-local state when the client supplied
+		// the explicit Session-Id contract. Cache routing hints are not conversation IDs.
+		if tokenHashStr != "" && sessionID != "" {
+			var releaseSession func()
+			var errSession error
+			executionSession, releaseSession, errSession = s.responsesExecutionSessions.acquire(tokenHashStr, sessionID)
+			if errSession != nil {
+				c.JSON(http.StatusTooManyRequests, gin.H{"error": errSession.Error()})
+				return
+			}
+			defer releaseSession()
+			if errAcquire := executionSession.acquireTurn(ctx); errAcquire != nil {
+				c.JSON(http.StatusRequestTimeout, gin.H{"error": errAcquire.Error()})
+				return
+			}
+			defer executionSession.releaseTurn()
+			replayBody, incrementalBody, localContinuation, errNormalize :=
+				executionSession.transcript.normalizeHTTPRequests(all)
+			if errNormalize != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
+				return
+			}
+			if !localContinuation {
+				executionSession = nil
+			} else {
+				executionSessionRequestBody = replayBody
+				// HTTP may continue an already established upstream websocket, but it must
+				// never create one. Without an attached socket, preserve HTTP wire semantics.
+				if _, connected := executionSession.upstream.targetSnapshot(); connected {
+					all = replayBody
+					nativeRequestBody = incrementalBody
+				}
+			}
+		}
 	}
 
 	cands, err := s.selectRouteCandidates(ctx, c, originalModel, string(clientProtocol))
@@ -305,6 +375,10 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 
 	if len(cands) == 0 {
+		if protocol.DetectRequestFamily(effectiveRequestPath) == protocol.RequestFamilyAlphaSearch {
+			writeEmptyAlphaSearchResponse(c.Writer)
+			return
+		}
 		s.AddLogAsync(&model.LogEntry{
 			Time:           model.JSONTime{Time: time.Now()},
 			Model:          originalModel,
@@ -332,6 +406,11 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			}
 		}
 	}
+	if executionSession != nil {
+		if pinnedTarget, ok := executionSession.upstream.targetSnapshot(); ok {
+			cands = prioritizePinnedCodexChannel(cands, pinnedTarget.channelID)
+		}
+	}
 
 	reqCtx := &proxyRequestContext{
 		originalModel:    originalModel,
@@ -347,22 +426,33 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		tokenEnvironment: tokenEnvironmentStr,
 		tokenID:          tokenIDInt64,
 		clientIP:         c.ClientIP(),
-		activeReqID:      activeID,
 		startTime:        startTime,
 		thinkingEffort:   thinkingEffort,
 		requestID:        util.NewUUIDv4(),
 	}
+	if executionSession != nil && nativeRequestBody != nil {
+		reqCtx.nativeCodexWS = executionSession.upstream
+		reqCtx.nativeCodexBody = nativeRequestBody
+	}
 	reqCtx.observer = &ForwardObserver{
 		OnBytesRead: func(n int64) {
-			s.activeRequests.AddBytes(activeID, n)
+			s.activeRequests.AddBytes(reqCtx.activeReqID, n)
 		},
 		OnFirstByteRead: func() {
-			s.activeRequests.SetClientFirstByteTime(activeID, time.Since(reqCtx.attemptStartTime))
+			s.activeRequests.SetClientFirstByteTime(reqCtx.activeReqID, time.Since(reqCtx.attemptStartTime))
+		},
+		OnUpstreamWebsocket: func(upstreamWebsocket bool) {
+			s.activeRequests.SetUpstreamWebsocket(reqCtx.activeReqID, upstreamWebsocket)
 		},
 		OnDebugCapture: func(dc *debugCapture) {
-			s.activeRequests.SetDebugCapture(activeID, dc)
+			s.activeRequests.SetDebugCapture(reqCtx.activeReqID, dc)
 		},
 	}
+	defer func() {
+		if reqCtx.activeReqID > 0 {
+			s.activeRequests.Remove(reqCtx.activeReqID)
+		}
+	}()
 
 	// 请求收尾即发 request 级瘦汇总事件（不带 usage/cost，仅供按 request_id 关联）。
 	// 用 defer 捕获最终写给客户端的状态码，覆盖成功/失败/提前返回各路径。
@@ -370,6 +460,9 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 
 	lastResult, succeeded := s.runProxyAttemptLoop(ctx, cands, reqCtx, c.Writer)
 	if succeeded {
+		if executionSession != nil && lastResult != nil && lastResult.hasResponsesTurn {
+			executionSession.commit(executionSessionRequestBody, lastResult.responsesTurn)
+		}
 		return
 	}
 
@@ -452,9 +545,20 @@ func (s *Server) runProxyAttemptLoop(
 	ctx context.Context,
 	cands []*model.Config,
 	reqCtx *proxyRequestContext,
-	w gin.ResponseWriter,
+	w http.ResponseWriter,
 ) (lastResult *proxyResult, succeeded bool) {
-	for _, cfg := range cands {
+	return s.runProxyAttemptLoopWithFailureBoundary(ctx, cands, reqCtx, w, nil)
+}
+
+func (s *Server) runProxyAttemptLoopWithFailureBoundary(
+	ctx context.Context,
+	cands []*model.Config,
+	reqCtx *proxyRequestContext,
+	w http.ResponseWriter,
+	stopAfterFailure func(current, next *model.Config, result *proxyResult) bool,
+) (lastResult *proxyResult, succeeded bool) {
+	sawAlphaSearchUnsupported := false
+	for index, cfg := range cands {
 		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
 
 		// 所有Key冷却：触发渠道级冷却(503)，防止后续请求重复尝试
@@ -482,8 +586,11 @@ func (s *Server) runProxyAttemptLoop(
 		}
 
 		if result != nil {
+			if result.alphaSearchUnsupported {
+				sawAlphaSearchUnsupported = true
+			}
 			if result.succeeded {
-				return nil, true
+				return result, true
 			}
 
 			lastResult = result
@@ -496,10 +603,28 @@ func (s *Server) runProxyAttemptLoop(
 			if shouldStopTryingChannels(result) {
 				break
 			}
+
+			if stopAfterFailure != nil && index+1 < len(cands) &&
+				stopAfterFailure(cfg, cands[index+1], result) {
+				break
+			}
 		}
+	}
+	if sawAlphaSearchUnsupported &&
+		protocol.DetectRequestFamily(reqCtx.requestPath) == protocol.RequestFamilyAlphaSearch &&
+		(lastResult == nil || (!lastResult.isClientCanceled && lastResult.nextAction != cooldown.ActionReturnClient)) {
+		writeEmptyAlphaSearchResponse(w)
+		return &proxyResult{status: http.StatusOK, succeeded: true, nextAction: cooldown.ActionReturnClient}, true
 	}
 
 	return lastResult, false
+}
+
+func writeEmptyAlphaSearchResponse(w http.ResponseWriter) {
+	header := make(http.Header, 2)
+	header.Set("Content-Type", "application/json; charset=utf-8")
+	header.Set("X-CCLoad-Search-Fallback", "empty")
+	writeResponseWithHeaders(w, http.StatusOK, header, []byte(`{"encrypted_output":null,"output":"","results":[]}`))
 }
 
 // writeFinalProxyResponse 所有渠道失败时写最终响应：

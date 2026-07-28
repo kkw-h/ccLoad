@@ -211,6 +211,26 @@ func validateSettingValue(key, valueType, value string) error {
 			if intVal != 0 && intVal < 1 {
 				return fmt.Errorf("auto_update_interval_hours must be 0 or >= 1")
 			}
+		case "responses_ws_max_sessions":
+			if intVal < 0 {
+				return fmt.Errorf("responses_ws_max_sessions must be >= 0")
+			}
+		case "responses_ws_session_ttl_minutes":
+			if intVal < 1 {
+				return fmt.Errorf("responses_ws_session_ttl_minutes must be >= 1")
+			}
+		case "max_concurrency",
+			"max_body_bytes",
+			"max_image_body_bytes",
+			"cooldown_auth_seconds",
+			"cooldown_server_seconds",
+			"cooldown_timeout_seconds",
+			"cooldown_rate_limit_seconds",
+			"cooldown_max_seconds",
+			"cooldown_min_seconds":
+			if intVal < 1 {
+				return fmt.Errorf("%s must be >= 1", key)
+			}
 		default:
 			if intVal < -1 {
 				return fmt.Errorf("value must be >= -1")

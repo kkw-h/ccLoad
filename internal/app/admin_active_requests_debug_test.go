@@ -18,7 +18,7 @@ func TestHandleActiveRequests_ExposesDebugAvailability(t *testing.T) {
 
 	srv := newInMemoryServer(t)
 	m := newActiveRequestManager()
-	id := m.Register(time.Now(), "claude-3-opus", "1.2.3.4", true)
+	id := beginTestActiveRequest(m, time.Now(), "claude-3-opus", "1.2.3.4", true)
 	m.SetDebugCapture(id, &debugCapture{})
 
 	srv.activeRequests = m
@@ -47,6 +47,38 @@ func TestHandleActiveRequests_ExposesDebugAvailability(t *testing.T) {
 	}
 	if got, ok := value.(bool); !ok || !got {
 		t.Fatalf("debug_log_available=%v, want true", value)
+	}
+}
+
+func TestHandleRuntimeMetricsExposesResponsesWebsocketResources(t *testing.T) {
+	srv := newInMemoryServer(t)
+	session, release, err := srv.responsesExecutionSessions.acquire("token-a", "session-a")
+	if err != nil {
+		t.Fatalf("acquire execution session: %v", err)
+	}
+	defer release()
+	session.commit([]byte(`{}`), responsesWebsocketTurnResult{completedOutput: []byte(`[]`)})
+	session.upstream.recordReconnect("test reconnect")
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/runtime-metrics", nil))
+	srv.HandleRuntimeMetrics(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	ws, ok := resp.Data["responses_websocket"].(map[string]any)
+	if !ok {
+		t.Fatalf("responses_websocket metrics missing: %#v", resp.Data)
+	}
+	if ws["sessions"] != float64(1) || ws["active_attachments"] != float64(1) || ws["transcript_bytes"] != float64(4) {
+		t.Fatalf("unexpected websocket resource metrics: %#v", ws)
+	}
+	if ws["reconnects"] != float64(1) {
+		t.Fatalf("websocket reconnect metric missing: %#v", ws)
+	}
+	if ws["max_sessions"] != float64(defaultResponsesExecutionSessionLimit) {
+		t.Fatalf("websocket limits missing: %#v", ws)
 	}
 }
 
@@ -90,7 +122,7 @@ func TestHandleGetActiveRequestDebugLog_ReturnsLiveSnapshot(t *testing.T) {
 	}
 
 	m := newActiveRequestManager()
-	id := m.Register(time.Now(), "claude-3-opus", "1.2.3.4", true)
+	id := beginTestActiveRequest(m, time.Now(), "claude-3-opus", "1.2.3.4", true)
 	m.SetDebugCapture(id, dc)
 	srv.activeRequests = m
 

@@ -10,6 +10,7 @@ func DefineChannelsTable() *TableBuilder {
 		Column("rpm_limit INT NOT NULL DEFAULT 0").
 		Column("max_concurrency INT NOT NULL DEFAULT 0").
 		Column("channel_type VARCHAR(64) NOT NULL DEFAULT 'anthropic'").
+		Column("websockets TINYINT NOT NULL DEFAULT 0").
 		Column("protocol_transform_mode VARCHAR(32) NOT NULL DEFAULT 'local'").
 		Column("enabled TINYINT NOT NULL DEFAULT 1").
 		Column("scheduled_check_enabled TINYINT NOT NULL DEFAULT 0").
@@ -173,6 +174,7 @@ func DefineLogsTable() *TableBuilder {
 		Column("message TEXT NOT NULL").
 		Column("duration DOUBLE NOT NULL DEFAULT 0.0").
 		Column("is_streaming TINYINT NOT NULL DEFAULT 0").
+		Column("upstream_websocket TINYINT NOT NULL DEFAULT 0").
 		Column("first_byte_time DOUBLE NOT NULL DEFAULT 0.0").
 		Column("api_key_used VARCHAR(191) NOT NULL DEFAULT ''").
 		Column("api_key_hash VARCHAR(64) NOT NULL DEFAULT ''"). // API Key SHA256（用于精确定位 key_index）
@@ -242,7 +244,7 @@ func DefineFingerprintTestResultsTable() *TableBuilder {
 		Index("idx_fp_test_results_created", "created_at DESC")
 }
 
-// DefineDebugLogsTable 定义debug_logs表结构（上游请求/响应原始数据）
+// DefineDebugLogsTable 定义debug_logs表结构
 // log_id 与 logs.id 1:1 对应，直接作为主键，无需独立自增ID
 func DefineDebugLogsTable() *TableBuilder {
 	return NewTable("debug_logs").
@@ -255,5 +257,12 @@ func DefineDebugLogsTable() *TableBuilder {
 		Column("resp_status INT NOT NULL DEFAULT 0").
 		Column("resp_headers TEXT NOT NULL").
 		Column("resp_body LONGBLOB").
+		Column("protocol_transformed TINYINT NOT NULL DEFAULT 0").
+		Column("original_req_url TEXT").
+		Column("original_req_headers TEXT").
+		Column("original_req_body LONGBLOB").
+		Column("translated_resp_status INT NOT NULL DEFAULT 0").
+		Column("translated_resp_headers TEXT").
+		Column("translated_resp_body LONGBLOB").
 		Index("idx_debug_logs_created_at", "created_at")
 }

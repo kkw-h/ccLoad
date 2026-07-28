@@ -46,7 +46,7 @@ function protocolTransformHintMarkup(protocol) {
 
   return `
           <span class="channel-editor-radio-hint" data-i18n="channels.modal.protocolTransformsHint">
-            ${window.i18nText('channels.modal.protocolTransformsHint', '额外暴露协议,不含原生上游协议')}
+            ${window.i18nText('channels.modal.protocolTransformsHint', '除主协议外，额外支持的协议')}
           </span>
         `;
 }
@@ -237,6 +237,140 @@ function syncScheduledCheckModelState() {
   input.disabled = wrapper.hidden || !checkbox.checked;
 }
 
+function channelSupportsNativeWebsocket() {
+  const channelType = document.querySelector('input[name="channelType"]:checked')?.value || 'anthropic';
+  return channelType === 'codex';
+}
+
+function handleChannelWebsocketClick(event) {
+  if (channelSupportsNativeWebsocket()) return true;
+
+  event.preventDefault();
+  event.currentTarget.checked = false;
+  const message = window.t('channels.websocketsCodexOnly');
+  if (window.showWarning) {
+    window.showWarning(message);
+  } else {
+    alert(message);
+  }
+  return false;
+}
+
+function setChannelWebsocketChecked(checkbox, checked) {
+  if (checkbox.checked === checked) return;
+  checkbox.checked = checked;
+  if (typeof markChannelFormDirty === 'function') {
+    markChannelFormDirty();
+  }
+}
+
+function getEnabledChannelWebsocketURLs() {
+  if (typeof getValidInlineURLs !== 'function') return [];
+  const stats = typeof urlStatsMap !== 'undefined' && urlStatsMap ? urlStatsMap : {};
+  return getValidInlineURLs().filter(url => !stats[url]?.disabled);
+}
+
+function getEnabledChannelWebsocketKeys() {
+  if (typeof getInlineKeyRows !== 'function') return [];
+  const states = typeof currentChannelKeyCooldowns !== 'undefined' ? currentChannelKeyCooldowns : [];
+  const disabledIndices = new Set(
+    (Array.isArray(states) ? states : [])
+      .filter(state => state && state.disabled)
+      .map(state => Number(state.key_index))
+  );
+  return getInlineKeyRows()
+    .map((row, index) => ({
+      index,
+      apiKey: String(row && typeof row === 'object' ? (row.api_key || '') : (row || '')).trim()
+    }))
+    .filter(item => item.apiKey && !disabledIndices.has(item.index))
+    .map(item => item.apiKey);
+}
+
+async function detectChannelWebsocketSupport(button) {
+  const checkbox = document.getElementById('channelWebsockets');
+  if (!checkbox) return false;
+  if (!channelSupportsNativeWebsocket()) {
+    setChannelWebsocketChecked(checkbox, false);
+    const message = window.t('channels.websocketsCodexOnly');
+    if (window.showWarning) window.showWarning(message);
+    else alert(message);
+    return false;
+  }
+
+  const baseURLs = getEnabledChannelWebsocketURLs();
+  if (baseURLs.length === 0) {
+    if (window.showError) window.showError(window.t('channels.fillApiUrlFirst'));
+    else alert(window.t('channels.fillApiUrlFirst'));
+    return false;
+  }
+  const apiKeys = getEnabledChannelWebsocketKeys();
+  if (apiKeys.length === 0) {
+    if (window.showError) window.showError(window.t('channels.addAtLeastOneEnabledKey'));
+    else alert(window.t('channels.addAtLeastOneEnabledKey'));
+    return false;
+  }
+
+  const originalHTML = button?.innerHTML || '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = window.t('channels.websocketsProbing');
+  }
+  try {
+    const customRules = invokeChannelEditorAction('collectCustomRulesForSubmit') || null;
+    const proxyURL = (document.getElementById('channelProxyURL')?.value || '').trim();
+    let supported = true;
+    for (const [index, baseURL] of baseURLs.entries()) {
+      const result = await fetchDataWithAuth('/admin/channels/websocket-probe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: baseURL,
+          api_key: apiKeys[index % apiKeys.length],
+          proxy_url: proxyURL,
+          custom_request_rules: customRules
+        })
+      });
+      if (!result || !result.supported) {
+        supported = false;
+        break;
+      }
+    }
+    setChannelWebsocketChecked(checkbox, supported);
+    window.showNotification(
+      window.t(supported ? 'channels.websocketsProbeSupported' : 'channels.websocketsProbeUnsupported'),
+      supported ? 'success' : 'warning'
+    );
+    return supported;
+  } catch (error) {
+    setChannelWebsocketChecked(checkbox, false);
+    const message = window.t('channels.websocketsProbeFailed', { error: error.message });
+    if (window.showError) window.showError(message);
+    else alert(message);
+    return false;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = originalHTML;
+    }
+  }
+}
+
+function syncChannelWebsocketState() {
+  const checkbox = document.getElementById('channelWebsockets');
+  if (!checkbox) return;
+  const supported = channelSupportsNativeWebsocket();
+  checkbox.disabled = false;
+  checkbox.setAttribute('aria-disabled', supported ? 'false' : 'true');
+  checkbox.closest('.channel-editor-checkbox-label')?.classList.toggle('is-disabled', !supported);
+  const probeButton = document.getElementById('channelWebsocketProbeBtn');
+  if (probeButton) {
+    probeButton.setAttribute('aria-disabled', supported ? 'false' : 'true');
+    probeButton.classList.toggle('is-disabled', !supported);
+  }
+  if (!supported) checkbox.checked = false;
+}
+
 async function resolveEditableChannel(id) {
   const cachedChannel = Array.isArray(channels) ? channels.find(c => c.id === id) : null;
   try {
@@ -318,6 +452,7 @@ function initChannelEditorActions() {
         'close-model-import-modal': () => invokeChannelEditorAction('closeModelImportModal'),
         'confirm-model-import': () => invokeChannelEditorAction('confirmModelImport'),
         'open-custom-rules-modal': () => invokeChannelEditorAction('openCustomRulesModal'),
+        'probe-channel-websocket': (actionTarget) => detectChannelWebsocketSupport(actionTarget),
         'close-custom-rules-modal': () => invokeChannelEditorAction('closeCustomRulesModal'),
         'switch-advanced-settings-tab': (actionTarget) => invokeChannelEditorAction('switchAdvancedSettingsTab', actionTarget?.dataset?.advancedSettingsTab || ''),
         'apply-advanced-settings': () => invokeChannelEditorAction('applyAdvancedSettingsFromForm'),
@@ -358,11 +493,18 @@ function initChannelEditorActions() {
     scheduledCheckCheckbox.dataset.bound = '1';
   }
 
+  const websocketCheckbox = document.getElementById('channelWebsockets');
+  if (websocketCheckbox && !websocketCheckbox.dataset.websocketBound) {
+    websocketCheckbox.addEventListener('click', handleChannelWebsocketClick);
+    websocketCheckbox.dataset.websocketBound = '1';
+  }
+
   const channelTypeRadios = document.getElementById('channelTypeRadios');
   if (channelTypeRadios && !channelTypeRadios.dataset.protocolTransformsBound) {
     channelTypeRadios.addEventListener('change', (event) => {
       if (event.target && event.target.name === 'channelType') {
         renderProtocolTransformOptions(event.target.value, getSelectedProtocolTransforms(''));
+        syncChannelWebsocketState();
         scheduleChannelDuplicateHintCheck();
       }
     });
@@ -381,8 +523,11 @@ async function showAddModal() {
   document.getElementById('channelForm').reset();
   document.getElementById('channelEnabled').checked = true;
   document.getElementById('channelScheduledCheckEnabled').checked = false;
+  const websocketCheckbox = document.getElementById('channelWebsockets');
+  if (websocketCheckbox) websocketCheckbox.checked = false;
   document.getElementById('channelScheduledCheckModel').value = '';
   document.querySelector('input[name="channelType"][value="anthropic"]').checked = true;
+  syncChannelWebsocketState();
   renderProtocolTransformOptions('anthropic', []);
   renderProtocolTransformModeOptions('upstream');
   document.querySelector('input[name="keyStrategy"][value="sequential"]').checked = true;
@@ -397,6 +542,7 @@ async function showAddModal() {
 
   inlineURLTableData = [''];
   selectedURLIndices.clear();
+  urlStatsMap = {};
   renderInlineURLTable();
   clearChannelDuplicateHint();
 
@@ -431,17 +577,16 @@ async function editChannel(id) {
   document.getElementById('channelName').value = channel.name;
   setInlineURLTableData(channel.url);
 
-  // 多URL时异步加载URL实时状态（延迟、冷却）
+  // 多URL时加载实时状态，确保检测前已拿到禁用标记
   const urlCount = getValidInlineURLs().length;
-  if (urlCount > 1) {
-    fetchURLStats(id);
-  }
+  const urlStatsPromise = urlCount > 1 ? fetchURLStats(id) : Promise.resolve();
 
   const [apiKeys, modelStats] = await Promise.all([
     apiKeysPromise,
     modelStatsPromise,
     scheduledVisibilityPromise,
-    channelTypeRenderPromise
+    channelTypeRenderPromise,
+    urlStatsPromise
   ]);
 
   const now = Date.now();
@@ -478,6 +623,9 @@ async function editChannel(id) {
   document.getElementById('channelDailyCostLimit').value = channel.daily_cost_limit || 0;
   document.getElementById('channelCostMultiplier').value = (Number(channel.cost_multiplier) >= 0 ? Number(channel.cost_multiplier) : 1);
   document.getElementById('channelEnabled').checked = channel.enabled;
+  const websocketCheckbox = document.getElementById('channelWebsockets');
+  if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
+  syncChannelWebsocketState();
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
 
@@ -762,6 +910,7 @@ async function saveChannel(event) {
     models: models,
     enabled: document.getElementById('channelEnabled').checked,
     scheduled_check_enabled: document.getElementById('channelScheduledCheckEnabled').checked,
+    websockets: !!document.getElementById('channelWebsockets')?.checked,
     scheduled_check_model: document.getElementById('channelScheduledCheckModel').value.trim(),
     custom_request_rules: invokeChannelEditorAction('collectCustomRulesForSubmit') || null,
     cooldown_detection_rules: invokeChannelEditorAction('collectCooldownDetectionRulesForSubmit') || null,
@@ -1449,6 +1598,9 @@ async function copyChannel(id, name) {
   document.getElementById('channelDailyCostLimit').value = channel.daily_cost_limit || 0;
   document.getElementById('channelCostMultiplier').value = (Number(channel.cost_multiplier) >= 0 ? Number(channel.cost_multiplier) : 1);
   document.getElementById('channelEnabled').checked = true;
+  const websocketCheckbox = document.getElementById('channelWebsockets');
+  if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
+  syncChannelWebsocketState();
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
 
@@ -2327,5 +2479,5 @@ function addCommonModels() {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { addCommonModels, fetchModelsFromAPI };
+  module.exports = { addCommonModels, detectChannelWebsocketSupport, fetchModelsFromAPI, handleChannelWebsocketClick };
 }

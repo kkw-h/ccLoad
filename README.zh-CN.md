@@ -46,7 +46,8 @@ ccLoad 直接处理这些问题：
 - 🔀 **自动故障切换**：按错误作用域跳过故障 Key、模型、渠道或 URL。
 - ⏰ **模型感知冷却**：结构化 `model_cooldown`、上游 HTTP 5xx、Key 级 429 限流和模型不可用 404 都先只冷却当前实际模型，同渠道其他模型仍可用；只有所有配置模型或所有启用 Key 都在冷却时才升级为渠道冷却。
 - 🌐 **多 URL 调度**：一个渠道可配置多个上游 URL，按延迟和健康度分配流量。
-- 🔄 **协议转换**：Anthropic、OpenAI、Gemini、Codex 请求和响应可在网关层转换。
+- 🔄 **多协议处理**：每个渠道配置一个主协议和多个额外支持协议，可选择上游直通或 ccLoad转换（实验性）。
+- 🔌 **Responses WebSocket 桥接**：认证后的 Codex 客户端可保持下游 WebSocket，各候选渠道按配置使用原生 Codex WebSocket 或现有 HTTP/SSE 传输。
 - 📊 **实时监控**：活跃请求、日志、Token、TTFB、费用和上游详情在后台直接可见。
 - 🔍 **软错误检测**：HTTP 200 伪装成功也会触发故障切换。已覆盖：
   - `{"error": {...}}` 结构的 JSON 错误
@@ -67,6 +68,7 @@ ccLoad 直接处理这些问题：
 | 🛡️ **故障秒切** | Key/渠道指数退避 + 模型精确冷却 | 单模型故障不误伤整个渠道 |
 | 📊 **数据大屏** | 趋势图+日志+Token统计 | 一眼看清用量情况 |
 | 🎯 **多API兼容** | Claude Code/Codex/Gemini/OpenAI | 一套配置走天下 |
+| 🔌 **Responses WebSocket** | 下游长连接+原生 WS/HTTP-SSE 桥接 | 保留会话并按安全边界故障切换 |
 | 📦 **开箱即用** | 单文件+嵌入式SQLite | 零依赖，下载就能跑 |
 | 🐳 **云原生** | 多架构镜像+CI/CD | amd64/arm64都支持 |
 | 🤗 **免费托管** | Hugging Face免费托管 | 适合个人试用 |
@@ -79,7 +81,7 @@ ccLoad 直接处理这些问题：
 | 💵 **service_tier定价** | OpenAI priority/flex/default层级 | 费用倍率精准计算 |
 | 🖼️ **图像工具计费** | Responses image_generation/gpt-image-2 | 图像生成成本不漏算 |
 | 📉 **分层定价** | GPT-5.4/Qwen-Plus/Gemini长上下文 | 超量token自动降档计费 |
-| 🔄 **协议转换** | 四协议全部 12 个有向转换组合 | 覆盖请求、流式与非流式响应，归一工具调用、思考/签名、用量和 SSE |
+| 🔄 **多协议处理** | 主协议 + 额外支持协议，四协议全部 12 个本地转换组合 | 默认上游直通，需要时由 ccLoad 转换请求、流式与非流式响应 |
 | 💬 **对话式模型测试** | 按渠道/按模型/对话三种模式 | 支持图片上传、思考等级、内置搜索与对话导出 |
 | 🔍 **调试日志** | 上游请求/响应原始数据捕获 | 敏感头脱敏，排障利器 |
 | 🕐 **定时检测** | 渠道可用性后台定时探测 | 自动发现故障渠道 |
@@ -89,7 +91,7 @@ ccLoad 直接处理这些问题：
 
 ## 🏗️ 架构概览
 
-请求依次经过认证/路由、渠道选择、协议 Registry、URL 选择和上游服务。`upstream` 模式原样透传，`local` 模式在 Registry 边界完成请求与响应转换；日志、指标、成本控制和三种数据库实现不侵入协议核心。
+请求依次经过认证/路由、渠道选择、协议 Registry、URL 选择和上游服务。每个渠道包含一个主协议和零个或多个额外支持协议；`upstream`（上游直通）模式按客户端协议原样转发，`local`（ccLoad转换（实验性））模式在 Registry 边界把额外协议转换为主协议。日志、指标、成本控制和三种数据库实现不侵入协议核心。
 
 ```mermaid
 graph TB
@@ -153,8 +155,8 @@ graph TB
 ```bash
 # 方式 1: 使用 docker-compose（最简单）
 curl -o docker-compose.yml https://raw.githubusercontent.com/caidaoli/ccLoad/master/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.example
-# 编辑 .env 文件设置密码
+curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.docker.example
+# 编辑 .env 文件设置 CCLOAD_PASS（必填，未设置服务会拒绝启动）
 docker-compose up -d
 
 # 方式 2: 直接运行镜像
@@ -175,6 +177,7 @@ git clone https://github.com/caidaoli/ccLoad.git
 cd ccLoad
 
 # 使用 docker-compose 构建并运行
+cp .env.docker.example .env  # 编辑 .env 设置 CCLOAD_PASS
 docker-compose -f docker-compose.build.yml up -d
 
 # 或手动构建
@@ -285,7 +288,7 @@ Hugging Face Spaces 提供免费的 Docker 托管和自动 HTTPS，适合个人�
 
    | 变量名 | 值 | 必填 | 说明 |
    |--------|-----|------|------|
-   | `CCLOAD_PASS` | `your_admin_password` | ✅ **必填** | 管理界面密码 |
+   | `CCLOAD_PASS` | 无 | ✅ **必填** | 管理界面密码 |
    | `CCLOAD_API_TOKENS` | `token1\|生产,token2\|开发` | 可选 | 启动时预置 API 访问令牌 |
 
    **注意**:
@@ -577,6 +580,55 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+**Codex Responses WebSocket**：
+
+下游 WebSocket 和上游 WebSocket 是两个独立开关：认证后的客户端始终可以升级 `GET /v1/responses`，也可以使用 Codex 直连别名 `GET /backend-api/codex/responses`；渠道的 `websockets` 只决定 ccLoad 是否尝试连接原生 Codex 上游 WebSocket。未启用该字段的渠道仍可通过 HTTP/SSE 桥接参与候选和故障切换。
+
+在 `/web/channels.html` 中选择 Codex 渠道，勾选“原生 WebSocket”并点击“检测”即可启用。使用 Admin API 时对应的关键字段如下；`url` 仍填写 `http://` 或 `https://` 地址，ccLoad 会在原生 WS 请求时转换为 `ws://` 或 `wss://`：
+
+```json
+{
+  "channel_type": "codex",
+  "url": "https://upstream.example.com",
+  "websockets": true
+}
+```
+
+以 `websocat` 为例连接下游：
+
+```bash
+websocat \
+  -H='Authorization: Bearer your-api-token' \
+  -H='Session-Id: stable-conversation-id' \
+  ws://localhost:8080/v1/responses
+```
+
+连接后发送文本帧。第一轮必须使用 `response.create` 并包含 `model`；后续轮次可使用 `response.append` 和上一轮返回的 `response.id`：
+
+```json
+{"type":"response.create","model":"your-model","input":[{"type":"message","role":"user","content":"Hello"}]}
+```
+
+```json
+{"type":"response.append","previous_response_id":"resp_xxx","input":[{"type":"message","role":"user","content":"Continue"}]}
+```
+
+客户端持续读取 Responses 事件，直到收到 `response.completed`、`response.done`、`response.incomplete`、`response.failed` 或 `error`。只支持文本帧；二进制帧会返回 `unsupported_frame`。
+
+故障切换只处理分类为可重试的 Key、模型或渠道级上游错误。客户端参数错误、无法转换的请求和消息过大不会切换。跨 Key、URL、渠道或传输的切换只发生在下游尚未提交任何可见的非心跳事件时；原生 WS 在同一上游上的一次内部重连使用下面单独说明的语义边界。
+
+| 当前上游 | 后续动作 | ccLoad 行为 | 客户端行为 |
+|---|---|---|---|
+| HTTP/SSE 在提交可见事件前失败 | 切换到另一个 HTTP/SSE 候选 | 内部切换并重放完整 transcript | 无需处理 |
+| 原生 WS 连接中断或 `previous_response_not_found`，且尚无语义事件 | 重连同一上游 | 内部重连一次并重放完整 transcript | 无需处理 |
+| 原生 WS 在提交可见事件前失败 | 切换到 HTTP/SSE 或另一个原生 WS 候选 | 内部切换并重放完整 transcript | 无需处理 |
+| 原生 WS 握手被拒绝或握手 EOF | 回退同渠道、同 Key、同 URL 的 HTTP/SSE | 内部回退并重放完整 transcript | 无需处理 |
+| HTTP/SSE | 下一候选是原生 WS | 发送 `502/server_error/upstream_unavailable`，随后以 close code `1011` 关闭下游 | 使用相同会话标识重连，并发送不带 `previous_response_id` 的完整会话输入 |
+
+原生 WS 的同一上游内部重连把 `response.created`、`response.queued` 和 `response.in_progress` 视为非语义事件，因此在这些事件之后仍可重连一次；其他事件都越过该重连边界。注意，这三个生命周期事件仍是已经提交给下游的可见事件，不能据此承诺继续跨候选切换。一旦文本、推理、工具调用或其他实际输出已经转发，ccLoad 不再切换或重放，避免重复输出、工具调用和费用。消息过大使用 close code `1009`，也不会故障切换。
+
+重连时必须使用相同的 API 令牌，并保持稳定的 `Session-Id` 请求头。`prompt_cache_key`、`Session_id` 及其他缓存路由提示不代表 execution session，不会触发本地串行，也不会共享本地会话状态。execution session 是单进程内存状态：默认最多保留 32 个会话，空闲 60 分钟后过期；容量满时优先逐出最久未访问的空闲会话（被逐出的客户端通过完整 transcript 重放恢复），仅当所有会话都在活跃使用时才返回容量错误。进程重启不会恢复会话。多实例部署必须使用粘性路由保证重连命中同一实例；否则客户端应发送不带 `previous_response_id` 的完整会话输入。上限和 TTL 可在系统设置中通过 `responses_ws_max_sessions`、`responses_ws_session_ttl_minutes` 调整，运行状态可通过 `GET /admin/runtime-metrics` 查看。
+
 **Codex Alpha Search（仅原生透传）**：
 
 `POST /v1/alpha/search` 接收 Codex 原生搜索请求，`model` 字段可省略。该端点只会转发到“实际上游协议为 Codex”的渠道，不参与本地跨协议转换。
@@ -634,6 +686,9 @@ curl -X POST http://localhost:8080/admin/channels \
     "name": "Claude-API",
     "api_key": "sk-ant-api03-xxx",
     "url": "https://api.anthropic.com,https://api2.anthropic.com",
+    "channel_type": "anthropic",
+    "protocol_transforms": [],
+    "protocol_transform_mode": "upstream",
     "priority": 10,
     "rpm_limit": 0,
     "max_concurrency": 0,
@@ -641,6 +696,8 @@ curl -X POST http://localhost:8080/admin/channels \
     "enabled": true
   }'
 ```
+
+> **多协议配置说明**：Web 界面的“主协议”对应 `channel_type`，用于模型列表拉取、定时检测和未指定客户端协议时的默认行为；“额外支持”对应 `protocol_transforms`。`protocol_transform_mode=upstream`（默认“上游直通”）会按客户端实际协议原样转发，适合同一 URL/Key 原生支持多个协议的上游；`local`（“ccLoad转换（实验性）”）会把额外协议转换成主协议。协议不是 Key 或模型名的唯一属性，因此配置保持显式，不做运行时猜测。
 
 > **多URL说明**：`url` 字段支持逗号分隔的多个URL。系统会按延迟加权随机选择最优URL，故障URL自动冷却，实现同渠道内的URL级负载均衡与故障切换。
 
@@ -805,8 +862,8 @@ ccLoad 使用的核心技术栈：
   - `protocol/cliproxy/`：仓库内维护的纯 [CLIProxyAPI](https://github.com/caidaoli/CLIProxyAPI) 转换核心快照；来源和同步规则见 [`UPSTREAM.md`](internal/protocol/cliproxy/UPSTREAM.md)
   - 上游同步入口：Codex 调 `$sync-cliproxy-core`，Claude Code 调 `/sync-cliproxy-core`；两者使用 `.agents/skills/` 下的同一份仓库 Skill
   - 无法表示为目标协议的请求返回 `400 Bad Request`，不会触发渠道故障切换或冷却
-  - 两种模式：`upstream`（默认，由上游原生处理）/ `local`（本地翻译）
-  - 渠道配置：`ProtocolTransformMode` + `ProtocolTransforms`
+  - 两种协议处理方式：`upstream`（默认，上游直通）/ `local`（ccLoad转换（实验性））
+  - 渠道配置：`ChannelType`（主协议）+ `ProtocolTransforms`（额外支持协议）+ `ProtocolTransformMode`（协议处理方式）
   - Codex `/v1/alpha/search` 仅支持原生透传，不进入本地协议转换
 - **冷却管理器**（DRY原则）：
   - `cooldown/manager.go`：统一冷却决策引擎
@@ -866,6 +923,8 @@ ccLoad 使用的核心技术栈：
 
 ### 环境变量
 
+环境变量只承载引导期配置——ccLoad 在数据库连接建立之前就需要的值。启动之后的策略类配置（限额、冷却时长、超时、健康度排序等）是系统设置，在管理界面修改。特别地，`SQLITE_PATH`、`SQLITE_JOURNAL_MODE`、`CCLOAD_MYSQL`、`CCLOAD_POSTGRES`、`CCLOAD_ENABLE_SQLITE_REPLICA` 和 `CCLOAD_SQLITE_LOG_DAYS` 决定的是*数据库怎么打开*，因此不可能存在那个数据库里，会一直保持为环境变量。
+
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `CCLOAD_PASS` | 无 | 管理界面密码（**必填**，未设置将退出） |
@@ -882,17 +941,10 @@ ccLoad 使用的核心技术栈：
 | `TRUSTED_PROXIES` | 私有网段 + Loopback + `100.64.0.0/10` | 可信代理 CIDR 列表（逗号分隔）；`none`=不信任任何代理 |
 | `SQLITE_PATH` | `data/ccload.db` | SQLite 数据库文件路径（仅 SQLite 模式） |
 | `SQLITE_JOURNAL_MODE` | `WAL` | SQLite Journal 模式（WAL/TRUNCATE/DELETE 等，容器环境建议 TRUNCATE） |
-| `CCLOAD_MAX_CONCURRENCY` | `1000` | 最大并发请求数（限制同时处理的代理请求数量） |
-| `CCLOAD_MAX_BODY_BYTES` | `10485760` | 请求体最大字节数（10MB，Images API自动放宽至20MB） |
-| `CCLOAD_COOLDOWN_AUTH_SEC` | `300` | 认证错误(401/402/403)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_SERVER_SEC` | `120` | 服务器错误(5xx)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_TIMEOUT_SEC` | `60` | 超时错误(597/598)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_RATE_LIMIT_SEC` | `60` | 限流错误(429)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_MAX_SEC` | `1800` | 指数退避冷却上限（秒，30分钟） |
-| `CCLOAD_COOLDOWN_MIN_SEC` | `10` | 指数退避冷却下限（秒） |
 | `CCLOAD_HOST_OVERRIDES` | 无 | DNS 覆盖：将上游域名钉到固定 IP，绕过 DNS 解析。格式：`host1=ip1,host2=ip2`，例如 `anyrouter.top=47.246.23.200`。不影响 TLS SNI/证书/Host 头 |
 
 > 如果你的服务挂在反向代理或负载均衡后面，建议显式设置 `TRUSTED_PROXIES`，避免伪造 `X-Forwarded-For` 干扰客户端 IP 识别和登录限速。
+> 可通过 `GET /admin/runtime-metrics` 查看 Responses WebSocket 的实时资源占用和上限。
 
 #### 混合存储模式（主库 + SQLite 缓存）
 
@@ -922,23 +974,33 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 | 纯 PostgreSQL | 设置 `CCLOAD_POSTGRES` | PostgreSQL 生产环境 |
 | 混合模式 | 主库 DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` | HuggingFace Spaces / 高延迟主库 |
 
-### Web 管理配置（支持热重载）
+### Web 管理配置（数据库存储，保存后自动重启）
 
-这些配置可在 Web 界面修改，保存后立即生效，无需重启：
+这些配置存在数据库中，在 Web 界面 `/web/settings.html` 修改。保存会先写库，随后约 2 秒自动重启进程——重启本身就是生效机制，因此没有热重载，进行中的请求会先跑完再退出：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `log_retention_days` | `7` | 日志保留天数（-1永久保留，1-365天） |
 | `max_key_retries` | `3` | 单个渠道内最大Key重试次数 |
-| `upstream_first_byte_timeout` | `0` | 上游首个有效流内容超时（秒，0=禁用，仅流式） |
+| `max_concurrency` | `1000` | 最大并发请求数，限制同时处理的代理请求数量 |
+| `max_body_bytes` | `10485760` | 请求体最大字节数，默认 10MB |
+| `max_image_body_bytes` | `20971520` | Images API 请求体最大字节数，默认 20MB |
+| `cooldown_auth_seconds` | `300` | 认证错误（401/402/403）初始冷却时间（秒） |
+| `cooldown_server_seconds` | `120` | 服务器错误（5xx）初始冷却时间（秒） |
+| `cooldown_timeout_seconds` | `60` | 超时错误（597/598）初始冷却时间（秒） |
+| `cooldown_rate_limit_seconds` | `60` | 限流错误（429）初始冷却时间（秒） |
+| `cooldown_min_seconds` | `10` | 指数退避冷却下限（秒） |
+| `cooldown_max_seconds` | `1800` | 指数退避冷却上限（秒；下限大于上限时整对回退默认值） |
+| `upstream_first_byte_timeout` | `0` | 流式请求首个有效内容超时（秒，0=禁用） |
+| `stream_timeout` | `0` | 流式请求总超时（秒，0=禁用） |
 | `non_stream_timeout` | `120` | 非流式请求超时（秒，0=禁用） |
-| `anthropic_first_byte_timeout` | `0` | Anthropic 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `anthropic_first_byte_timeout` | `0` | Anthropic 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `anthropic_non_stream_timeout` | `0` | Anthropic 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
-| `codex_first_byte_timeout` | `0` | Codex 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `codex_first_byte_timeout` | `0` | Codex 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `codex_non_stream_timeout` | `0` | Codex 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
-| `openai_first_byte_timeout` | `0` | OpenAI 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `openai_first_byte_timeout` | `0` | OpenAI 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `openai_non_stream_timeout` | `0` | OpenAI 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
-| `gemini_first_byte_timeout` | `0` | Gemini 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `gemini_first_byte_timeout` | `0` | Gemini 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `gemini_non_stream_timeout` | `0` | Gemini 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
 | `enable_health_score` | `false` | 启用基于健康度的渠道动态排序 |
 | `success_rate_penalty_weight` | `100` | 成功率惩罚权重（见下方说明） |
@@ -1096,7 +1158,7 @@ storage/
 - 主库 DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` → 混合模式
 
 **核心表结构**（SQLite / MySQL / PostgreSQL 共用）:
-- `channels` - 渠道配置（渠道级冷却内联，UNIQUE 约束 name，含协议转换配置、定时检测配置、RPM/并发限制配置）
+- `channels` - 渠道配置（渠道级冷却内联，UNIQUE 约束 name，含多协议处理配置、定时检测配置、RPM/并发限制配置）
 - `api_keys` - API 密钥（Key 级冷却内联，支持多 Key 策略）
 - `channel_model_cooldowns` - 模型级运行时冷却，主键为渠道和实际上游模型
 - `logs` - 请求日志（含base_url上游URL追踪）
@@ -1104,7 +1166,7 @@ storage/
 - `key_rr` - 轮询指针（channel_id → idx）
 - `auth_tokens` - 认证令牌（支持费用限额、模型/渠道限制、并发限制、首字节时间记录）
 - `web_sessions` - 可绑定 API Token 的角色化 Web 会话
-- `system_settings` - 系统配置（支持热重载）
+- `system_settings` - 系统配置（数据库存储，保存后自动重启生效）
 
 **架构特性** (✅ 2025-12月 ~ 2026-04月持续优化):
 - ✅ **统一SQL层**（重构）：SQLite、MySQL 和 PostgreSQL 共享 `storage/sql/` 实现

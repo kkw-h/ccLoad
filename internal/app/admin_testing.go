@@ -40,10 +40,102 @@ func (s *Server) HandleChannelURLTest(c *gin.Context) {
 	s.handleChannelTestRequest(c, true)
 }
 
+type channelWebsocketProbeRequest struct {
+	URL                string                    `json:"url" binding:"required"`
+	APIKey             string                    `json:"api_key" binding:"required"`
+	ProxyURL           string                    `json:"proxy_url,omitempty"`
+	CustomRequestRules *model.CustomRequestRules `json:"custom_request_rules,omitempty"`
+}
+
+func (r *channelWebsocketProbeRequest) Validate() error {
+	var err error
+	r.URL, err = validateChannelBaseURL(r.URL)
+	if err != nil {
+		return err
+	}
+	r.APIKey = strings.TrimSpace(r.APIKey)
+	if r.APIKey == "" {
+		return errors.New("api_key cannot be empty")
+	}
+	r.ProxyURL, err = normalizeChannelProxyURL(r.ProxyURL)
+	if err != nil {
+		return err
+	}
+	return validateCustomRequestRules(r.CustomRequestRules)
+}
+
+type channelWebsocketProbeResult struct {
+	Supported bool   `json:"supported"`
+	Status    int    `json:"status,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// HandleChannelWebsocketProbe 只探测 Codex Responses WebSocket 握手能力。
+// 它不发送模型请求，不写日志、冷却或渠道配置。
+func (s *Server) HandleChannelWebsocketProbe(c *gin.Context) {
+	var probe channelWebsocketProbeRequest
+	if err := BindAndValidate(c, &probe); err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, "invalid websocket probe request: "+err.Error())
+		return
+	}
+
+	cfg := &model.Config{
+		ChannelType:        util.ChannelTypeCodex,
+		URL:                probe.URL,
+		ProxyURL:           probe.ProxyURL,
+		CustomRequestRules: probe.CustomRequestRules,
+	}
+	testReq := &testutil.TestChannelRequest{Model: "websocket-probe", Stream: true, Content: "probe"}
+	fullURL, headers, _, err := (&testutil.CodexTester{}).Build(cfg, probe.APIKey, testReq)
+	if err != nil {
+		RespondError(c, http.StatusBadRequest, fmt.Errorf("build websocket probe: %w", err))
+		return
+	}
+	applyHeaderRules(headers, cfg.HeaderRules())
+	websocketURL, err := codexWebsocketURL(fullURL)
+	if err != nil {
+		RespondError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	conn, resp, dialErr := s.codexWebsocketDialer(cfg).DialContext(
+		c.Request.Context(), websocketURL, codexWebsocketHeaders(headers),
+	)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}
+	if dialErr != nil {
+		errorMessage := dialErr.Error()
+		if resp != nil && resp.Status != "" {
+			errorMessage = resp.Status
+		}
+		RespondJSON(c, http.StatusOK, channelWebsocketProbeResult{
+			Supported: false,
+			Status:    status,
+			Error:     errorMessage,
+		})
+		return
+	}
+
+	RespondJSON(c, http.StatusOK, channelWebsocketProbeResult{
+		Supported: true,
+		Status:    http.StatusSwitchingProtocols,
+	})
+}
+
 type channelTestRequestPlan struct {
 	clientProtocol   string
 	upstreamProtocol string
 	clientTester     testutil.ChannelTester
+	clientURL        string
+	clientHeaders    http.Header
 	fullURL          string
 	headers          http.Header
 	requestBody      []byte
@@ -55,9 +147,12 @@ type channelTestRequestPlan struct {
 type channelTestTimeout struct {
 	cancel                     context.CancelFunc
 	firstByteTimeout           time.Duration
+	streamTimeout              time.Duration
 	nonStreamTimeout           time.Duration
 	firstStreamContentTimer    *time.Timer
+	streamTimer                *time.Timer
 	firstStreamContentTimedOut atomic.Bool
+	streamTimedOut             atomic.Bool
 }
 
 func (t *channelTestTimeout) cancelAll() {
@@ -66,6 +161,9 @@ func (t *channelTestTimeout) cancelAll() {
 	}
 	if t.firstStreamContentTimer != nil {
 		t.firstStreamContentTimer.Stop()
+	}
+	if t.streamTimer != nil {
+		t.streamTimer.Stop()
 	}
 	if t.cancel != nil {
 		t.cancel()
@@ -81,6 +179,10 @@ func (t *channelTestTimeout) markFirstStreamContent() {
 
 func (t *channelTestTimeout) firstStreamContentTimeoutTriggered() bool {
 	return t != nil && t.firstStreamContentTimedOut.Load()
+}
+
+func (t *channelTestTimeout) streamTimeoutTriggered() bool {
+	return t != nil && t.streamTimedOut.Load()
 }
 
 func newChannelTester(protocolName string) testutil.ChannelTester {
@@ -166,10 +268,17 @@ func (s *Server) newChannelTestTimeoutContextWithTimeouts(parent context.Context
 	timeout := &channelTestTimeout{
 		cancel:           cancel,
 		firstByteTimeout: timeouts.FirstByteTimeout,
+		streamTimeout:    timeouts.StreamTimeout,
 		nonStreamTimeout: timeouts.NonStreamTimeout,
 	}
 
 	if stream {
+		if timeouts.StreamTimeout > 0 {
+			timeout.streamTimer = time.AfterFunc(timeouts.StreamTimeout, func() {
+				timeout.streamTimedOut.Store(true)
+				cancel()
+			})
+		}
 		if timeouts.FirstByteTimeout > 0 {
 			timeout.firstStreamContentTimer = time.AfterFunc(timeouts.FirstByteTimeout, func() {
 				timeout.firstStreamContentTimedOut.Store(true)
@@ -199,7 +308,12 @@ func (s *Server) describeChannelTestTimeoutError(start time.Time, testReq *testu
 			threshold = s.firstByteTimeout
 		}
 		return util.StatusFirstByteTimeout,
-			fmt.Sprintf("上游首个有效流内容超时: upstream first valid stream content timeout after %.2fs (threshold=%v): %v", durationSec, threshold, err),
+			fmt.Sprintf("流式请求首个有效内容超时: upstream first valid stream content timeout after %.2fs (threshold=%v): %v", durationSec, threshold, err),
+			true
+	}
+	if timeout.streamTimeoutTriggered() {
+		return util.StatusStreamIncomplete,
+			fmt.Sprintf("流式请求总超时: upstream stream timeout after %.2fs (threshold=%v): %v", durationSec, timeout.streamTimeout, err),
 			true
 	}
 	if !testReq.Stream && timeout != nil && timeout.nonStreamTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
@@ -293,6 +407,8 @@ func (s *Server) buildChannelTestRequestPlan(
 		clientProtocol:   clientProtocol,
 		upstreamProtocol: upstreamProtocol,
 		clientTester:     clientTester,
+		clientURL:        fullURL,
+		clientHeaders:    cloneHeaders(headers),
 		fullURL:          fullURL,
 		headers:          headers,
 		requestBody:      body,
@@ -368,10 +484,12 @@ func parseTestStreamResponseBytes(
 
 	result["raw_response"] = collector.rawResponse()
 	if scanner.Err() != nil {
+		result["success"] = false
 		result["error"] = "读取流式响应失败: " + scanner.Err().Error()
 		return result
 	}
 	if collector.dataLineCount == 0 {
+		result["success"] = false
 		result["error"] = summarizeUnexpectedTestResponse("text/event-stream", raw)
 		return result
 	}
@@ -688,11 +806,12 @@ func (s *Server) testChannelAPIWithURL(
 ) map[string]any {
 	start := time.Now()
 	var (
-		req             *http.Request
-		requestPlan     *channelTestRequestPlan
-		cancel          context.CancelFunc
-		capacityRelease func()
-		err             error
+		req              *http.Request
+		requestPlan      *channelTestRequestPlan
+		cancel           context.CancelFunc
+		capacityRelease  func()
+		websocketSession *codexUpstreamWebsocketSession
+		err              error
 	)
 	if testReq.WaitForCapacity {
 		var cfgForBuild *model.Config
@@ -718,10 +837,56 @@ func (s *Server) testChannelAPIWithURL(
 	}
 	defer cancel()
 	ctx := req.Context()
+	useNativeCodexWebsocket := cfg.Websockets && testReq.Stream &&
+		clientProtocol == string(protocol.Codex) && requestPlan.upstreamProtocol == string(protocol.Codex)
+	if useNativeCodexWebsocket {
+		preparedBody, prepareErr := buildCodexWebsocketRequestBody(requestPlan.requestBody)
+		if prepareErr != nil {
+			if capacityRelease != nil {
+				capacityRelease()
+			}
+			return map[string]any{
+				"success":     false,
+				"error":       prepareErr.Error(),
+				"duration_ms": time.Since(start).Milliseconds(),
+			}
+		}
+		websocketURL, websocketURLErr := codexWebsocketURL(requestPlan.fullURL)
+		if websocketURLErr != nil {
+			if capacityRelease != nil {
+				capacityRelease()
+			}
+			return map[string]any{
+				"success":     false,
+				"error":       websocketURLErr.Error(),
+				"duration_ms": time.Since(start).Milliseconds(),
+			}
+		}
+		debugRequest := req.Clone(ctx)
+		debugRequest.Method = "WEBSOCKET"
+		debugRequest.URL, err = neturl.Parse(websocketURL)
+		if err != nil {
+			if capacityRelease != nil {
+				capacityRelease()
+			}
+			return map[string]any{
+				"success":     false,
+				"error":       "解析 WebSocket URL 失败: " + err.Error(),
+				"duration_ms": time.Since(start).Milliseconds(),
+			}
+		}
+		requestPlan.fullURL = websocketURL
+		requestPlan.requestBody = preparedBody
+		requestPlan.debugCapture = s.captureDebugRequest(debugRequest, preparedBody)
+		websocketSession = newCodexUpstreamWebsocketSession()
+		defer websocketSession.Close()
+	}
 
 	// 发送请求
 	var resp *http.Response
-	if capacityRelease != nil {
+	if useNativeCodexWebsocket {
+		resp, err = s.doChannelTestCodexWebsocket(ctx, cfg, websocketSession, req, requestPlan.requestBody, capacityRelease)
+	} else if capacityRelease != nil {
 		resp, err = s.doReservedUpstreamRequest(cfg, req, capacityRelease, nil)
 	} else {
 		resp, err = s.doUpstreamRequest(cfg, req)
@@ -769,6 +934,12 @@ func (s *Server) testChannelAPIWithURL(
 		"status_code":  resp.StatusCode,
 		"is_streaming": testReq.Stream,
 	}
+	if useNativeCodexWebsocket {
+		result["transport"] = "websocket"
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			result["websocket_handshake_status"] = http.StatusSwitchingProtocols
+		}
+	}
 
 	// 始终返回上游请求原始数据，便于调试排查（不依赖 debug_log_enabled）
 	result["upstream_request_url"] = requestPlan.fullURL
@@ -813,6 +984,28 @@ func (s *Server) testChannelAPIWithURL(
 	return attachTestDebugData(requestPlan, resp, s.parseTestNonStreamResponse(ctx, requestPlan, testReq, resp, contentType, start, respBody, result))
 }
 
+func (s *Server) doChannelTestCodexWebsocket(
+	ctx context.Context,
+	cfg *model.Config,
+	session *codexUpstreamWebsocketSession,
+	req *http.Request,
+	body []byte,
+	capacityRelease func(),
+) (*http.Response, error) {
+	if capacityRelease == nil {
+		resp, _, _, err := s.doCodexWebsocketRequest(ctx, cfg, session, req, body, nil, nil)
+		return resp, err
+	}
+
+	resp, _, _, err := session.roundTrip(ctx, cfg, s.codexWebsocketDialer(cfg), req, body, nil, nil, s.skipTLSVerify)
+	if err != nil || resp == nil || resp.Body == nil {
+		capacityRelease()
+		return resp, err
+	}
+	resp.Body = &releaseOnCloseReadCloser{ReadCloser: resp.Body, release: capacityRelease}
+	return resp, nil
+}
+
 // parseTestNonStreamResponse 解析非流式响应（成功/失败两路），写入 result 并返回。
 // 提取自 testChannelAPIWithURL 内嵌闭包，行为保持不变。
 func (s *Server) parseTestNonStreamResponse(
@@ -846,6 +1039,11 @@ func (s *Server) parseTestNonStreamResponse(
 				return result
 			}
 			parseBody = translatedBody
+			translatedHeader := resp.Header.Clone()
+			translatedHeader.Set("Content-Type", "application/json")
+			translatedHeader.Del("Content-Encoding")
+			requestPlan.debugCapture.captureTranslatedResponseMeta(resp.StatusCode, translatedHeader)
+			requestPlan.debugCapture.captureTranslatedResponse(translatedBody)
 		}
 
 		parsed := requestPlan.clientTester.Parse(resp.StatusCode, parseBody)
@@ -953,6 +1151,13 @@ func (s *Server) newTestUpstreamRequest(
 	}
 	applyHeaderRules(req.Header, cfgForBuild.HeaderRules())
 	requestPlan.debugCapture = s.captureDebugRequest(req, requestPlan.requestBody)
+	if requestPlan.clientProtocol != requestPlan.upstreamProtocol {
+		originalHeaders := cloneHeaders(requestPlan.clientHeaders)
+		for key, value := range testReq.Headers {
+			originalHeaders.Set(key, value)
+		}
+		requestPlan.debugCapture.markProtocolTransform(extractRequestPath(requestPlan.clientURL), originalHeaders, requestPlan.clientBody)
+	}
 
 	return req, timeout.cancelAll, nil
 }
@@ -995,6 +1200,12 @@ func (s *Server) parseTestTranslatedSSEResponse(
 	result map[string]any,
 ) map[string]any {
 	recorder := httptest.NewRecorder()
+	translatedWriter := http.ResponseWriter(recorder)
+	if requestPlan.debugCapture != nil {
+		translatedWriter = requestPlan.debugCapture.wrapTranslatedResponseWriter(recorder)
+	}
+	filterAndWriteResponseHeaders(translatedWriter, resp.Header)
+	translatedWriter.WriteHeader(resp.StatusCode)
 	var rawUpstreamBuf bytes.Buffer
 	upstreamTee := io.TeeReader(resp.Body, &rawUpstreamBuf)
 	streamReader := readerWithCloser{Reader: upstreamTee, Closer: resp.Body}
@@ -1006,7 +1217,7 @@ func (s *Server) parseTestTranslatedSSEResponse(
 	streamErr := streamTransformSSEEventsUntil(
 		ctx,
 		streamReader,
-		recorder,
+		translatedWriter,
 		func(rawEvent []byte) error {
 			if len(rawEvent) == 0 {
 				return nil

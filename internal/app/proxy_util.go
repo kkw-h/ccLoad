@@ -113,6 +113,8 @@ type fwResult struct {
 	// 响应是否已经提交给客户端（头或正文已发送）
 	// false 表示本次尝试仍可在同一请求内切换到其他Key/渠道
 	ResponseCommitted bool
+	// UpstreamWebsocket 只表示本次实际上游请求采用了WebSocket，不表示下游协议或渠道配置。
+	UpstreamWebsocket bool
 
 	// OpenAI service_tier（2026-03新增）
 	// 响应中的 service_tier 字段决定计费倍率：priority=2x, flex=0.5x, default=1x
@@ -123,13 +125,17 @@ type fwResult struct {
 
 	// Debug日志数据（debug开启时填充，传递到日志写入管道）
 	DebugData *model.DebugLogEntry
+
+	ResponsesTurnResult    responsesWebsocketTurnResult
+	HasResponsesTurnResult bool
 }
 
 // ForwardObserver 封装转发过程中的观测回调（遵循SRP，避免函数签名膨胀）
 type ForwardObserver struct {
-	OnBytesRead     func(int64) // 字节读取回调（可选）
-	OnFirstByteRead func()      // 首字节读取回调（可选）
-	OnDebugCapture  func(*debugCapture)
+	OnBytesRead         func(int64) // 字节读取回调（可选）
+	OnFirstByteRead     func()      // 首字节读取回调（可选）
+	OnUpstreamWebsocket func(bool)  // 实际上游传输变化回调（可选）
+	OnDebugCapture      func(*debugCapture)
 }
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
@@ -157,20 +163,25 @@ type proxyRequestContext struct {
 	thinkingEffort   string
 	requestID        string // 关联同一用户请求的所有用量事件
 	attemptSeq       int    // 真实上游尝试序号（每次转发前自增）
+	nativeCodexWS    *codexUpstreamWebsocketSession
+	nativeCodexBody  []byte
 }
 
 // proxyResult 代理请求结果
 type proxyResult struct {
-	status           int
-	header           http.Header
-	body             []byte
-	channelID        *int64
-	duration         float64
-	firstByteTime    float64
-	succeeded        bool
-	isClientCanceled bool            // 客户端主动取消请求（context.Canceled）
-	nextAction       cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
-	deferredCooldown *cooldown.ErrorInput
+	status                 int
+	header                 http.Header
+	body                   []byte
+	channelID              *int64
+	duration               float64
+	firstByteTime          float64
+	succeeded              bool
+	isClientCanceled       bool            // 客户端主动取消请求（context.Canceled）
+	nextAction             cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
+	deferredCooldown       *cooldown.ErrorInput
+	alphaSearchUnsupported bool
+	responsesTurn          responsesWebsocketTurnResult
+	hasResponsesTurn       bool
 }
 
 // ErrorAction 已迁移到 cooldown.Action (internal/cooldown/manager.go)
@@ -609,23 +620,29 @@ func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestConte
 	actualModel = s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, upstreamProtocol)
 
 	bodyToSend = reqCtx.body
-
-	// 如果模型发生变更，修改请求体
-	if actualModel != reqCtx.originalModel {
-		var reqData map[string]json.RawMessage
-		if err := sonic.Unmarshal(reqCtx.body, &reqData); err == nil {
-			modelRaw, err := sonic.Marshal(actualModel)
-			if err != nil {
-				return actualModel, bodyToSend
-			}
-			reqData["model"] = modelRaw
-			if modifiedBody, err := sonic.Marshal(reqData); err == nil {
-				bodyToSend = modifiedBody
-			}
-		}
-	}
+	bodyToSend = replaceJSONRequestModel(bodyToSend, reqCtx.originalModel, actualModel)
 
 	return actualModel, bodyToSend
+}
+
+func replaceJSONRequestModel(body []byte, originalModel, actualModel string) []byte {
+	if len(body) == 0 || actualModel == "" || actualModel == originalModel {
+		return body
+	}
+	var reqData map[string]json.RawMessage
+	if err := sonic.Unmarshal(body, &reqData); err != nil {
+		return body
+	}
+	modelRaw, err := sonic.Marshal(actualModel)
+	if err != nil {
+		return body
+	}
+	reqData["model"] = modelRaw
+	modifiedBody, err := sonic.Marshal(reqData)
+	if err != nil {
+		return body
+	}
+	return modifiedBody
 }
 
 // stripAnthropicBillingHeaders 从 Anthropic /v1/messages 请求体的 system 数组中
@@ -872,17 +889,18 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		modelName = billingModel
 	}
 	entry := &model.LogEntry{
-		Time:        model.JSONTime{Time: logTime},
-		Model:       modelName,
-		LogSource:   model.LogSourceProxy,
-		ChannelID:   p.ChannelID,
-		StatusCode:  p.StatusCode,
-		Duration:    p.Duration,
-		IsStreaming: p.IsStreaming,
-		APIKeyUsed:  p.APIKeyUsed,
-		AuthTokenID: p.AuthTokenID,
-		ClientIP:    p.ClientIP,
-		BaseURL:     p.BaseURL,
+		Time:              model.JSONTime{Time: logTime},
+		Model:             modelName,
+		LogSource:         model.LogSourceProxy,
+		ChannelID:         p.ChannelID,
+		StatusCode:        p.StatusCode,
+		Duration:          p.Duration,
+		IsStreaming:       p.IsStreaming,
+		UpstreamWebsocket: p.Result != nil && p.Result.UpstreamWebsocket,
+		APIKeyUsed:        p.APIKeyUsed,
+		AuthTokenID:       p.AuthTokenID,
+		ClientIP:          p.ClientIP,
+		BaseURL:           p.BaseURL,
 	}
 	entry.ThinkingEffort = normalizeThinkingEffort(p.ThinkingEffort)
 
@@ -915,7 +933,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		// 499 客户端取消但上游已产 usage：按实际 usage 计费，日志行需带 usage/cost
 		// （与 token_stats 中性计费口径一致，也让用量事件携带真实 usage）。
 		if p.StatusCode == 499 && p.Result != nil && hasConsumedTokens(p.Result) {
-			fillEntryUsage(entry, p.Result, billingModel)
+			fillEntryUsage(entry, p.Result, billingModel, true)
 		}
 	} else if p.Result != nil {
 		res := p.Result
@@ -945,7 +963,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		}
 
 		// Token统计（2025-11新增，从SSE响应中提取）+ 成本
-		fillEntryUsage(entry, res, billingModel)
+		fillEntryUsage(entry, res, billingModel, p.StatusCode >= http.StatusOK && p.StatusCode < http.StatusMultipleChoices)
 	} else {
 		entry.Message = "unknown"
 	}
@@ -960,10 +978,10 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 	return entry
 }
 
-// fillEntryUsage 将转发结果的 usage 与成本写入日志条目。
-// 成本使用实际转发的模型计算（重定向时价格可能不同）；始终调用 computeRequestCost
+// fillEntryUsage 将转发结果的 usage 写入日志条目，并仅在 billCost 为真时计算成本。
+// 成本使用实际转发的模型计算（重定向时价格可能不同）；计费分支始终调用 computeRequestCost
 // 以支持按次计费图像模型（tokens=0 时返回固定成本）。alpha/search 固定按 search_call 计费。
-func fillEntryUsage(entry *model.LogEntry, res *fwResult, billingModel string) {
+func fillEntryUsage(entry *model.LogEntry, res *fwResult, billingModel string, billCost bool) {
 	entry.InputTokens = res.InputTokens
 	entry.OutputTokens = res.OutputTokens
 	entry.ReasoningTokens = res.ReasoningTokens
@@ -972,7 +990,9 @@ func fillEntryUsage(entry *model.LogEntry, res *fwResult, billingModel string) {
 	entry.Cache5mInputTokens = res.Cache5mInputTokens
 	entry.Cache1hInputTokens = res.Cache1hInputTokens
 	entry.ServiceTier = res.ServiceTier
-	entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+	if billCost {
+		entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+	}
 }
 
 // buildAttemptUsageEvent 从已归一化的 LogEntry 复用 usage/cost，构建 attempt 用量事件。
@@ -1031,20 +1051,15 @@ func computeRequestCost(model string, serviceTier string, res *fwResult) float64
 	if res == nil {
 		return 0
 	}
-	if serviceTier == "fast" && util.IsFastModeModel(model) {
-		return util.CalculateFastModeCost(
-			res.InputTokens, res.OutputTokens,
-			res.CacheReadInputTokens, res.Cache5mInputTokens, res.Cache1hInputTokens,
-		)
-	}
-	return util.CalculateCostDetailed(
+	return util.CalculateStandardCostBreakdown(
 		model,
+		serviceTier,
 		res.InputTokens,
 		res.OutputTokens,
 		res.CacheReadInputTokens,
 		res.Cache5mInputTokens,
 		res.Cache1hInputTokens,
-	) * util.OpenAIServiceTierMultiplier(model, serviceTier)
+	).Total
 }
 
 // truncateErr 截断错误信息到512字符（防止日志过长）
