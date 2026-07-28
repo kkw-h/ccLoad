@@ -890,6 +890,10 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		"health_score_update_interval",
 		"health_min_confident_sample",
 		"cooldown_fallback_enabled",
+		"external_auth_enabled",
+		"external_auth_timeout_ms",
+		"external_auth_max_retries",
+		"external_auth_bypass_cidrs",
 	}
 
 	for _, key := range expectedKeys {
@@ -908,6 +912,9 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		}
 		if key == "stream_timeout" && val != "0" {
 			t.Errorf("setting %q default = %q, want 0", key, val)
+		}
+		if key == "external_auth_enabled" && val != "false" {
+			t.Errorf("setting %q default = %q, want false", key, val)
 		}
 	}
 	var valueType string

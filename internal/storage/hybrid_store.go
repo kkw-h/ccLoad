@@ -799,6 +799,45 @@ func (h *HybridStore) BatchUpdateSettings(ctx context.Context, updates map[strin
 	return nil
 }
 
+func (h *HybridStore) CreateExternalAuthEnvironment(ctx context.Context, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error) {
+	created, err := h.mysql.CreateExternalAuthEnvironment(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+	h.syncToSQLite("CreateExternalAuthEnvironment", func() error {
+		copy := *created
+		_, err := h.sqlite.CreateExternalAuthEnvironment(ctx, &copy)
+		return err
+	})
+	return created, nil
+}
+
+func (h *HybridStore) ListExternalAuthEnvironments(ctx context.Context) ([]*model.ExternalAuthEnvironment, error) {
+	return h.mysql.ListExternalAuthEnvironments(ctx)
+}
+
+func (h *HybridStore) UpdateExternalAuthEnvironment(ctx context.Context, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error) {
+	updated, err := h.mysql.UpdateExternalAuthEnvironment(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+	h.syncToSQLite("UpdateExternalAuthEnvironment", func() error {
+		_, err := h.sqlite.UpdateExternalAuthEnvironment(ctx, updated)
+		return err
+	})
+	return updated, nil
+}
+
+func (h *HybridStore) DeleteExternalAuthEnvironment(ctx context.Context, id int64) error {
+	if err := h.mysql.DeleteExternalAuthEnvironment(ctx, id); err != nil {
+		return err
+	}
+	h.syncToSQLite("DeleteExternalAuthEnvironment", func() error {
+		return h.sqlite.DeleteExternalAuthEnvironment(ctx, id)
+	})
+	return nil
+}
+
 func (h *HybridStore) CreateWebSession(ctx context.Context, token string, session model.WebSession) error {
 	return h.sqlite.CreateWebSession(ctx, token, session)
 }

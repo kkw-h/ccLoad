@@ -60,6 +60,34 @@
             </button>
           </div>
         </section>
+
+        <section id="external-auth-environments" class="glass-card mb-6" aria-labelledby="external-auth-environments-title">
+          <div class="section-header">
+            <div>
+              <h2 id="external-auth-environments-title" data-i18n="settings.externalAuth.title">外部鉴权环境</h2>
+              <p class="text-secondary" data-i18n="settings.externalAuth.description">
+                根据客户端的 X-Sedna-Env 请求头选择对应的鉴权地址。
+              </p>
+            </div>
+            <button id="add-external-auth-environment" class="btn btn-primary" type="button"
+              aria-label="添加外部鉴权环境" data-i18n="settings.externalAuth.add">
+              添加环境
+            </button>
+          </div>
+          <div class="table-container mobile-card-table-container">
+            <table class="modern-table mobile-card-table">
+              <thead>
+                <tr>
+                  <th data-i18n="settings.externalAuth.environment">环境</th>
+                  <th data-i18n="settings.externalAuth.authzUrl">鉴权地址</th>
+                  <th data-i18n="settings.externalAuth.active">启用</th>
+                  <th data-i18n="common.actions">操作</th>
+                </tr>
+              </thead>
+              <tbody id="external-auth-environment-rows"></tbody>
+            </table>
+          </div>
+        </section>
       </div>
     </main>
   </div>

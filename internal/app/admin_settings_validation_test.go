@@ -43,6 +43,11 @@ func TestValidateSettingValue(t *testing.T) {
 		{name: "int_cooldown_auth_ok", key: "cooldown_auth_seconds", valueType: "int", value: "300", wantErr: false},
 		{name: "int_cooldown_min_reject_0", key: "cooldown_min_seconds", valueType: "int", value: "0", wantErr: true},
 		{name: "int_cooldown_max_ok", key: "cooldown_max_seconds", valueType: "int", value: "1800", wantErr: false},
+		{name: "external_auth_timeout_min", key: "external_auth_timeout_ms", valueType: "int", value: "100", wantErr: false},
+		{name: "external_auth_timeout_too_small", key: "external_auth_timeout_ms", valueType: "int", value: "99", wantErr: true},
+		{name: "external_auth_timeout_too_large", key: "external_auth_timeout_ms", valueType: "int", value: "10001", wantErr: true},
+		{name: "external_auth_retries_max", key: "external_auth_max_retries", valueType: "int", value: "2", wantErr: false},
+		{name: "external_auth_retries_too_large", key: "external_auth_max_retries", valueType: "int", value: "3", wantErr: true},
 
 		{name: "bool_ok_true", key: "any_bool", valueType: "bool", value: "true", wantErr: false},
 		{name: "bool_ok_false", key: "any_bool", valueType: "bool", value: "false", wantErr: false},
@@ -56,6 +61,8 @@ func TestValidateSettingValue(t *testing.T) {
 		{name: "duration_reject_non_int", key: "any_duration", valueType: "duration", value: "1.5", wantErr: true},
 
 		{name: "string_accepts_any", key: "any_string", valueType: "string", value: "", wantErr: false},
+		{name: "external_auth_bypass_valid", key: "external_auth_bypass_cidrs", valueType: "string", value: "203.0.113.7,2001:db8::/32", wantErr: false},
+		{name: "external_auth_bypass_invalid", key: "external_auth_bypass_cidrs", valueType: "string", value: "not-a-cidr", wantErr: true},
 
 		{name: "unknown_type_reject", key: "k", valueType: "wtf", value: "x", wantErr: true},
 	}
