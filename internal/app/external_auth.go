@@ -1,13 +1,22 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -26,6 +35,222 @@ type externalAuthConfig struct {
 
 type externalAuthResolver interface {
 	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+type externalAuthRequest struct {
+	RequestID             string `json:"request_id"`
+	Method                string `json:"method"`
+	Path                  string `json:"path"`
+	Model                 string `json:"model,omitempty"`
+	Stream                bool   `json:"stream"`
+	ClientIP              string `json:"client_ip,omitempty"`
+	OriginalAuthorization string `json:"-"`
+}
+
+type externalAuthResult struct {
+	ExternalUserID string
+	CCLoadToken    string
+	ExpiresAt      time.Time
+}
+
+type externalAuthErrorKind uint8
+
+const (
+	externalAuthErrorDenied externalAuthErrorKind = iota + 1
+	externalAuthErrorUnavailable
+)
+
+type externalAuthError struct {
+	kind externalAuthErrorKind
+	msg  string
+}
+
+func (e *externalAuthError) Error() string { return e.msg }
+
+func isExternalAuthErrorKind(err error, kind externalAuthErrorKind) bool {
+	var target *externalAuthError
+	return errors.As(err, &target) && target.kind == kind
+}
+
+type externalAuthMetrics struct {
+	requestsTotal atomic.Int64
+	allowed       atomic.Int64
+	denied        atomic.Int64
+	errors        atomic.Int64
+	retries       atomic.Int64
+	bypassed      atomic.Int64
+	durationNanos atomic.Int64
+}
+
+type externalAuthMetricsSnapshot struct {
+	RequestsTotal   int64 `json:"requests_total"`
+	Allowed         int64 `json:"allowed"`
+	Denied          int64 `json:"denied"`
+	Errors          int64 `json:"errors"`
+	Retries         int64 `json:"retries"`
+	Bypassed        int64 `json:"bypassed"`
+	DurationMSTotal int64 `json:"duration_ms_total"`
+}
+
+type ExternalAuthService struct {
+	config externalAuthConfig
+	client *http.Client
+	jitter func(time.Duration) time.Duration
+	now    func() time.Time
+	stats  externalAuthMetrics
+}
+
+func newExternalAuthService(
+	cfg externalAuthConfig,
+	client *http.Client,
+	jitter func(time.Duration) time.Duration,
+) *ExternalAuthService {
+	if client == nil {
+		client = &http.Client{}
+	}
+	if jitter == nil {
+		jitter = func(delay time.Duration) time.Duration { return delay }
+	}
+	return &ExternalAuthService{
+		config: cfg,
+		client: client,
+		jitter: jitter,
+		now:    time.Now,
+	}
+}
+
+func (s *ExternalAuthService) Metrics() externalAuthMetricsSnapshot {
+	if s == nil {
+		return externalAuthMetricsSnapshot{}
+	}
+	return externalAuthMetricsSnapshot{
+		RequestsTotal:   s.stats.requestsTotal.Load(),
+		Allowed:         s.stats.allowed.Load(),
+		Denied:          s.stats.denied.Load(),
+		Errors:          s.stats.errors.Load(),
+		Retries:         s.stats.retries.Load(),
+		Bypassed:        s.stats.bypassed.Load(),
+		DurationMSTotal: s.stats.durationNanos.Load() / int64(time.Millisecond),
+	}
+}
+
+func (s *ExternalAuthService) Authorize(
+	ctx context.Context,
+	input externalAuthRequest,
+) (externalAuthResult, error) {
+	started := s.now()
+	s.stats.requestsTotal.Add(1)
+	defer func() {
+		s.stats.durationNanos.Add(s.now().Sub(started).Nanoseconds())
+	}()
+
+	payload, err := json.Marshal(input)
+	if err != nil {
+		s.stats.errors.Add(1)
+		return externalAuthResult{}, unavailableExternalAuthError("encode authorization request")
+	}
+	for attempt := 0; attempt <= s.config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			s.stats.retries.Add(1)
+			if err := waitExternalAuthRetry(ctx, s.jitter(externalAuthRetryDelay(attempt))); err != nil {
+				s.stats.errors.Add(1)
+				return externalAuthResult{}, unavailableExternalAuthError("authorization request canceled")
+			}
+		}
+		result, retry, err := s.authorizeAttempt(ctx, input.OriginalAuthorization, payload)
+		if err == nil {
+			s.stats.allowed.Add(1)
+			return result, nil
+		}
+		if isExternalAuthErrorKind(err, externalAuthErrorDenied) {
+			s.stats.denied.Add(1)
+			return externalAuthResult{}, err
+		}
+		if !retry || attempt == s.config.MaxRetries {
+			s.stats.errors.Add(1)
+			return externalAuthResult{}, err
+		}
+	}
+	panic("unreachable")
+}
+
+func (s *ExternalAuthService) authorizeAttempt(
+	ctx context.Context,
+	originalAuthorization string,
+	payload []byte,
+) (externalAuthResult, bool, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, s.config.WebhookURL.String(), bytes.NewReader(payload))
+	if err != nil {
+		return externalAuthResult{}, false, unavailableExternalAuthError("build authorization request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Original-Authorization", originalAuthorization)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return externalAuthResult{}, true, unavailableExternalAuthError("authorization service request failed")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return externalAuthResult{}, false, &externalAuthError{kind: externalAuthErrorDenied, msg: "external authorization denied"}
+	case resp.StatusCode == http.StatusRequestTimeout ||
+		resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode >= http.StatusInternalServerError:
+		return externalAuthResult{}, true, unavailableExternalAuthError("authorization service temporarily unavailable")
+	case resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices:
+		return externalAuthResult{}, false, unavailableExternalAuthError("authorization service returned an invalid status")
+	}
+
+	externalUserID := strings.TrimSpace(resp.Header.Get("X-User-Id"))
+	if _, err := uuid.Parse(externalUserID); err != nil {
+		return externalAuthResult{}, false, unavailableExternalAuthError("authorization service returned an invalid user ID")
+	}
+	ccLoadToken := strings.TrimSpace(resp.Header.Get("X-Ccload-Token"))
+	if ccLoadToken == "" {
+		return externalAuthResult{}, false, unavailableExternalAuthError("authorization service returned no local token")
+	}
+	expUnix, err := strconv.ParseInt(strings.TrimSpace(resp.Header.Get("X-Authz-Token-Exp")), 10, 64)
+	if err != nil {
+		return externalAuthResult{}, false, unavailableExternalAuthError("authorization service returned an invalid expiration")
+	}
+	expiresAt := time.Unix(expUnix, 0)
+	if !expiresAt.After(s.now().Add(5 * time.Second)) {
+		return externalAuthResult{}, false, unavailableExternalAuthError("authorization result expires too soon")
+	}
+	return externalAuthResult{
+		ExternalUserID: externalUserID,
+		CCLoadToken:    ccLoadToken,
+		ExpiresAt:      expiresAt,
+	}, false, nil
+}
+
+func unavailableExternalAuthError(msg string) error {
+	return &externalAuthError{kind: externalAuthErrorUnavailable, msg: msg}
+}
+
+func externalAuthRetryDelay(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 100 * time.Millisecond
+	}
+	return 300 * time.Millisecond
+}
+
+func waitExternalAuthRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func parseExternalAuthConfig(

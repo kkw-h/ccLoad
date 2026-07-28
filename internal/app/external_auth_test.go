@@ -2,8 +2,14 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,4 +99,103 @@ func TestValidateExternalAuthEndpointAllowsPublicHTTPS(t *testing.T) {
 	if err := validateExternalAuthEndpoint(context.Background(), "https://auth.example.com/check", resolver); err != nil {
 		t.Fatalf("validateExternalAuthEndpoint() error = %v", err)
 	}
+}
+
+func TestExternalAuthAuthorizeRetriesTransientFailure(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Original-Authorization"); got != "Bearer platform-jwt" {
+			t.Errorf("X-Original-Authorization = %q", got)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode webhook payload: %v", err)
+		}
+		if _, exists := payload["prompt"]; exists {
+			t.Error("webhook payload contains prompt")
+		}
+		if calls.Add(1) < 3 {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("X-User-Id", "d9428888-122b-11e1-b85c-61cd3cbb3210")
+		w.Header().Set("X-Ccload-Token", "local-secret")
+		w.Header().Set("X-Authz-Token-Exp", strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	service := newTestExternalAuthService(t, server, 2)
+	result, err := service.Authorize(context.Background(), externalAuthRequest{
+		RequestID:             "req-1",
+		Method:                http.MethodPost,
+		Path:                  "/v1/responses",
+		Model:                 "gpt-5",
+		Stream:                true,
+		ClientIP:              "198.51.100.9",
+		OriginalAuthorization: "Bearer platform-jwt",
+	})
+	if err != nil {
+		t.Fatalf("Authorize() error = %v", err)
+	}
+	if result.CCLoadToken != "local-secret" {
+		t.Fatalf("CCLoadToken = %q", result.CCLoadToken)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("calls = %d, want 3", calls.Load())
+	}
+	stats := service.Metrics()
+	if stats.RequestsTotal != 1 || stats.Allowed != 1 || stats.Retries != 2 {
+		t.Fatalf("metrics = %+v", stats)
+	}
+}
+
+func TestExternalAuthAuthorizeDoesNotRetryDenial(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "denied", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	_, err := newTestExternalAuthService(t, server, 2).Authorize(context.Background(), externalAuthRequest{
+		OriginalAuthorization: "Bearer platform-jwt",
+	})
+	if !isExternalAuthErrorKind(err, externalAuthErrorDenied) {
+		t.Fatalf("Authorize() error = %v, want denied", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestExternalAuthAuthorizeRejectsExpiringToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-User-Id", "d9428888-122b-11e1-b85c-61cd3cbb3210")
+		w.Header().Set("X-Ccload-Token", "local-secret")
+		w.Header().Set("X-Authz-Token-Exp", strconv.FormatInt(time.Now().Add(5*time.Second).Unix(), 10))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	_, err := newTestExternalAuthService(t, server, 0).Authorize(context.Background(), externalAuthRequest{
+		OriginalAuthorization: "Bearer platform-jwt",
+	})
+	if !isExternalAuthErrorKind(err, externalAuthErrorUnavailable) {
+		t.Fatalf("Authorize() error = %v, want unavailable", err)
+	}
+}
+
+func newTestExternalAuthService(t *testing.T, server *httptest.Server, retries int) *ExternalAuthService {
+	t.Helper()
+	endpoint, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newExternalAuthService(externalAuthConfig{
+		Enabled:    true,
+		WebhookURL: endpoint,
+		Timeout:    time.Second,
+		MaxRetries: retries,
+	}, server.Client(), func(time.Duration) time.Duration { return 0 })
 }
