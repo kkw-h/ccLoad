@@ -273,7 +273,9 @@ func NewServer(store storage.Store) *Server {
 	if err != nil {
 		log.Fatalf("[FATAL] 外部鉴权配置无效: %v", err)
 	}
-	externalAuthEnvironments, err := store.ListExternalAuthEnvironments(loadCtx)
+	externalAuthLoadCtx, externalAuthLoadCancel := newExternalAuthLoadContext()
+	externalAuthEnvironments, err := store.ListExternalAuthEnvironments(externalAuthLoadCtx)
+	externalAuthLoadCancel()
 	if err != nil {
 		log.Fatalf("[FATAL] 加载外部鉴权环境失败: %v", err)
 	}

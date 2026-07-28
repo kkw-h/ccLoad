@@ -94,6 +94,20 @@ func TestExternalAuthConfigFromConfigServiceUsesManagedEnvironments(t *testing.T
 	}
 }
 
+func TestNewExternalAuthLoadContextIsIndependentFromExpiredBootstrapContext(t *testing.T) {
+	bootstrapCtx, cancelBootstrap := context.WithCancel(context.Background())
+	cancelBootstrap()
+	if bootstrapCtx.Err() == nil {
+		t.Fatal("bootstrap context must be expired for this regression test")
+	}
+
+	loadCtx, cancelLoad := newExternalAuthLoadContext()
+	defer cancelLoad()
+	if loadCtx.Err() != nil {
+		t.Fatalf("external auth load context inherited expired bootstrap state: %v", loadCtx.Err())
+	}
+}
+
 func TestValidateExternalAuthEndpointRejectsUnsafeTargets(t *testing.T) {
 	tests := []struct {
 		name       string

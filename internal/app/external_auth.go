@@ -27,6 +27,7 @@ const (
 	externalAuthMinTimeoutMS = 100
 	externalAuthMaxTimeoutMS = 10_000
 	externalAuthMaxRetries   = 2
+	externalAuthLoadTimeout  = 10 * time.Second
 )
 
 type externalAuthConfig struct {
@@ -118,6 +119,10 @@ type ExternalAuthService struct {
 	jitter        func(time.Duration) time.Duration
 	now           func() time.Time
 	stats         externalAuthMetrics
+}
+
+func newExternalAuthLoadContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), externalAuthLoadTimeout)
 }
 
 func newExternalAuthService(
