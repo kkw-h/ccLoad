@@ -32,11 +32,12 @@ type CostComponent struct {
 // CacheWrite 将 5m/1h 两种缓存创建费用合并为一项；两者同时存在时，
 // PricePerMillion 为按 Token 数加权后的实际单价。
 type StandardCostBreakdown struct {
-	Input      CostComponent `json:"input"`
-	Output     CostComponent `json:"output"`
-	CacheRead  CostComponent `json:"cache_read"`
-	CacheWrite CostComponent `json:"cache_write"`
-	Total      float64       `json:"total"`
+	Input                 CostComponent `json:"input"`
+	Output                CostComponent `json:"output"`
+	CacheRead             CostComponent `json:"cache_read"`
+	CacheWrite            CostComponent `json:"cache_write"`
+	Total                 float64       `json:"total"`
+	ServiceTierMultiplier float64       `json:"service_tier_multiplier,omitempty"`
 }
 
 func newCostComponent(quantity int, pricePerMillion float64) CostComponent {
@@ -232,7 +233,11 @@ func CalculateStandardCostBreakdown(
 		cache5mTokens,
 		cache1hTokens,
 	)
-	return scaleCostBreakdown(breakdown, OpenAIServiceTierMultiplier(model, serviceTier))
+	multiplier := OpenAIServiceTierMultiplier(model, serviceTier)
+	if multiplier != 1 {
+		breakdown.ServiceTierMultiplier = multiplier
+	}
+	return scaleCostBreakdown(breakdown, multiplier)
 }
 
 func calculateCostBreakdownDetailed(model string, inputTokens, outputTokens, cacheReadTokens, cache5mTokens, cache1hTokens int) StandardCostBreakdown {
@@ -454,8 +459,8 @@ func modelSupportsTier(model string) bool {
 }
 
 // OpenAIServiceTierMultiplier 返回 OpenAI service_tier 的费用倍率。
-// priority=2x（加钱降延迟）, flex=0.5x（便宜但慢）, fast=2.5x(gpt-5.5)/2x(gpt-5.4), default/""=1x（标准）。
-// 仅当响应中携带 service_tier 字段时才生效。
+// Codex 用 priority 表示 Fast 模式：GPT-5.6/5.5=2.5x，GPT-5.4=2x；
+// 其他 priority 模型=2x，flex=0.5x，default/""=1x（标准）。
 func OpenAIServiceTierMultiplier(model, serviceTier string) float64 {
 	if serviceTier == "" || serviceTier == "default" {
 		return 1.0
@@ -465,19 +470,26 @@ func OpenAIServiceTierMultiplier(model, serviceTier string) float64 {
 	}
 	switch serviceTier {
 	case "priority":
+		if multiplier := openAIFastModeMultiplier(model); multiplier != 1.0 {
+			return multiplier
+		}
 		return 2.0
 	case "flex":
 		return 0.5
 	case "fast":
-		// gpt-5.5 fast = 2.5× base, gpt-5.4 fast = 2× base
-		lm := strings.ToLower(model)
-		if strings.HasPrefix(lm, "gpt-5.5") {
-			return 2.5
-		}
-		if strings.HasPrefix(lm, "gpt-5.4") {
-			return 2.0
-		}
+		return openAIFastModeMultiplier(model)
+	default:
 		return 1.0
+	}
+}
+
+func openAIFastModeMultiplier(model string) float64 {
+	lowerModel := strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(lowerModel, "gpt-5.6"), strings.HasPrefix(lowerModel, "gpt-5.5"):
+		return 2.5
+	case strings.HasPrefix(lowerModel, "gpt-5.4"):
+		return 2.0
 	default:
 		return 1.0
 	}
@@ -519,9 +531,10 @@ func calculateFastModeCostBreakdown(inputTokens, outputTokens, cacheReadTokens, 
 	const baseInputPrice = 5.0 // claude-opus-4-6 基础 input 价 $5/MTok
 
 	breakdown := StandardCostBreakdown{
-		Input:     newCostComponent(inputTokens, inputPrice),
-		Output:    newCostComponent(outputTokens, outputPrice),
-		CacheRead: newCostComponent(cacheReadTokens, baseInputPrice*cacheReadMultiplierOpus),
+		Input:                 newCostComponent(inputTokens, inputPrice),
+		Output:                newCostComponent(outputTokens, outputPrice),
+		CacheRead:             newCostComponent(cacheReadTokens, baseInputPrice*cacheReadMultiplierOpus),
+		ServiceTierMultiplier: inputPrice / baseInputPrice,
 	}
 
 	breakdown.CacheWrite = newCacheWriteCostComponent(cache5mTokens, cache1hTokens, baseInputPrice)
