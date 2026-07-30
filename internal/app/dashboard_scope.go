@@ -179,6 +179,7 @@ func ApplyWebIdentityScope(c *gin.Context, filter *model.LogFilter) {
 		tokenID = 1<<63 - 1
 	}
 	filter.AuthTokenID = &tokenID
+	filter.AuthTokenIDs = nil
 }
 
 func isAPITokenWebRequest(c *gin.Context) bool {

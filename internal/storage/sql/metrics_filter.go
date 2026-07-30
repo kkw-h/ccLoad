@@ -69,7 +69,14 @@ func (s *SQLStore) AggregateRangeWithFilter(ctx context.Context, since, until ti
 		}
 
 		// 添加 auth_token_id 过滤
-		if filter.AuthTokenID != nil && *filter.AuthTokenID > 0 {
+		if len(filter.AuthTokenIDs) > 0 {
+			placeholders := make([]string, len(filter.AuthTokenIDs))
+			for i, id := range filter.AuthTokenIDs {
+				placeholders[i] = "?"
+				args = append(args, id)
+			}
+			query += fmt.Sprintf(" AND logs.auth_token_id IN (%s)", strings.Join(placeholders, ", "))
+		} else if filter.AuthTokenID != nil && *filter.AuthTokenID > 0 {
 			query += " AND logs.auth_token_id = ?"
 			args = append(args, *filter.AuthTokenID)
 		}

@@ -239,7 +239,11 @@ func hashFilter(filter *model.LogFilter) string {
 	if filter.ModelLike != "" {
 		parts = append(parts, fmt.Sprintf("model_like:%s", filter.ModelLike))
 	}
-	if filter.AuthTokenID != nil {
+	if len(filter.AuthTokenIDs) > 0 {
+		authTokenIDs := append([]int64(nil), filter.AuthTokenIDs...)
+		sort.Slice(authTokenIDs, func(i, j int) bool { return authTokenIDs[i] < authTokenIDs[j] })
+		parts = append(parts, fmt.Sprintf("auth:%v", authTokenIDs))
+	} else if filter.AuthTokenID != nil {
 		parts = append(parts, fmt.Sprintf("auth:%d", *filter.AuthTokenID))
 	}
 	if filter.StatusCode != nil {
