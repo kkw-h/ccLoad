@@ -6,134 +6,78 @@ function setChannelModalTitle(i18nKey) {
   titleEl.textContent = window.t(i18nKey);
 }
 
-if (!window.ChannelProtocolConfig) {
-  throw new Error('ChannelProtocolConfig helper is required before channels-modals.js');
+function normalizeProtocolTransformMode(value) {
+  const mode = String(value || '').trim().toLowerCase();
+  return ['auto', 'upstream', 'local'].includes(mode) ? mode : 'auto';
 }
 
-function protocolTransformLabel(protocol) {
-  const labels = {
-    anthropic: 'channels.protocolTransformAnthropic',
-    codex: 'channels.protocolTransformCodex',
-    openai: 'channels.protocolTransformOpenAI',
-    gemini: 'channels.protocolTransformGemini'
+let protocolTransformModeCombobox = null;
+let quickAddChannelTrigger = null;
+let quickAddChannelRequestVersion = 0;
+
+function getProtocolTransformModeOptions() {
+  return [
+    { value: 'auto', label: window.t('channels.modal.protocolTransformModeAuto') },
+    { value: 'upstream', label: window.t('channels.modal.protocolTransformModeUpstream') },
+    { value: 'local', label: window.t('channels.modal.protocolTransformModeLocal') }
+  ];
+}
+
+function getProtocolTransformModeLabel(value) {
+  const mode = normalizeProtocolTransformMode(value);
+  return getProtocolTransformModeOptions().find(option => option.value === mode)?.label || mode;
+}
+
+function getProtocolTransformModeHelp(value) {
+  const mode = normalizeProtocolTransformMode(value);
+  const keys = {
+    auto: 'channels.modal.protocolTransformModeAutoHelp',
+    upstream: 'channels.modal.protocolTransformModeUpstreamHelp',
+    local: 'channels.modal.protocolTransformModeLocalHelp'
   };
-  const key = labels[protocol] || protocol;
-  return window.t ? window.t(key) : key;
+  return window.t(keys[mode]);
 }
 
-function protocolTransformModeLabel(mode) {
-  const labels = {
-    local: 'channels.protocolTransformModeLocal',
-    upstream: 'channels.protocolTransformModeUpstream'
-  };
-  const key = labels[mode] || mode;
-  return window.t ? window.t(key) : key;
+function setProtocolTransformMode(value) {
+  const mode = normalizeProtocolTransformMode(value);
+  const hiddenInput = document.getElementById('protocolTransformModeValue');
+  if (hiddenInput) hiddenInput.value = mode;
+  protocolTransformModeCombobox?.setValue(mode, getProtocolTransformModeLabel(mode));
+  const visibleInput = protocolTransformModeCombobox?.getInput();
+  if (visibleInput) visibleInput.title = getProtocolTransformModeHelp(mode);
 }
 
-function hasExactURLMarker(url) {
-  return String(url || '').trim().endsWith('#');
+function getProtocolTransformMode() {
+  const hiddenInput = document.getElementById('protocolTransformModeValue');
+  return normalizeProtocolTransformMode(hiddenInput?.value || protocolTransformModeCombobox?.getValue());
 }
 
-function hasExactURLInEditor() {
-  if (typeof getValidInlineURLs === 'function') {
-    return getValidInlineURLs().some(hasExactURLMarker);
+async function ensureProtocolTransformModeCombobox(transformMode) {
+  if (!protocolTransformModeCombobox) {
+    protocolTransformModeCombobox = createSearchableCombobox({
+      container: 'protocolTransformModeSelectContainer',
+      inputId: 'protocolTransformModeInput',
+      dropdownId: 'protocolTransformModeDropdown',
+      minWidth: 0,
+      getOptions: getProtocolTransformModeOptions,
+      initialValue: 'auto',
+      initialLabel: getProtocolTransformModeLabel('auto'),
+      onSelect: (value) => {
+        setProtocolTransformMode(value);
+        markChannelFormDirty();
+      }
+    });
   }
-  return Array.isArray(inlineURLTableData) && inlineURLTableData.some(hasExactURLMarker);
+
+  setProtocolTransformMode(transformMode ?? getProtocolTransformMode());
+  protocolTransformModeCombobox?.refresh();
 }
 
-function protocolTransformHintMarkup(protocol) {
-  if (protocol !== 'gemini') return '';
-
-  return `
-          <span class="channel-editor-radio-hint" data-i18n="channels.modal.protocolTransformsHint">
-            ${window.i18nText('channels.modal.protocolTransformsHint', '除主协议外，额外支持的协议')}
-          </span>
-        `;
-}
-
-function normalizeProtocolTransformSelection(channelType, selectedValues) {
-  return window.ChannelProtocolConfig.normalizeProtocolTransformsForChannel(channelType, selectedValues);
-}
-
-function renderProtocolTransformOptions(channelType, selectedValues = []) {
-  const container = document.getElementById('protocolTransformsContainer');
-  if (!container) return;
-
-  const currentType = window.ChannelProtocolConfig.normalizeProtocol(channelType) || 'anthropic';
-  const selected = new Set(normalizeProtocolTransformSelection(currentType, selectedValues));
-  const options = window.ChannelProtocolConfig.getProtocolTransformRenderOptions(currentType);
-  container.innerHTML = options.map((protocol) => {
-    const disabled = protocol === currentType;
-    const checked = !disabled && selected.has(protocol);
-    const copyClass = protocol === 'gemini'
-      ? 'channel-editor-radio-option-copy channel-editor-radio-option-copy--with-hint'
-      : 'channel-editor-radio-option-copy';
-    return `
-      <label class="channel-editor-radio-option">
-        <input type="checkbox"
-               name="protocolTransform"
-               value="${protocol}"
-               ${checked ? 'checked' : ''}
-               ${disabled ? 'disabled' : ''}
-        >
-        <span class="${copyClass}">
-          <span class="channel-editor-radio-option-text">${protocolTransformLabel(protocol)}${disabled ? ` (${window.i18nText('channels.protocolTransformNative', '原生')})` : ''}</span>
-          ${protocolTransformHintMarkup(protocol)}
-        </span>
-      </label>
-    `;
-  }).join('');
-}
-
-function getSelectedProtocolTransforms(channelType) {
-  const selectedValues = Array.from(document.querySelectorAll('input[name="protocolTransform"]:checked'))
-    .map((input) => input.value);
-  return normalizeProtocolTransformSelection(channelType, selectedValues);
-}
-
-function renderProtocolTransformModeOptions(selectedValue = 'upstream') {
-  const container = document.getElementById('protocolTransformModeContainer');
-  if (!container) return;
-
-  const exactURL = hasExactURLInEditor();
-  const selectedMode = exactURL
-    ? 'local'
-    : window.ChannelProtocolConfig.normalizeProtocolTransformMode(selectedValue);
-  container.innerHTML = window.ChannelProtocolConfig.PROTOCOL_TRANSFORM_MODES.map((mode) => `
-      <label class="channel-editor-radio-option">
-        <input type="radio"
-               name="protocolTransformMode"
-               value="${mode}"
-               ${exactURL && mode === 'upstream' ? 'disabled' : ''}
-               ${mode === selectedMode ? 'checked' : ''}
-        >
-        <span>${protocolTransformModeLabel(mode)}</span>
-      </label>
-    `).join('');
-}
-
-function syncProtocolTransformModeForURLs() {
-  const exactURL = hasExactURLInEditor();
-  const localInput = document.querySelector('input[name="protocolTransformMode"][value="local"]');
-  const upstreamInput = document.querySelector('input[name="protocolTransformMode"][value="upstream"]');
-
-  if (upstreamInput) {
-    upstreamInput.disabled = exactURL;
-  }
-  if (exactURL && upstreamInput && upstreamInput.checked) {
-    upstreamInput.checked = false;
-  }
-  if (exactURL && localInput) {
-    localInput.checked = true;
-  }
-}
-
-function getSelectedProtocolTransformMode() {
-  if (hasExactURLInEditor()) {
-    return 'local';
-  }
-  const selected = document.querySelector('input[name="protocolTransformMode"]:checked')?.value;
-  return window.ChannelProtocolConfig.normalizeProtocolTransformMode(selected);
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('localechange', () => {
+    setProtocolTransformMode(getProtocolTransformMode());
+    protocolTransformModeCombobox?.refresh();
+  });
 }
 
 async function syncScheduledCheckVisibility() {
@@ -169,7 +113,8 @@ let scheduledCheckModelCombobox = null;
 
 function getScheduledCheckModelNames() {
   return redirectTableData
-    .map(entry => (entry && entry.model ? entry.model.trim() : ''))
+    .filter(entry => entry && !entry.disabled)
+    .map(entry => (entry.model ? entry.model.trim() : ''))
     .filter(Boolean);
 }
 
@@ -237,25 +182,6 @@ function syncScheduledCheckModelState() {
   input.disabled = wrapper.hidden || !checkbox.checked;
 }
 
-function channelSupportsNativeWebsocket() {
-  const channelType = document.querySelector('input[name="channelType"]:checked')?.value || 'anthropic';
-  return channelType === 'codex';
-}
-
-function handleChannelWebsocketClick(event) {
-  if (channelSupportsNativeWebsocket()) return true;
-
-  event.preventDefault();
-  event.currentTarget.checked = false;
-  const message = window.t('channels.websocketsCodexOnly');
-  if (window.showWarning) {
-    window.showWarning(message);
-  } else {
-    alert(message);
-  }
-  return false;
-}
-
 function setChannelWebsocketChecked(checkbox, checked) {
   if (checkbox.checked === checked) return;
   checkbox.checked = checked;
@@ -265,9 +191,12 @@ function setChannelWebsocketChecked(checkbox, checked) {
 }
 
 function getEnabledChannelWebsocketURLs() {
-  if (typeof getValidInlineURLs !== 'function') return [];
+  if (typeof getValidInlineURLConfigs !== 'function' || typeof runtimeInlineURL !== 'function') return [];
   const stats = typeof urlStatsMap !== 'undefined' && urlStatsMap ? urlStatsMap : {};
-  return getValidInlineURLs().filter(url => !stats[url]?.disabled);
+  return getValidInlineURLConfigs()
+    .filter(entry => entry.protocols.length === 0 || entry.protocols.includes('codex'))
+    .map(runtimeInlineURL)
+    .filter(url => url && !stats[url]?.disabled);
 }
 
 function getEnabledChannelWebsocketKeys() {
@@ -290,13 +219,6 @@ function getEnabledChannelWebsocketKeys() {
 async function detectChannelWebsocketSupport(button) {
   const checkbox = document.getElementById('channelWebsockets');
   if (!checkbox) return false;
-  if (!channelSupportsNativeWebsocket()) {
-    setChannelWebsocketChecked(checkbox, false);
-    const message = window.t('channels.websocketsCodexOnly');
-    if (window.showWarning) window.showWarning(message);
-    else alert(message);
-    return false;
-  }
 
   const baseURLs = getEnabledChannelWebsocketURLs();
   if (baseURLs.length === 0) {
@@ -356,21 +278,6 @@ async function detectChannelWebsocketSupport(button) {
   }
 }
 
-function syncChannelWebsocketState() {
-  const checkbox = document.getElementById('channelWebsockets');
-  if (!checkbox) return;
-  const supported = channelSupportsNativeWebsocket();
-  checkbox.disabled = false;
-  checkbox.setAttribute('aria-disabled', supported ? 'false' : 'true');
-  checkbox.closest('.channel-editor-checkbox-label')?.classList.toggle('is-disabled', !supported);
-  const probeButton = document.getElementById('channelWebsocketProbeBtn');
-  if (probeButton) {
-    probeButton.setAttribute('aria-disabled', supported ? 'false' : 'true');
-    probeButton.classList.toggle('is-disabled', !supported);
-  }
-  if (!supported) checkbox.checked = false;
-}
-
 async function resolveEditableChannel(id) {
   const cachedChannel = Array.isArray(channels) ? channels.find(c => c.id === id) : null;
   try {
@@ -381,37 +288,25 @@ async function resolveEditableChannel(id) {
   }
 }
 
-async function handleChannelSaveSuccess({ isNewChannel, newChannelType, savedChannelId, response }) {
+async function handleChannelSaveSuccess({ isNewChannel, savedChannelId, response }) {
   if (window.ChannelModalHooks && typeof window.ChannelModalHooks.afterSave === 'function') {
     await window.ChannelModalHooks.afterSave({
       isNewChannel,
-      newChannelType,
       savedChannelId,
       response
     });
     return;
   }
 
-  const hasFilters = typeof filters !== 'undefined' && filters;
-  const currentType = hasFilters ? filters.channelType : 'all';
-  let nextType = currentType || 'all';
-
-  // 新增渠道时，如果类型与当前筛选器不匹配，切换到新渠道的类型
-  if (isNewChannel && hasFilters && currentType !== 'all' && currentType !== newChannelType) {
-    filters.channelType = newChannelType;
-    nextType = newChannelType;
-    const typeFilter = document.getElementById('channelTypeFilter');
-    if (typeFilter) typeFilter.value = newChannelType;
-  }
   if (isNewChannel) {
     channelsCurrentPage = 1;
   }
   if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
 
   if (typeof reloadChannelsList === 'function') {
-    await reloadChannelsList(nextType, filters.status);
+    await reloadChannelsList();
   } else if (typeof loadChannels === 'function') {
-    await loadChannels(nextType);
+    await loadChannels();
   }
 }
 
@@ -431,14 +326,19 @@ function initChannelEditorActions() {
       boundKey: 'channelEditorActionsBound',
       click: {
         'close-channel-modal': () => invokeChannelEditorAction('closeModal'),
+        'open-quick-add-channel': (actionTarget) => openQuickAddChannelModal(actionTarget),
+        'close-quick-add-channel': () => closeQuickAddChannelModal(),
         'add-inline-url': () => invokeChannelEditorAction('addInlineURL'),
         'batch-delete-urls': () => invokeChannelEditorAction('batchDeleteSelectedURLs'),
         'open-key-import-modal': () => invokeChannelEditorAction('openKeyImportModal'),
         'open-key-export-modal': () => invokeChannelEditorAction('openKeyExportModal'),
         'toggle-inline-key-visibility': () => invokeChannelEditorAction('toggleInlineKeyVisibility'),
         'batch-delete-keys': () => invokeChannelEditorAction('batchDeleteSelectedKeys'),
-        'add-common-models': () => invokeChannelEditorAction('addCommonModels'),
+        'add-common-models': (actionTarget) => openCommonModelsModal(actionTarget),
+        'close-common-models-modal': () => closeCommonModelsModal(),
+        'confirm-common-models': () => confirmCommonModelsSelection(),
         'fetch-models-from-api': () => invokeChannelEditorAction('fetchModelsFromAPI'),
+        'fetch-sub2api-rate': () => invokeChannelEditorAction('fetchSub2APIRate'),
         'add-redirect-row': () => invokeChannelEditorAction('addRedirectRow'),
         'batch-lowercase-models': () => invokeChannelEditorAction('batchLowercaseSelectedModels'),
         'batch-delete-models': () => invokeChannelEditorAction('batchDeleteSelectedModels'),
@@ -493,30 +393,20 @@ function initChannelEditorActions() {
     scheduledCheckCheckbox.dataset.bound = '1';
   }
 
-  const websocketCheckbox = document.getElementById('channelWebsockets');
-  if (websocketCheckbox && !websocketCheckbox.dataset.websocketBound) {
-    websocketCheckbox.addEventListener('click', handleChannelWebsocketClick);
-    websocketCheckbox.dataset.websocketBound = '1';
-  }
-
-  const channelTypeRadios = document.getElementById('channelTypeRadios');
-  if (channelTypeRadios && !channelTypeRadios.dataset.protocolTransformsBound) {
-    channelTypeRadios.addEventListener('change', (event) => {
-      if (event.target && event.target.name === 'channelType') {
-        renderProtocolTransformOptions(event.target.value, getSelectedProtocolTransforms(''));
-        syncChannelWebsocketState();
-        scheduleChannelDuplicateHintCheck();
-      }
-    });
-    channelTypeRadios.dataset.protocolTransformsBound = '1';
-  }
-
+  initCommonModelsModalEvents();
+  initQuickAddChannelModalEvents();
   ensureScheduledCheckModelCombobox();
+}
+
+function setQuickAddChannelButtonVisible(visible) {
+  const button = document.getElementById('quickAddChannelBtn');
+  if (button) button.hidden = !visible;
 }
 
 async function showAddModal() {
   editingChannelId = null;
   currentChannelKeyCooldowns = [];
+  setQuickAddChannelButtonVisible(true);
   await syncScheduledCheckVisibility();
 
   setChannelModalTitle('channels.addChannel');
@@ -526,10 +416,7 @@ async function showAddModal() {
   const websocketCheckbox = document.getElementById('channelWebsockets');
   if (websocketCheckbox) websocketCheckbox.checked = false;
   document.getElementById('channelScheduledCheckModel').value = '';
-  document.querySelector('input[name="channelType"][value="anthropic"]').checked = true;
-  syncChannelWebsocketState();
-  renderProtocolTransformOptions('anthropic', []);
-  renderProtocolTransformModeOptions('upstream');
+	await ensureProtocolTransformModeCombobox('auto');
   document.querySelector('input[name="keyStrategy"][value="sequential"]').checked = true;
 
   redirectTableData = [];
@@ -540,7 +427,7 @@ async function showAddModal() {
   renderRedirectTable();
   syncScheduledCheckModelState();
 
-  inlineURLTableData = [''];
+  inlineURLTableData = [emptyInlineURLConfig()];
   selectedURLIndices.clear();
   urlStatsMap = {};
   renderInlineURLTable();
@@ -567,25 +454,24 @@ async function editChannel(id) {
   const scheduledVisibilityPromise = syncScheduledCheckVisibility();
   const apiKeysPromise = fetchEditableChannelKeys(id);
   const modelStatsPromise = fetchEditableChannelModelStats(id);
-  const channelType = channel.channel_type || 'anthropic';
-  const channelTypeRenderPromise = window.ChannelTypeManager.renderChannelTypeRadios('channelTypeRadios', channelType);
+  const protocolModeRenderPromise = ensureProtocolTransformModeCombobox(channel.protocol_transform_mode);
 
   editingChannelId = id;
+  setQuickAddChannelButtonVisible(false);
   clearChannelDuplicateHint();
 
   setChannelModalTitle('channels.editChannel');
   document.getElementById('channelName').value = channel.name;
-  setInlineURLTableData(channel.url);
+  setInlineURLTableData(channel.urls);
 
-  // 多URL时加载实时状态，确保检测前已拿到禁用标记
-  const urlCount = getValidInlineURLs().length;
-  const urlStatsPromise = urlCount > 1 ? fetchURLStats(id) : Promise.resolve();
+  // 所有已保存 URL 都有独立统计；单 URL 也必须加载。
+  const urlStatsPromise = fetchURLStats(id);
 
   const [apiKeys, modelStats] = await Promise.all([
     apiKeysPromise,
     modelStatsPromise,
     scheduledVisibilityPromise,
-    channelTypeRenderPromise,
+    protocolModeRenderPromise,
     urlStatsPromise
   ]);
 
@@ -610,8 +496,6 @@ async function editChannel(id) {
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
   renderInlineKeyTable();
 
-  renderProtocolTransformOptions(channelType, channel.protocol_transforms || []);
-  renderProtocolTransformModeOptions(channel.protocol_transform_mode || 'upstream');
   const keyStrategy = channel.key_strategy || 'sequential';
   const strategyRadio = document.querySelector(`input[name="keyStrategy"][value="${keyStrategy}"]`);
   if (strategyRadio) {
@@ -625,7 +509,6 @@ async function editChannel(id) {
   document.getElementById('channelEnabled').checked = channel.enabled;
   const websocketCheckbox = document.getElementById('channelWebsockets');
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
-  syncChannelWebsocketState();
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
 
@@ -642,6 +525,7 @@ async function editChannel(id) {
     return {
       model: modelName,
       redirect_model: redirectModel,
+      disabled: !!m.disabled,
       cooldown_until: cooldown?.cooldown_until || '',
       cooldown_remaining_ms: cooldown?.cooldown_remaining_ms || 0,
       model_stats: stats || null,
@@ -705,12 +589,12 @@ function closeModal() {
 let channelDuplicateHintTimer = null;
 let channelDuplicateHintRequestSeq = 0;
 
-async function checkChannelDuplicate(channelType, urls, options = {}) {
+async function checkChannelDuplicate(urls, options = {}) {
   try {
     const resp = await fetchAPIWithAuth('/admin/channels/check-duplicate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel_type: channelType, urls })
+      body: JSON.stringify({ urls })
     });
     if (!resp.success) return [];
     return Array.isArray(resp.data?.duplicates) ? resp.data.duplicates : [];
@@ -764,15 +648,14 @@ async function refreshChannelDuplicateHint() {
     return;
   }
 
-  const validURLs = typeof getValidInlineURLs === 'function' ? getValidInlineURLs() : [];
-  if (validURLs.length === 0) {
+  const validURLConfigs = typeof getValidInlineURLConfigs === 'function' ? getValidInlineURLConfigs() : [];
+  if (validURLConfigs.length === 0) {
     clearChannelDuplicateHint();
     return;
   }
 
   const requestSeq = ++channelDuplicateHintRequestSeq;
-  const channelType = document.querySelector('input[name="channelType"]:checked')?.value || 'anthropic';
-  const dupes = await checkChannelDuplicate(channelType, validURLs, { silent: true });
+  const dupes = await checkChannelDuplicate(validURLConfigs, { silent: true });
   if (requestSeq !== channelDuplicateHintRequestSeq) return;
   if (dupes.length > 0) {
     renderChannelDuplicateHint(dupes);
@@ -798,8 +681,8 @@ function scheduleChannelDuplicateHintCheck() {
     return;
   }
 
-  const validURLs = typeof getValidInlineURLs === 'function' ? getValidInlineURLs() : [];
-  if (validURLs.length === 0) {
+  const validURLConfigs = typeof getValidInlineURLConfigs === 'function' ? getValidInlineURLConfigs() : [];
+  if (validURLConfigs.length === 0) {
     clearChannelDuplicateHint();
     return;
   }
@@ -817,8 +700,10 @@ function scheduleChannelDuplicateHintCheck() {
 
 function confirmDuplicateChannel(dupes) {
   const list = dupes.map(d => {
-    const urls = d.url.split('\n').filter(u => u.trim());
-    return `• ${d.name}（${d.channel_type}）\n  ${urls.join('\n  ')}`;
+    const urls = (Array.isArray(d.urls) ? d.urls : [])
+      .map(runtimeInlineURL)
+      .filter(Boolean);
+    return `• ${d.name}\n  ${urls.join('\n  ')}`;
   }).join('\n\n');
   return confirm(window.t('channels.duplicateChannelFound', { list }));
 }
@@ -827,6 +712,16 @@ function setChannelSavePending(pending) {
   const saveBtn = document.getElementById('channelSaveBtn');
   if (!saveBtn) return;
   saveBtn.disabled = Boolean(pending);
+}
+
+function collectModelsForSubmit(rows) {
+  return (rows || [])
+    .filter(r => r.model && r.model.trim())
+    .map(r => ({
+      model: r.model.trim(),
+      redirect_model: (r.redirect_model || '').trim(),
+      disabled: !!r.disabled
+    }));
 }
 
 async function saveChannel(event) {
@@ -843,8 +738,8 @@ async function saveChannel(event) {
     return;
   }
 
-  const validURLs = getValidInlineURLs();
-  if (validURLs.length === 0) {
+  const validURLConfigs = getValidInlineURLConfigs();
+  if (validURLConfigs.length === 0) {
     alert(window.t('channels.fillApiUrlFirst'));
     return;
   }
@@ -856,16 +751,10 @@ async function saveChannel(event) {
     return;
   }
 
-  document.getElementById('channelUrl').value = validURLs.join('\n');
   document.getElementById('channelApiKey').value = validKeys.join(',');
 
   // 构建模型配置（新格式：models 数组）
-  const models = redirectTableData
-    .filter(r => r.model && r.model.trim())
-    .map(r => ({
-      model: r.model.trim(),
-      redirect_model: (r.redirect_model || '').trim()
-    }));
+  const models = collectModelsForSubmit(redirectTableData);
   const seenModels = new Set();
   const duplicateModels = [];
   for (const entry of models) {
@@ -887,17 +776,14 @@ async function saveChannel(event) {
     return;
   }
 
-  const channelType = document.querySelector('input[name="channelType"]:checked')?.value || 'anthropic';
   const keyStrategy = document.querySelector('input[name="keyStrategy"]:checked')?.value || 'sequential';
 
   const formData = {
     name: document.getElementById('channelName').value.trim(),
-    url: validURLs.join('\n'),
+    urls: validURLConfigs,
     api_key: validKeys.join(','),
-    api_keys: validKeyRows.map(row => ({ api_key: row.api_key, note: row.note || '' })),
-    channel_type: channelType,
-    protocol_transform_mode: getSelectedProtocolTransformMode(),
-    protocol_transforms: getSelectedProtocolTransforms(channelType),
+		api_keys: validKeyRows.map(row => ({ api_key: row.api_key, note: row.note || '' })),
+		protocol_transform_mode: getProtocolTransformMode(),
     key_strategy: keyStrategy,
     priority: parseInt(document.getElementById('channelPriority').value) || 0,
     rpm_limit: parseInt(document.getElementById('channelRPMLimit').value) || 0,
@@ -917,7 +803,7 @@ async function saveChannel(event) {
     proxy_url: (document.getElementById('channelProxyURL')?.value || '').trim()
   };
 
-  if (!formData.name || !formData.url || !formData.api_key || formData.models.length === 0) {
+  if (!formData.name || formData.urls.length === 0 || !formData.api_key || formData.models.length === 0) {
     if (window.showError) window.showError(window.t('channels.fillAllRequired'));
     return;
   }
@@ -925,7 +811,7 @@ async function saveChannel(event) {
   setChannelSavePending(true);
   try {
     if (!editingChannelId) {
-      const dupes = await checkChannelDuplicate(channelType, validURLs);
+      const dupes = await checkChannelDuplicate(validURLConfigs);
       if (dupes.length > 0 && !confirmDuplicateChannel(dupes)) return;
     }
 
@@ -944,12 +830,11 @@ async function saveChannel(event) {
     if (!resp.success) throw new Error(resp.error || window.t('channels.msg.saveFailed'));
 
     const isNewChannel = !editingChannelId;
-    const newChannelType = formData.channel_type;
     const savedChannelId = editingChannelId;
 
     resetChannelFormDirty(); // 保存成功，重置dirty状态（避免closeModal弹确认框）
     closeModal();
-    await handleChannelSaveSuccess({ isNewChannel, newChannelType, savedChannelId, response: resp });
+    await handleChannelSaveSuccess({ isNewChannel, savedChannelId, response: resp });
     if (window.showSuccess) window.showSuccess(isNewChannel ? window.t('channels.channelAdded') : window.t('channels.channelUpdated'));
   } catch (e) {
     console.error('Save channel failed', e);
@@ -1176,6 +1061,11 @@ function updateBatchChannelSelectionUI() {
     const visible = selectedCount > 0;
     floatingMenu.classList.toggle('is-visible', visible);
     floatingMenu.setAttribute('aria-hidden', visible ? 'false' : 'true');
+    floatingMenu.inert = !visible;
+    if (!visible) {
+      const refreshOptions = document.getElementById('batchRefreshOptions');
+      if (refreshOptions) refreshOptions.open = false;
+    }
   }
 
   const summary = document.getElementById('selectedChannelsSummary');
@@ -1219,12 +1109,16 @@ function updateBatchChannelSelectionUI() {
     'batchDisableChannelsBtn',
     'batchDeleteChannelsBtn',
     'batchRefreshMergeBtn',
-    'batchRefreshReplaceBtn'
+    'batchRefreshReplaceBtn',
+    'batchApplyProtocolBtn'
   ];
   actionBtnIDs.forEach((id) => {
     const btn = document.getElementById(id);
     if (btn) btn.disabled = selectedCount === 0;
   });
+
+  const protocolMode = document.getElementById('batchProtocolTransformMode');
+  if (protocolMode) protocolMode.disabled = selectedCount === 0;
 }
 
 function selectAllVisibleChannels() {
@@ -1318,6 +1212,56 @@ async function batchSetSelectedChannelsEnabled(enabled) {
   }
 }
 
+async function batchSetSelectedChannelsProtocolMode() {
+  const channelIDs = getSelectedChannelIDs();
+  if (channelIDs.length === 0) {
+    if (window.showWarning) window.showWarning(window.t('channels.batchNoSelection'));
+    return;
+  }
+
+  const modeSelect = document.getElementById('batchProtocolTransformMode');
+  const mode = String(modeSelect?.value || '').trim();
+  if (!['auto', 'upstream', 'local'].includes(mode)) {
+    if (window.showError) window.showError(window.t('channels.batchProtocolModeInvalid'));
+    return;
+  }
+
+  const applyButton = document.getElementById('batchApplyProtocolBtn');
+  if (applyButton) applyButton.disabled = true;
+  if (modeSelect) modeSelect.disabled = true;
+
+  try {
+    const resp = await fetchAPIWithAuth('/admin/channels/batch-protocol-mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel_ids: channelIDs,
+        protocol_transform_mode: mode
+      })
+    });
+    if (!resp.success) throw new Error(resp.error || window.t('common.failed'));
+
+    const data = resp.data || {};
+    selectedChannelIds.clear();
+    if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
+    await reloadChannelsList();
+
+    if (window.showSuccess) {
+      window.showSuccess(window.t('channels.batchProtocolModeSummary', {
+        mode: window.t(`channels.batchProtocolModeValue.${mode}`),
+        updated: data.updated || 0,
+        unchanged: data.unchanged || 0,
+        notFound: data.not_found_count || 0
+      }));
+    }
+  } catch (e) {
+    console.error('Batch set protocol transform mode failed', e);
+    if (window.showError) window.showError(window.t('channels.batchOperationFailed', { error: e.message }));
+  } finally {
+    updateBatchChannelSelectionUI();
+  }
+}
+
 function batchDeleteSelectedChannels() {
   const channelIDs = getSelectedChannelIDs();
   if (channelIDs.length === 0) {
@@ -1389,6 +1333,69 @@ function setBatchRefreshRowResult(channelID, result) {
   }
 }
 
+const BATCH_REFRESH_OPTIONS_STORAGE_KEY = 'channels.batchRefreshOptions';
+
+function getBatchRefreshOptionInputs() {
+  return {
+    lowercaseModels: document.getElementById('batchRefreshLowercaseModels'),
+    stripModelSourcePrefix: document.getElementById('batchRefreshStripModelSourcePrefix')
+  };
+}
+
+function resolveBatchRefreshOptionsStorage(storage) {
+  if (storage) return storage;
+  try {
+    return window.localStorage;
+  } catch (_) {
+    return null;
+  }
+}
+
+function readBatchRefreshOptions(storage) {
+  const fallback = { lowercase_models: false, strip_model_source_prefix: false };
+  const target = resolveBatchRefreshOptionsStorage(storage);
+  if (!target) return fallback;
+
+  try {
+    const saved = JSON.parse(target.getItem(BATCH_REFRESH_OPTIONS_STORAGE_KEY));
+    return {
+      lowercase_models: saved?.lowercase_models === true,
+      strip_model_source_prefix: saved?.strip_model_source_prefix === true
+    };
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function saveBatchRefreshOptions(storage) {
+  const inputs = getBatchRefreshOptionInputs();
+  const options = {
+    lowercase_models: inputs.lowercaseModels?.checked === true,
+    strip_model_source_prefix: inputs.stripModelSourcePrefix?.checked === true
+  };
+  const target = resolveBatchRefreshOptionsStorage(storage);
+  if (!target) return options;
+
+  try {
+    target.setItem(BATCH_REFRESH_OPTIONS_STORAGE_KEY, JSON.stringify(options));
+  } catch (_) { /* 浏览器禁用本地存储时保留当前页面状态 */ }
+  return options;
+}
+
+function initBatchRefreshOptions(storage) {
+  const inputs = getBatchRefreshOptionInputs();
+  const options = readBatchRefreshOptions(storage);
+  if (inputs.lowercaseModels) inputs.lowercaseModels.checked = options.lowercase_models;
+  if (inputs.stripModelSourcePrefix) inputs.stripModelSourcePrefix.checked = options.strip_model_source_prefix;
+
+  for (const input of [inputs.lowercaseModels, inputs.stripModelSourcePrefix]) {
+    if (!input || input.dataset.batchRefreshOptionsBound === '1') continue;
+    input.addEventListener('change', () => saveBatchRefreshOptions(storage));
+    input.dataset.batchRefreshOptionsBound = '1';
+  }
+  return options;
+}
+
 async function batchRefreshSelectedChannels(mode) {
   const channelIDs = getSelectedChannelIDs();
   if (channelIDs.length === 0) {
@@ -1408,8 +1415,10 @@ async function batchRefreshSelectedChannels(mode) {
   }
 
   // 禁用批量操作按钮
-  const actionBtnIDs = ['batchRefreshMergeBtn', 'batchRefreshReplaceBtn', 'batchEnableChannelsBtn', 'batchDisableChannelsBtn', 'batchDeleteChannelsBtn'];
+  const actionBtnIDs = ['batchRefreshMergeBtn', 'batchRefreshReplaceBtn', 'batchEnableChannelsBtn', 'batchDisableChannelsBtn', 'batchDeleteChannelsBtn', 'batchApplyProtocolBtn'];
   actionBtnIDs.forEach(id => { const btn = document.getElementById(id); if (btn) btn.disabled = true; });
+  const protocolModeSelect = document.getElementById('batchProtocolTransformMode');
+  if (protocolModeSelect) protocolModeSelect.disabled = true;
 
   const total = channelIDs.length;
   const modeLabel = mode === 'replace' ? window.t('channels.batchModeReplace') : window.t('channels.batchModeMerge');
@@ -1565,7 +1574,7 @@ async function copyChannel(id, name) {
   currentChannelKeyCooldowns = [];
   setChannelModalTitle('channels.copyChannel');
   document.getElementById('channelName').value = copiedName;
-  setInlineURLTableData(channel.url);
+  setInlineURLTableData(channel.urls);
 
   let apiKeys = [];
   try {
@@ -1581,11 +1590,7 @@ async function copyChannel(id, name) {
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
   renderInlineKeyTable();
 
-  const channelType = channel.channel_type || 'anthropic';
-  const radioButton = document.querySelector(`input[name="channelType"][value="${channelType}"]`);
-  if (radioButton) {
-    radioButton.checked = true;
-  }
+  await ensureProtocolTransformModeCombobox(channel.protocol_transform_mode);
   scheduleChannelDuplicateHintCheck();
   const keyStrategy = channel.key_strategy || 'sequential';
   const strategyRadio = document.querySelector(`input[name="keyStrategy"][value="${keyStrategy}"]`);
@@ -1600,14 +1605,14 @@ async function copyChannel(id, name) {
   document.getElementById('channelEnabled').checked = true;
   const websocketCheckbox = document.getElementById('channelWebsockets');
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
-  syncChannelWebsocketState();
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
 
   // 加载模型配置（新格式：models是 {model, redirect_model} 数组）
   redirectTableData = (channel.models || []).map(m => ({
     model: m.model || '',
-    redirect_model: m.redirect_model || ''
+    redirect_model: m.redirect_model || '',
+    disabled: !!m.disabled
   }));
   selectedModelIndices.clear();
   currentModelFilter = '';
@@ -1644,48 +1649,8 @@ function generateCopyName(originalName) {
   return proposedName;
 }
 
-// 拆分模型映射，支持 model:redirect / model->redirect / model
-function splitModelMapping(entry) {
-  const arrowIndex = entry.indexOf('->');
-  if (arrowIndex >= 0) {
-    return [entry.slice(0, arrowIndex), entry.slice(arrowIndex + 2)];
-  }
-
-  const colonIndex = entry.indexOf(':');
-  if (colonIndex >= 0) {
-    return [entry.slice(0, colonIndex), entry.slice(colonIndex + 1)];
-  }
-
-  return [entry, ''];
-}
-
-// 解析模型输入，支持逗号和换行分隔
-// 支持格式：model 或 model:redirect 或 model->redirect
-// 返回 [{model, redirect_model}] 数组
 function parseModels(input) {
-  const entries = input
-    .split(/[,\n]/)
-    .map(m => m.trim())
-    .filter(m => m);
-
-  const seen = new Set();
-  const result = [];
-
-  for (const entry of entries) {
-    const [modelRaw, redirectRaw] = splitModelMapping(entry);
-    const model = modelRaw.trim();
-    if (!model) continue;
-
-    const redirect = redirectRaw.trim() || model;
-    const modelKey = model.toLowerCase();
-
-    if (!seen.has(modelKey)) {
-      seen.add(modelKey);
-      result.push({ model, redirect_model: redirect });
-    }
-  }
-
-  return result;
+  return window.ModelEntryParser.parseModelEntries(input);
 }
 
 function addRedirectRow() {
@@ -1819,9 +1784,70 @@ function updateRedirectRow(index, field, value) {
       if (statusCell) {
         renderRedirectModelStatus(statusCell, redirectTableData[index]);
       }
+      configureRedirectModelActions(row, redirectTableData[index], index);
     }
 
     markChannelFormDirty();
+  }
+}
+
+function toggleModelDisabledState(rows, index) {
+  const row = rows?.[index];
+  if (!row) return false;
+  row.disabled = !row.disabled;
+  return true;
+}
+
+function toggleRedirectModelDisabled(index) {
+  if (!toggleModelDisabledState(redirectTableData, index)) return;
+  renderRedirectTable();
+  document.querySelector(`#redirectTableBody .redirect-model-toggle-btn[data-index="${index}"]`)?.focus();
+  markChannelFormDirty();
+}
+
+async function testRedirectModel(index, button) {
+  const redirect = redirectTableData[index];
+  const modelName = String(redirect?.model || '').trim();
+  if (!redirect || !modelName) {
+    if (window.showWarning) window.showWarning(window.t('channels.modelNameRequiredForTest'));
+    return false;
+  }
+  if (!editingChannelId || channelFormDirty) {
+    if (window.showWarning) window.showWarning(window.t('channels.saveBeforeModelTest'));
+    return false;
+  }
+  if (redirect.disabled) {
+    if (window.showWarning) window.showWarning(window.t('channels.enableBeforeModelTest'));
+    return false;
+  }
+
+  const channel = channels.find(item => item.id === editingChannelId);
+  if (!channel) {
+    if (window.showError) window.showError(window.t('channels.test.channelNotFound'));
+    return false;
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+  }
+  try {
+    const opened = await testChannel(channel.id, channel.name, modelName);
+    if (!opened) return false;
+    await runChannelTest();
+    return true;
+  } catch (error) {
+    console.error('Model test failed', error);
+    if (window.showError) {
+      window.showError(window.t('channels.test.requestFailed') + error.message);
+    }
+    return false;
+  } finally {
+    if (button?.isConnected) {
+      const currentRedirect = redirectTableData[index];
+      button.disabled = Boolean(currentRedirect?.disabled) || !String(currentRedirect?.model || '').trim();
+      button.removeAttribute('aria-busy');
+    }
   }
 }
 
@@ -1860,12 +1886,49 @@ function createRedirectRow(redirect, index) {
   if (statusCell) {
     renderRedirectModelStatus(statusCell, redirect);
   }
+  configureRedirectModelActions(row, redirect, index);
 
   return row;
 }
 
 function renderRedirectModelStatus(statusCell, redirect) {
   statusCell.replaceChildren();
+
+  if (redirect.disabled) {
+    appendRedirectModelStatus(statusCell, 'disabled', [window.t('channels.modelStatusDisabled')]);
+  } else {
+    renderActiveRedirectModelStatus(statusCell, redirect);
+  }
+}
+
+function configureRedirectModelActions(row, redirect, index) {
+  const toggleButton = row.querySelector('.redirect-model-toggle-btn');
+  if (!toggleButton) return;
+  toggleButton.dataset.index = String(index);
+  const toggleTitle = redirect.disabled
+    ? window.t('channels.enableThisModel')
+    : window.t('channels.disableThisModel');
+  toggleButton.title = toggleTitle;
+  toggleButton.setAttribute('aria-label', toggleTitle);
+  toggleButton.innerHTML = redirect.disabled
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>'
+    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+
+  const testButton = row.querySelector('.redirect-model-test-btn');
+  if (!testButton) return;
+  const modelName = String(redirect.model || '').trim();
+  const testTitle = redirect.disabled
+    ? window.t('channels.enableBeforeModelTest')
+    : modelName
+      ? window.t('channels.testThisModel')
+      : window.t('channels.modelNameRequiredForTest');
+  testButton.dataset.index = String(index);
+  testButton.title = testTitle;
+  testButton.setAttribute('aria-label', testTitle);
+  testButton.disabled = redirect.disabled || !modelName;
+}
+
+function renderActiveRedirectModelStatus(statusCell, redirect) {
   const cooldownUntilMS = Date.parse(redirect.cooldown_until || '');
   const responseRemainingMS = Number(redirect.cooldown_remaining_ms || 0);
   const cooldownRemainingMS = Number.isFinite(cooldownUntilMS)
@@ -2012,8 +2075,22 @@ function initRedirectTableEventDelegation() {
     }
   });
 
-  // 处理删除按钮和转小写按钮点击
+  // 处理模型操作按钮点击
   tbody.addEventListener('click', (e) => {
+    const toggleBtn = e.target.closest('.redirect-model-toggle-btn');
+    if (toggleBtn) {
+      const index = parseInt(toggleBtn.dataset.index, 10);
+      toggleRedirectModelDisabled(index);
+      return;
+    }
+
+    const testBtn = e.target.closest('.redirect-model-test-btn');
+    if (testBtn) {
+      const index = parseInt(testBtn.dataset.index, 10);
+      void testRedirectModel(index, testBtn);
+      return;
+    }
+
     const deleteBtn = e.target.closest('.redirect-delete-btn');
     if (deleteBtn) {
       const index = parseInt(deleteBtn.dataset.index, 10);
@@ -2294,6 +2371,7 @@ function batchDeleteSelectedModels() {
 
 function mergeModelRowsWithFetchedModels(currentRows, fetchedModels) {
   const existingModelKeys = new Set();
+  const occupiedModelKeys = new Set();
   const rows = [];
   (currentRows || []).forEach(row => {
     const model = (row?.model || '').trim();
@@ -2301,9 +2379,13 @@ function mergeModelRowsWithFetchedModels(currentRows, fetchedModels) {
     const modelKey = model.toLowerCase();
     if (existingModelKeys.has(modelKey)) return;
     existingModelKeys.add(modelKey);
+    occupiedModelKeys.add(modelKey);
+    const redirectModel = (row?.redirect_model || '').trim();
+    if (redirectModel) occupiedModelKeys.add(redirectModel.toLowerCase());
     rows.push({
       model,
-      redirect_model: (row?.redirect_model || '').trim()
+      redirect_model: redirectModel,
+      disabled: !!row?.disabled
     });
   });
 
@@ -2313,18 +2395,22 @@ function mergeModelRowsWithFetchedModels(currentRows, fetchedModels) {
     if (!modelName) continue;
 
     const modelKey = modelName.toLowerCase();
-    if (existingModelKeys.has(modelKey)) continue;
-    existingModelKeys.add(modelKey);
-
     const fetchedRedirect = (typeof entry === 'object' && entry?.redirect_model)
       ? String(entry.redirect_model).trim()
       : modelName;
+    const redirectKey = fetchedRedirect.toLowerCase();
+    if (occupiedModelKeys.has(modelKey) || occupiedModelKeys.has(redirectKey)) continue;
+    occupiedModelKeys.add(modelKey);
+    occupiedModelKeys.add(redirectKey);
     rows.push({
       model: modelName,
-      redirect_model: fetchedRedirect
+      redirect_model: fetchedRedirect,
+      disabled: false
     });
     added++;
   }
+
+  rows.sort((a, b) => a.model.localeCompare(b.model));
 
   return { rows, added, removed: 0 };
 }
@@ -2334,13 +2420,331 @@ function areModelRowsEqual(left, right) {
   return (left || []).every((row, index) => {
     const other = right[index] || {};
     return (row.model || '') === (other.model || '') &&
-      (row.redirect_model || '') === (other.redirect_model || '');
+      (row.redirect_model || '') === (other.redirect_model || '') &&
+      !!row.disabled === !!other.disabled;
   });
 }
 
+function quickAddFieldKind(name) {
+  const normalized = String(name || '').trim().toLowerCase();
+  const compact = normalized.replace(/[^a-z0-9密钥]/g, '');
+  if (compact.includes('url') || compact.includes('endpoint') || compact.endsWith('apibase')) {
+    return 'url';
+  }
+  if (compact.includes('apikey') || compact === 'key' || compact.endsWith('key') ||
+      compact.includes('token') || compact.includes('secret') || compact.includes('密钥')) {
+    return 'apiKey';
+  }
+  return '';
+}
+
+function cleanQuickAddValue(value) {
+  let cleaned = String(value || '').trim();
+  cleaned = cleaned.replace(/^[`'\"]+/, '').replace(/[`'\";,]+$/, '').trim();
+  return cleaned;
+}
+
+function collectQuickAddJSONFields(value, fields) {
+  if (!value || typeof value !== 'object') return;
+  for (const [name, child] of Object.entries(value)) {
+    const kind = quickAddFieldKind(name);
+    if (kind && (typeof child === 'string' || typeof child === 'number')) {
+      const cleaned = cleanQuickAddValue(child);
+      if (cleaned) fields[kind].push(cleaned);
+    }
+    if (child && typeof child === 'object') collectQuickAddJSONFields(child, fields);
+  }
+}
+
+function normalizeQuickAddURL(value) {
+  const candidate = cleanQuickAddValue(value);
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch (_error) {
+    const error = new Error('invalid URL');
+    error.code = 'url_invalid';
+    throw error;
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.host ||
+      parsed.username || parsed.password || parsed.search || parsed.hash) {
+    const error = new Error('invalid URL');
+    error.code = 'url_invalid';
+    throw error;
+  }
+
+  let path = parsed.pathname.replace(/\/+$/, '');
+  const versionPathIndex = path.toLowerCase().indexOf('/v1');
+  if (versionPathIndex >= 0) path = path.slice(0, versionPathIndex);
+  return `${parsed.protocol}//${parsed.host}${path}`;
+}
+
+function parseQuickAddChannelInfo(input) {
+  const text = String(input || '').trim();
+  if (!text) {
+    const error = new Error('connection info is required');
+    error.code = 'input_required';
+    throw error;
+  }
+
+  const fields = { url: [], apiKey: [] };
+  try {
+    collectQuickAddJSONFields(JSON.parse(text), fields);
+  } catch (_error) {
+    // 普通文本不是 JSON；继续按环境变量、标签文本解析。
+  }
+
+  for (const line of text.split(/\r?\n/)) {
+    const assignment = line.match(/^\s*(?:export\s+|set\s+)?([^:=]+?)\s*[:=]\s*(.+?)\s*$/i);
+    if (!assignment) continue;
+    const kind = quickAddFieldKind(assignment[1]);
+    if (!kind) continue;
+    const value = cleanQuickAddValue(assignment[2]);
+    if (value) fields[kind].push(value);
+  }
+
+  const urlMatch = text.match(/https?:\/\/[^\s\"'`<>\uff0c\uff1b]+/i);
+  if (urlMatch) fields.url.unshift(cleanQuickAddValue(urlMatch[0].replace(/[).]+$/, '')));
+
+  if (fields.apiKey.length === 0) {
+    const labeledKey = text.match(/(?:api[\s_-]*key|token|secret|\u5bc6\u94a5)\s*[:=]\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s,;\]}]+))/i);
+    const bearerKey = text.match(/\bbearer\s+([^\s\"',;]+)/i);
+    const key = labeledKey
+      ? (labeledKey[1] || labeledKey[2] || labeledKey[3])
+      : bearerKey?.[1];
+    if (key) fields.apiKey.push(cleanQuickAddValue(key));
+  }
+
+  if (fields.apiKey.length === 0) {
+    const bareCandidates = text.split(/\r?\n/)
+      .map(cleanQuickAddValue)
+      .filter(value => value && !value.includes('://') && !/\s/.test(value) && value.length >= 8);
+    if (bareCandidates.length === 1) fields.apiKey.push(bareCandidates[0]);
+  }
+
+  if (fields.url.length === 0) {
+    const error = new Error('URL not found');
+    error.code = 'url_missing';
+    throw error;
+  }
+  if (fields.apiKey.length === 0) {
+    const error = new Error('API key not found');
+    error.code = 'key_missing';
+    throw error;
+  }
+
+  return {
+    url: normalizeQuickAddURL(fields.url[0]),
+    apiKey: fields.apiKey[0]
+  };
+}
+
+async function discoverQuickAddChannelSetup(input, request = fetchAPIWithAuth) {
+  const parsed = parseQuickAddChannelInfo(input);
+  const failures = [];
+  let response;
+  for (const protocol of ['openai', 'anthropic']) {
+    try {
+      const candidate = await request('/admin/channels/models/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          urls: [{ url: parsed.url, exact: false, protocols: [] }],
+          protocol,
+          api_key: parsed.apiKey
+        })
+      });
+      if (candidate?.success) {
+        response = candidate;
+        break;
+      }
+      failures.push(`${protocol}: ${candidate?.error || 'model discovery failed'}`);
+    } catch (error) {
+      failures.push(`${protocol}: ${error?.message || 'model discovery failed'}`);
+    }
+  }
+  if (!response) throw new Error(failures.join('; '));
+
+  const replacement = mergeModelRowsWithFetchedModels([], response.data?.models || []);
+  if (replacement.rows.length === 0) {
+    const error = new Error('model list is empty');
+    error.code = 'models_missing';
+    throw error;
+  }
+
+  return {
+    // Models API 成功不能证明聊天请求协议；保持自动能力探测。
+    url: { url: parsed.url, exact: false, protocols: [] },
+    key: { api_key: parsed.apiKey, note: '' },
+    models: replacement.rows
+  };
+}
+
+function applyQuickAddChannelSetup(setup) {
+  const channelNameInput = document.getElementById('channelName');
+  if (channelNameInput && !channelNameInput.value.trim()) {
+    channelNameInput.value = new URL(setup.url.url).host;
+  }
+
+  setInlineURLTableData([setup.url]);
+  setInlineKeyTableDataFromAPI([setup.key]);
+  currentChannelKeyCooldowns = [];
+  selectedKeyIndices.clear();
+  renderInlineKeyTable();
+
+  redirectTableData = setup.models.map(row => ({
+    model: row.model || '',
+    redirect_model: row.redirect_model || '',
+    disabled: !!row.disabled
+  }));
+  selectedModelIndices.clear();
+  updateModelBatchDeleteButton();
+  renderRedirectTable();
+  syncScheduledCheckModelState();
+  markChannelFormDirty();
+  scheduleChannelEditorTableSizingSync();
+}
+
+function setQuickAddChannelError(message = '') {
+  const input = document.getElementById('quickAddChannelInput');
+  const error = document.getElementById('quickAddChannelError');
+  if (!input || !error) return;
+
+  const hasError = Boolean(message);
+  input.setAttribute('aria-invalid', hasError ? 'true' : 'false');
+  error.textContent = message;
+  error.hidden = !hasError;
+}
+
+function setQuickAddChannelBusy(busy) {
+  const input = document.getElementById('quickAddChannelInput');
+  const button = document.getElementById('quickAddChannelConfirmBtn');
+  const status = document.getElementById('quickAddChannelStatus');
+  if (input) input.disabled = busy;
+  if (button) {
+    button.disabled = busy;
+    if (busy) button.setAttribute('aria-busy', 'true');
+    else button.removeAttribute('aria-busy');
+  }
+  if (status) status.textContent = busy ? window.t('channels.quickAdd.checking') : '';
+}
+
+function quickAddChannelErrorMessage(error) {
+  const keys = {
+    input_required: 'channels.quickAdd.inputRequired',
+    url_missing: 'channels.quickAdd.urlMissing',
+    key_missing: 'channels.quickAdd.keyMissing',
+    url_invalid: 'channels.quickAdd.urlInvalid',
+    models_missing: 'channels.quickAdd.modelsMissing'
+  };
+  if (error?.code && keys[error.code]) return window.t(keys[error.code]);
+  return window.t('channels.quickAdd.failed', { error: error?.message || window.t('common.unknown') });
+}
+
+function openQuickAddChannelModal(trigger) {
+  if (editingChannelId !== null) return false;
+  const modal = document.getElementById('quickAddChannelModal');
+  const input = document.getElementById('quickAddChannelInput');
+  if (!modal || !input) return false;
+
+  quickAddChannelRequestVersion++;
+  quickAddChannelTrigger = trigger || document.activeElement;
+  input.value = '';
+  setQuickAddChannelError();
+  setQuickAddChannelBusy(false);
+  document.getElementById('channelModal')?.setAttribute('inert', '');
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  input.focus();
+  return true;
+}
+
+function closeQuickAddChannelModal() {
+  const modal = document.getElementById('quickAddChannelModal');
+  if (!modal) return;
+
+  quickAddChannelRequestVersion++;
+  setQuickAddChannelBusy(false);
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  document.getElementById('channelModal')?.removeAttribute('inert');
+  quickAddChannelTrigger?.focus?.();
+  quickAddChannelTrigger = null;
+}
+
+async function confirmQuickAddChannel() {
+  const input = document.getElementById('quickAddChannelInput');
+  if (!input || input.disabled) return false;
+
+  const requestVersion = ++quickAddChannelRequestVersion;
+  setQuickAddChannelError();
+  setQuickAddChannelBusy(true);
+  try {
+    const setup = await discoverQuickAddChannelSetup(input.value);
+    if (requestVersion !== quickAddChannelRequestVersion) return false;
+
+    applyQuickAddChannelSetup(setup);
+    const modelCount = setup.models.length;
+    closeQuickAddChannelModal();
+    if (window.showSuccess) {
+      window.showSuccess(window.t('channels.quickAdd.success', { count: modelCount }));
+    }
+    return true;
+  } catch (error) {
+    if (requestVersion !== quickAddChannelRequestVersion) return false;
+    setQuickAddChannelBusy(false);
+    setQuickAddChannelError(quickAddChannelErrorMessage(error));
+    input.focus();
+    return false;
+  }
+}
+
+function initQuickAddChannelModalEvents() {
+  const modal = document.getElementById('quickAddChannelModal');
+  const form = document.getElementById('quickAddChannelForm');
+  if (!modal || !form || modal.dataset.bound) return;
+
+  modal.addEventListener('click', event => {
+    if (event.target === modal) closeQuickAddChannelModal();
+  });
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    confirmQuickAddChannel();
+  });
+  document.addEventListener('keydown', event => {
+    if (!modal.classList.contains('show')) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeQuickAddChannelModal();
+      return;
+    }
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      confirmQuickAddChannel();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+
+    const focusable = Array.from(modal.querySelectorAll('button:not([disabled]), textarea:not([disabled])'));
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, true);
+  modal.dataset.bound = '1';
+}
+
 async function fetchModelsFromAPI() {
-  const channelUrl = getValidInlineURLs()[0] || '';
-  const channelType = document.querySelector('input[name="channelType"]:checked')?.value || 'anthropic';
+  const urls = getValidInlineURLConfigs();
+  const channelUrl = urls[0]?.url || '';
   const firstValidKey = selectFirstEnabledInlineKey(getInlineKeyRows(), currentChannelKeyCooldowns);
 
   if (!channelUrl) {
@@ -2366,8 +2770,7 @@ async function fetchModelsFromAPI() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      channel_type: channelType,
-      url: channelUrl,
+      urls,
       api_key: firstValidKey
     })
   };
@@ -2383,7 +2786,8 @@ async function fetchModelsFromAPI() {
 
     const previousRows = redirectTableData.map(row => ({
       model: row.model || '',
-      redirect_model: row.redirect_model || ''
+      redirect_model: row.redirect_model || '',
+      disabled: !!row.disabled
     }));
     const replacement = mergeModelRowsWithFetchedModels(redirectTableData, data.models);
     if (replacement.rows.length === 0) {
@@ -2415,11 +2819,91 @@ async function fetchModelsFromAPI() {
   }
 }
 
+function setFetchSub2APIRatePending(pending) {
+  const button = document.getElementById('fetchSub2APIRateBtn');
+  const label = document.getElementById('fetchSub2APIRateLabel');
+  if (button) {
+    button.disabled = pending;
+    if (pending) button.setAttribute('aria-busy', 'true');
+    else button.removeAttribute('aria-busy');
+  }
+  if (label) {
+    label.textContent = window.t(pending ? 'channels.fetchRateLoading' : 'channels.fetchRate');
+  }
+}
+
+function showSub2APIRateError(code) {
+  const knownCodes = new Set([
+    'authentication_error',
+    'permission_error',
+    'not_supported',
+    'timeout',
+    'invalid_response'
+  ]);
+  const errorCode = knownCodes.has(code) ? code : 'default';
+  const message = window.t(`channels.fetchRateError.${errorCode}`);
+  if (window.showError) window.showError(message);
+  else alert(message);
+}
+
+async function fetchSub2APIRate() {
+  const baseURL = getValidInlineURLConfigs()[0]?.url || '';
+  const apiKey = selectFirstEnabledInlineKey(getInlineKeyRows(), currentChannelKeyCooldowns);
+
+  if (!baseURL) {
+    if (window.showError) window.showError(window.t('channels.fillApiUrlFirst'));
+    else alert(window.t('channels.fillApiUrlFirst'));
+    return;
+  }
+  if (!apiKey) {
+    if (window.showError) window.showError(window.t('channels.addAtLeastOneEnabledKey'));
+    else alert(window.t('channels.addAtLeastOneEnabledKey'));
+    return;
+  }
+
+  setFetchSub2APIRatePending(true);
+  try {
+    const response = await fetchAPIWithAuth('/admin/channels/billing/fetch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url: baseURL, api_key: apiKey })
+    });
+    if (!response.success) {
+      showSub2APIRateError(response.data?.code);
+      return;
+    }
+
+    const rate = response.data?.effective_rate_multiplier;
+    if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0) {
+      showSub2APIRateError('invalid_response');
+      return;
+    }
+
+    const input = document.getElementById('channelCostMultiplier');
+    if (!input) return;
+    const rateText = String(rate);
+    const currentRate = Number.parseFloat(input.value);
+    input.value = rateText;
+    if (!Number.isFinite(currentRate) || currentRate !== rate) markChannelFormDirty();
+
+    const message = window.t('channels.fetchRateSuccess', { rate: rateText });
+    if (window.showSuccess) window.showSuccess(message);
+    else alert(message);
+  } catch (error) {
+    console.error('Fetch Sub2API rate failed', error);
+    showSub2APIRateError('default');
+  } finally {
+    setFetchSub2APIRatePending(false);
+  }
+}
+
 // 常用模型配置
 const COMMON_MODELS = {
   anthropic: [
     'claude-haiku-4-5-20251001',
     'claude-opus-4-8',
+    'claude-opus-5',
+    'claude-fable-5',
     'claude-sonnet-5',
     'claude-sonnet-4-6',
   ],
@@ -2432,6 +2916,7 @@ const COMMON_MODELS = {
     'gpt-5.6-terra'
   ],
   gemini: [
+    'gemini-3.6-flash',
     'gemini-3.5-flash',
     'gemini-2.5-pro',
     'gemini-3.1-flash-lite',
@@ -2439,45 +2924,165 @@ const COMMON_MODELS = {
   ]
 };
 
-function addCommonModels() {
-  const channelType = document.querySelector('input[name="channelType"]:checked')?.value || 'anthropic';
-  const commonModels = COMMON_MODELS[channelType];
+let commonModelsTrigger = null;
 
-  if (!commonModels || commonModels.length === 0) {
-    if (window.showWarning) {
-      window.showWarning(window.t('channels.noPresetModels', { type: channelType }));
-    } else {
-      alert(window.t('channels.noPresetModels', { type: channelType }));
-    }
-    return;
+function getCommonModelsModalCheckboxes() {
+  return Array.from(document.querySelectorAll('#commonModelsModal input[name="commonModelType"]'));
+}
+
+function openCommonModelsModal(trigger) {
+  const modal = document.getElementById('commonModelsModal');
+  if (!modal) return false;
+
+  commonModelsTrigger = trigger || document.activeElement;
+  const configuredProtocols = new Set(
+    getValidInlineURLConfigs().flatMap(entry => Array.isArray(entry.protocols) ? entry.protocols : [])
+  );
+  const checkboxes = getCommonModelsModalCheckboxes();
+  checkboxes.forEach(checkbox => {
+    checkbox.checked = configuredProtocols.size > 0
+      ? configuredProtocols.has(checkbox.value)
+      : checkbox.value === 'anthropic';
+  });
+
+  document.getElementById('channelModal')?.setAttribute('inert', '');
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  (checkboxes.find(checkbox => checkbox.checked) || checkboxes[0])?.focus();
+  return true;
+}
+
+function closeCommonModelsModal() {
+  const modal = document.getElementById('commonModelsModal');
+  if (!modal) return;
+
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  document.getElementById('channelModal')?.removeAttribute('inert');
+  if (commonModelsTrigger && typeof commonModelsTrigger.focus === 'function') {
+    commonModelsTrigger.focus();
   }
+  commonModelsTrigger = null;
+}
 
-  // 获取现有模型名称集合
+function getSelectedCommonModelTypes() {
+  return getCommonModelsModalCheckboxes()
+    .filter(checkbox => checkbox.checked)
+    .map(checkbox => checkbox.value);
+}
+
+function initCommonModelsModalEvents() {
+  const modal = document.getElementById('commonModelsModal');
+  if (!modal || modal.dataset.bound) return;
+
+  modal.addEventListener('click', event => {
+    if (event.target === modal) closeCommonModelsModal();
+  });
+  document.addEventListener('keydown', event => {
+    if (!modal.classList.contains('show')) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeCommonModelsModal();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+
+    const focusable = Array.from(modal.querySelectorAll('button:not([disabled]), input:not([disabled])'));
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, true);
+  modal.dataset.bound = '1';
+}
+
+function addCommonModelsToRows(rows, protocols) {
+  const selectedProtocols = Array.from(new Set(
+    (Array.isArray(protocols) ? protocols : [])
+      .map(protocol => String(protocol || '').trim().toLowerCase())
+      .filter(protocol => COMMON_MODELS[protocol])
+  ));
+  const commonModels = selectedProtocols.flatMap(protocol => COMMON_MODELS[protocol]);
+  if (commonModels.length === 0) return { addedCount: 0, hasSupportedTypes: false };
+
   const existingModels = new Set(
-    redirectTableData
+    rows
       .map(r => (r.model || '').trim().toLowerCase())
       .filter(Boolean)
   );
 
-  // 添加常用模型（不重复）
   let addedCount = 0;
   for (const modelName of commonModels) {
     const modelKey = modelName.toLowerCase();
     if (!existingModels.has(modelKey)) {
-      redirectTableData.push({ model: modelName, redirect_model: '' });
+      rows.push({ model: modelName, redirect_model: '' });
       existingModels.add(modelKey);
       addedCount++;
     }
   }
+  return { addedCount, hasSupportedTypes: true };
+}
+
+function addCommonModels(protocols) {
+  const result = addCommonModelsToRows(redirectTableData, protocols);
+  if (!result.hasSupportedTypes) {
+    if (window.showWarning) {
+      window.showWarning(window.t('channels.selectCommonModelType'));
+    } else {
+      alert(window.t('channels.selectCommonModelType'));
+    }
+    return 0;
+  }
 
   renderRedirectTable();
-  if (addedCount > 0) markChannelFormDirty();
+  if (result.addedCount > 0) markChannelFormDirty();
 
   if (window.showSuccess) {
-    window.showSuccess(window.t('channels.addedCommonModels', { count: addedCount }));
+    window.showSuccess(window.t('channels.addedCommonModels', { count: result.addedCount }));
   }
+  return result.addedCount;
+}
+
+function confirmCommonModelsSelection() {
+  const selectedTypes = getSelectedCommonModelTypes();
+  if (selectedTypes.length === 0) {
+    if (window.showWarning) {
+      window.showWarning(window.t('channels.selectCommonModelType'));
+    } else {
+      alert(window.t('channels.selectCommonModelType'));
+    }
+    getCommonModelsModalCheckboxes()[0]?.focus();
+    return false;
+  }
+
+  addCommonModels(selectedTypes);
+  closeCommonModelsModal();
+  return true;
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { addCommonModels, detectChannelWebsocketSupport, fetchModelsFromAPI, handleChannelWebsocketClick };
+  module.exports = {
+    addCommonModels,
+    addCommonModelsToRows,
+    applyQuickAddChannelSetup,
+    batchSetSelectedChannelsProtocolMode,
+    collectModelsForSubmit,
+    detectChannelWebsocketSupport,
+    discoverQuickAddChannelSetup,
+    editChannel,
+    fetchModelsFromAPI,
+    fetchSub2APIRate,
+    initBatchRefreshOptions,
+    mergeModelRowsWithFetchedModels,
+    parseQuickAddChannelInfo,
+    testRedirectModel,
+    toggleModelDisabledState
+  };
 }

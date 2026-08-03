@@ -2,19 +2,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { selectFirstEnabledInlineKey } = require('./channels-keys.js');
+const { fetchURLStats } = require('./channels-urls.js');
 
-function installFetchModelsGlobals({ rows, states, onFetch, onError, onWarning, channelType = 'openai' }) {
-  const globals = {
-    window: {
-      ChannelProtocolConfig: {},
-      t: key => key,
+function installFetchModelsGlobals({ rows, states, onFetch, onError, onWarning }) {
+	const globals = {
+		window: {
+			t: key => key,
       showError: onError,
       showWarning: onWarning
     },
-    document: {
-      querySelector: () => ({ value: channelType })
-    },
-    getValidInlineURLs: () => ['https://upstream.test'],
+    document: { querySelector: () => null },
+    getValidInlineURLConfigs: () => [{ url: 'https://upstream.test', exact: false, protocols: ['openai'] }],
     getInlineKeyRows: () => rows,
     currentChannelKeyCooldowns: states,
     selectFirstEnabledInlineKey,
@@ -45,10 +43,293 @@ function loadFetchModelsFromAPI() {
   return loadChannelsModals().fetchModelsFromAPI;
 }
 
+function installBatchProtocolModeGlobals(response) {
+  const requests = [];
+  const notifications = [];
+  let filterSaves = 0;
+  let reloads = 0;
+  const elements = {
+    batchProtocolTransformMode: { value: 'local', disabled: false },
+    batchApplyProtocolBtn: { disabled: false },
+    batchFloatingMenu: {
+      inert: false,
+      classList: { toggle() {} },
+      setAttribute() {}
+    },
+    selectedChannelsSummary: { textContent: '' },
+    selectedChannelsCountBadge: { textContent: '' },
+    batchFloatingMenuCloseBtn: { disabled: false }
+  };
+  const globals = {
+    window: {
+      t: (key, params) => params ? { key, params } : key,
+      showSuccess: message => notifications.push({ type: 'success', message }),
+      showError: message => notifications.push({ type: 'error', message }),
+      showWarning: message => notifications.push({ type: 'warning', message })
+    },
+    document: { getElementById: id => elements[id] || null },
+    selectedChannelIds: new Set(['11', '22']),
+    filteredChannels: [],
+    channels: [],
+    fetchAPIWithAuth: async (url, options) => {
+      requests.push({ url, options });
+      return response;
+    },
+    saveChannelsFilters: () => { filterSaves++; },
+    reloadChannelsList: async () => { reloads++; },
+    console: { ...console, error: () => {} }
+  };
+  const previous = new Map();
+  for (const [name, value] of Object.entries(globals)) {
+    previous.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  }
+  return {
+    elements,
+    notifications,
+    requests,
+    selectedChannelIds: globals.selectedChannelIds,
+    get filterSaves() { return filterSaves; },
+    get reloads() { return reloads; },
+    restore() {
+      for (const [name, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(global, name, descriptor);
+        else delete global[name];
+      }
+    }
+  };
+}
+
+function installFetchSub2APIRateGlobals({ response, rows, states }) {
+  const requests = [];
+  const notifications = [];
+  let dirty = false;
+  const elements = {
+    channelCostMultiplier: { value: '0.5' },
+    fetchSub2APIRateBtn: {
+      disabled: false,
+      attributes: new Map(),
+      setAttribute(name, value) { this.attributes.set(name, value); },
+      removeAttribute(name) { this.attributes.delete(name); }
+    },
+    fetchSub2APIRateLabel: { textContent: '' }
+  };
+  const globals = {
+    window: {
+      t: (key, params) => params ? { key, params } : key,
+      showSuccess: message => notifications.push({ type: 'success', message }),
+      showError: message => notifications.push({ type: 'error', message })
+    },
+    document: {
+      getElementById: id => elements[id] || null,
+      querySelector: () => null
+    },
+    getValidInlineURLConfigs: () => [{ url: 'https://sub2api.test/v1', exact: false, protocols: ['openai'] }],
+    getInlineKeyRows: () => rows,
+    currentChannelKeyCooldowns: states,
+    selectFirstEnabledInlineKey,
+    fetchAPIWithAuth: async (url, options) => {
+      requests.push({ url, options });
+      return response;
+    },
+    markChannelFormDirty: () => { dirty = true; },
+    alert: message => notifications.push({ type: 'alert', message }),
+    console: { ...console, error: () => {} }
+  };
+  const previous = new Map();
+  for (const [name, value] of Object.entries(globals)) {
+    previous.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  }
+  return {
+    elements,
+    notifications,
+    requests,
+    get dirty() { return dirty; },
+    restore() {
+      for (const [name, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(global, name, descriptor);
+        else delete global[name];
+      }
+    }
+  };
+}
+
+function installEditChannelGlobals(channel) {
+  const requests = [];
+  const elements = new Map();
+  const makeElement = () => ({
+    value: '',
+    checked: false,
+    disabled: false,
+    hidden: false,
+    style: {},
+    dataset: {},
+    classList: { add() {}, remove() {}, contains() { return false; } },
+    setAttribute() {},
+    addEventListener() {},
+    appendChild() {},
+    querySelector: () => null
+  });
+  const getElement = id => {
+    if (id === 'channelScheduledCheckEnabledWrapper' || id === 'channelScheduledCheckModelWrapper') {
+      return null;
+    }
+    if (!elements.has(id)) elements.set(id, makeElement());
+    return elements.get(id);
+  };
+  const globals = {
+    window: {
+      t: key => key,
+      addEventListener() {}
+    },
+    document: {
+      getElementById: getElement,
+      querySelector: selector => [
+        '#channelModal .channel-editor-body',
+        '#inlineUrlTableBody'
+      ].includes(selector) ? null : makeElement()
+    },
+    channels: [],
+    editingChannelId: null,
+    currentChannelKeyCooldowns: [],
+    inlineKeyTableData: [{ api_key: '' }],
+    inlineKeyVisible: false,
+    inlineURLTableData: channel.urls,
+    inlineURLProtocolComboboxes: new Map(),
+    selectedURLIndices: new Set(),
+    redirectTableData: [],
+    selectedModelIndices: new Set(),
+    currentModelFilter: '',
+    fetchDataWithAuth: async url => {
+      requests.push(url);
+      if (url === `/admin/channels/${channel.id}`) return channel;
+      if (url === `/admin/channels/${channel.id}/keys`) return [];
+      if (url === `/admin/channels/${channel.id}/model-stats`) return [];
+      if (url === `/admin/channels/${channel.id}/url-stats`) {
+        return [{ url: channel.urls[0].url, latency_ms: 125, requests: 1, failures: 0 }];
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    createSearchableCombobox: () => ({
+      setValue() {},
+      refresh() {},
+      getInput: () => null,
+      getValue: () => 'auto'
+    }),
+    TemplateEngine: { render: () => null },
+    clearChannelDuplicateHint() {},
+    setInlineURLTableData() {},
+    fetchURLStats,
+    urlStatsMap: {},
+    renderInlineURLTable() {},
+    setInlineKeyTableDataFromAPI() {},
+    renderInlineKeyTable() {},
+    renderRedirectTable() {},
+    resetChannelFormDirty() {},
+    syncChannelEditorTableSizing() {},
+    scheduleChannelEditorTableSizingSync() {}
+  };
+  const previous = new Map();
+  for (const [name, value] of Object.entries(globals)) {
+    previous.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  }
+  return {
+    requests,
+    getElement,
+    restore() {
+      for (const [name, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(global, name, descriptor);
+        else delete global[name];
+      }
+    }
+  };
+}
+
+function installCommonModelsGlobals(initialRows = []) {
+  const rows = initialRows.map(row => ({ ...row }));
+  const notifications = [];
+  let dirty = false;
+  let renders = 0;
+  const globals = {
+    window: {
+      t: (key, params) => ({ key, params }),
+      showSuccess: message => notifications.push({ type: 'success', message }),
+      showWarning: message => notifications.push({ type: 'warning', message })
+    },
+    redirectTableData: rows,
+    renderRedirectTable: () => { renders++; },
+    markChannelFormDirty: () => { dirty = true; },
+    alert: () => {}
+  };
+  const previous = new Map();
+  for (const [name, value] of Object.entries(globals)) {
+    previous.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  }
+  return {
+    rows,
+    notifications,
+    get dirty() { return dirty; },
+    get renders() { return renders; },
+    restore() {
+      for (const [name, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(global, name, descriptor);
+        else delete global[name];
+      }
+    }
+  };
+}
+
+function installModelRequestTestGlobals({ dirty = false } = {}) {
+  const calls = [];
+  const notifications = [];
+  const button = {
+    disabled: false,
+    isConnected: true,
+    attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    removeAttribute(name) { this.attributes.delete(name); }
+  };
+  const globals = {
+    window: {
+      t: key => key,
+      showWarning: message => notifications.push(message)
+    },
+    redirectTableData: [{ model: 'requested-model', redirect_model: 'upstream-model', disabled: false }],
+    editingChannelId: 7,
+    channelFormDirty: dirty,
+    channels: [{ id: 7, name: 'test-channel' }],
+    testChannel: async (...args) => {
+      calls.push({ type: 'open', args });
+      return true;
+    },
+    runChannelTest: async () => { calls.push({ type: 'run' }); }
+  };
+  const previous = new Map();
+  for (const [name, value] of Object.entries(globals)) {
+    previous.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  }
+  return {
+    button,
+    calls,
+    notifications,
+    restore() {
+      for (const [name, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(global, name, descriptor);
+        else delete global[name];
+      }
+    }
+  };
+}
+
 function installWebsocketProbeGlobals({
   supported,
   initialChecked,
   urls = ['https://upstream.test'],
+  urlConfigs = urls.map(url => ({ url, exact: false, protocols: [] })),
   rows = [{ api_key: 'sk-probe' }],
   urlStats = {},
   keyStates = []
@@ -59,10 +340,9 @@ function installWebsocketProbeGlobals({
   const notifications = [];
   const requests = [];
   let dirty = false;
-  const globals = {
-    window: {
-      ChannelProtocolConfig: {},
-      t: key => key,
+	const globals = {
+		window: {
+			t: key => key,
       showNotification: (message, type) => notifications.push({ message, type }),
       collectCustomRulesForSubmit: () => ({
         headers: [{ action: 'override', name: 'X-Probe', value: '1' }]
@@ -75,7 +355,8 @@ function installWebsocketProbeGlobals({
         channelProxyURL: proxyInput
       })[id] || null
     },
-    getValidInlineURLs: () => urls,
+    getValidInlineURLConfigs: () => urlConfigs,
+    runtimeInlineURL: entry => entry.exact ? `${entry.url}#` : entry.url,
     getInlineKeyRows: () => rows,
     urlStatsMap: urlStats,
     currentChannelKeyCooldowns: keyStates,
@@ -114,8 +395,15 @@ test('WebSocket probe skips disabled URLs and keys and checks every enabled URL'
     initialChecked: false,
     urls: [
       'https://disabled-upstream.test',
+      'https://anthropic-only.test',
       'https://enabled-a.test',
       'https://enabled-b.test'
+    ],
+    urlConfigs: [
+      { url: 'https://disabled-upstream.test', exact: false, protocols: ['codex'] },
+      { url: 'https://anthropic-only.test', exact: false, protocols: ['anthropic'] },
+      { url: 'https://enabled-a.test', exact: false, protocols: ['codex'] },
+      { url: 'https://enabled-b.test', exact: false, protocols: [] }
     ],
     rows: [
       { api_key: 'disabled-key' },
@@ -149,60 +437,25 @@ test('WebSocket probe skips disabled URLs and keys and checks every enabled URL'
   }
 });
 
-test('unsupported native WebSocket click is rejected with a clear warning', () => {
-  let warning = '';
-  let prevented = false;
-  const checkbox = { checked: true };
-  const restore = installFetchModelsGlobals({
-    rows: [],
-    states: [],
-    onFetch: async () => ({}),
-    onError: () => {},
-    onWarning: message => { warning = message; }
-  });
+test('editing a single-URL channel loads its URL statistics', async () => {
+  const channel = {
+    id: 73,
+    name: 'single-url',
+    urls: [{ url: 'https://single.test', exact: false, protocols: [] }],
+    models: [],
+    priority: 100,
+    enabled: true,
+    protocol_transform_mode: 'auto'
+  };
+  const fixture = installEditChannelGlobals(channel);
 
   try {
-    const { handleChannelWebsocketClick } = loadChannelsModals();
-    const supported = handleChannelWebsocketClick({
-      currentTarget: checkbox,
-      preventDefault: () => { prevented = true; }
-    });
-
-    assert.equal(supported, false);
-    assert.equal(prevented, true);
-    assert.equal(checkbox.checked, false);
-    assert.equal(warning, 'channels.websocketsCodexOnly');
+    const { editChannel } = loadChannelsModals();
+    await editChannel(channel.id);
+    assert.ok(fixture.requests.includes(`/admin/channels/${channel.id}/url-stats`));
+    assert.equal(fixture.getElement('quickAddChannelBtn').hidden, true);
   } finally {
-    restore();
-  }
-});
-
-test('Codex native WebSocket click remains editable', () => {
-  let warned = false;
-  let prevented = false;
-  const checkbox = { checked: true };
-  const restore = installFetchModelsGlobals({
-    rows: [],
-    states: [],
-    onFetch: async () => ({}),
-    onError: () => {},
-    onWarning: () => { warned = true; },
-    channelType: 'codex'
-  });
-
-  try {
-    const { handleChannelWebsocketClick } = loadChannelsModals();
-    const supported = handleChannelWebsocketClick({
-      currentTarget: checkbox,
-      preventDefault: () => { prevented = true; }
-    });
-
-    assert.equal(supported, true);
-    assert.equal(prevented, false);
-    assert.equal(checkbox.checked, true);
-    assert.equal(warned, false);
-  } finally {
-    restore();
+    fixture.restore();
   }
 });
 
@@ -252,6 +505,119 @@ for (const testCase of [
   });
 }
 
+test('common models add every selected type and ignore existing names case-insensitively', () => {
+  const rows = [
+    { model: 'GPT-5.4', redirect_model: 'custom-upstream-model' }
+  ];
+
+  const restore = installCommonModelsGlobals();
+  try {
+    const { addCommonModelsToRows } = loadChannelsModals();
+    const result = addCommonModelsToRows(rows, ['anthropic', 'codex', 'anthropic']);
+
+    assert.deepEqual(result, { addedCount: 11, hasSupportedTypes: true });
+    assert.equal(rows.length, 12);
+    assert.equal(rows.filter(row => row.model.toLowerCase() === 'gpt-5.4').length, 1);
+    assert.ok(rows.some(row => row.model === 'claude-opus-4-8'));
+    assert.ok(rows.some(row => row.model === 'gpt-5.6-terra'));
+  } finally {
+    restore.restore();
+  }
+});
+
+test('common models require at least one supported type', () => {
+  const fixture = installCommonModelsGlobals();
+
+  try {
+    const { addCommonModels } = loadChannelsModals();
+    assert.equal(addCommonModels([]), 0);
+    assert.equal(fixture.rows.length, 0);
+    assert.equal(fixture.dirty, false);
+    assert.equal(fixture.renders, 0);
+    assert.deepEqual(fixture.notifications, [{
+      type: 'warning',
+      message: { key: 'channels.selectCommonModelType', params: undefined }
+    }]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('fetched models sort by model name while preserving existing state', () => {
+  const { mergeModelRowsWithFetchedModels } = loadChannelsModals();
+  const result = mergeModelRowsWithFetchedModels([
+    { model: 'z-existing-model', redirect_model: 'upstream-model', disabled: true }
+  ], [
+    { model: 'z-existing-model', redirect_model: 'ignored-replacement' },
+    { model: 'UPSTREAM-MODEL', redirect_model: 'UPSTREAM-MODEL' },
+    { model: 'm-new-model', redirect_model: 'new-upstream' },
+    { model: 'a-new-model', redirect_model: 'another-upstream' }
+  ]);
+
+  assert.deepEqual(result, {
+    rows: [
+      { model: 'a-new-model', redirect_model: 'another-upstream', disabled: false },
+      { model: 'm-new-model', redirect_model: 'new-upstream', disabled: false },
+      { model: 'z-existing-model', redirect_model: 'upstream-model', disabled: true }
+    ],
+    added: 2,
+    removed: 0
+  });
+});
+
+test('model disabled state toggles without changing the model mapping', () => {
+  const { toggleModelDisabledState } = loadChannelsModals();
+  const rows = [{ model: 'model-a', redirect_model: 'upstream-a', disabled: false }];
+
+  assert.equal(toggleModelDisabledState(rows, 0), true);
+  assert.deepEqual(rows, [{ model: 'model-a', redirect_model: 'upstream-a', disabled: true }]);
+  assert.equal(toggleModelDisabledState(rows, 0), true);
+  assert.deepEqual(rows, [{ model: 'model-a', redirect_model: 'upstream-a', disabled: false }]);
+  assert.equal(toggleModelDisabledState(rows, 9), false);
+});
+
+test('model row test opens the existing test flow for the current model and runs it', async () => {
+  const fixture = installModelRequestTestGlobals();
+
+  try {
+    const { testRedirectModel } = loadChannelsModals();
+    assert.equal(await testRedirectModel(0, fixture.button), true);
+    assert.deepEqual(fixture.calls, [
+      { type: 'open', args: [7, 'test-channel', 'requested-model'] },
+      { type: 'run' }
+    ]);
+    assert.equal(fixture.button.disabled, false);
+    assert.equal(fixture.button.attributes.has('aria-busy'), false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('model row test rejects unsaved channel changes', async () => {
+  const fixture = installModelRequestTestGlobals({ dirty: true });
+
+  try {
+    const { testRedirectModel } = loadChannelsModals();
+    assert.equal(await testRedirectModel(0, fixture.button), false);
+    assert.deepEqual(fixture.calls, []);
+    assert.deepEqual(fixture.notifications, ['channels.saveBeforeModelTest']);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('model submit payload includes disabled state', () => {
+  const { collectModelsForSubmit } = loadChannelsModals();
+  assert.deepEqual(collectModelsForSubmit([
+    { model: '  model-a  ', redirect_model: ' upstream-a ', disabled: true },
+    { model: 'model-b', redirect_model: '', disabled: false },
+    { model: '   ', disabled: true }
+  ]), [
+    { model: 'model-a', redirect_model: 'upstream-a', disabled: true },
+    { model: 'model-b', redirect_model: '', disabled: false }
+  ]);
+});
+
 test('fetchModelsFromAPI sends the first enabled API key', async () => {
   let requestBody;
   const restore = installFetchModelsGlobals({
@@ -274,6 +640,7 @@ test('fetchModelsFromAPI sends the first enabled API key', async () => {
   }
 
   assert.equal(requestBody.api_key, 'enabled-key');
+  assert.deepEqual(requestBody.urls, [{ url: 'https://upstream.test', exact: false, protocols: ['openai'] }]);
 });
 
 test('fetchModelsFromAPI rejects a channel whose keys are all disabled', async () => {
@@ -297,4 +664,354 @@ test('fetchModelsFromAPI rejects a channel whose keys are all disabled', async (
 
   assert.equal(fetchCalled, false);
   assert.equal(shownError, 'channels.addAtLeastOneEnabledKey');
+});
+
+test('fetchSub2APIRate writes the effective multiplier from the first enabled key', async () => {
+  const fixture = installFetchSub2APIRateGlobals({
+    response: { success: true, data: { effective_rate_multiplier: 1.2 } },
+    rows: [{ api_key: 'disabled-key' }, { api_key: 'enabled-key' }],
+    states: [
+      { key_index: 0, disabled: true },
+      { key_index: 1, disabled: false }
+    ]
+  });
+
+  try {
+    const { fetchSub2APIRate } = loadChannelsModals();
+    await fetchSub2APIRate();
+
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].url, '/admin/channels/billing/fetch');
+    assert.deepEqual(JSON.parse(fixture.requests[0].options.body), {
+      base_url: 'https://sub2api.test/v1',
+      api_key: 'enabled-key'
+    });
+    assert.equal(fixture.elements.channelCostMultiplier.value, '1.2');
+    assert.equal(fixture.elements.fetchSub2APIRateBtn.disabled, false);
+    assert.equal(fixture.dirty, true);
+    assert.deepEqual(fixture.notifications, [{
+      type: 'success',
+      message: { key: 'channels.fetchRateSuccess', params: { rate: '1.2' } }
+    }]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('fetchSub2APIRate preserves the input and maps authentication failures', async () => {
+  const fixture = installFetchSub2APIRateGlobals({
+    response: { success: false, data: { code: 'authentication_error' } },
+    rows: [{ api_key: 'invalid-key' }],
+    states: [{ key_index: 0, disabled: false }]
+  });
+
+  try {
+    const { fetchSub2APIRate } = loadChannelsModals();
+    await fetchSub2APIRate();
+
+    assert.equal(fixture.elements.channelCostMultiplier.value, '0.5');
+    assert.equal(fixture.dirty, false);
+    assert.deepEqual(fixture.notifications, [{
+      type: 'error',
+      message: 'channels.fetchRateError.authentication_error'
+    }]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch protocol mode submits selected channel IDs and refreshes the list', async () => {
+  const fixture = installBatchProtocolModeGlobals({
+    success: true,
+    data: { updated: 2, unchanged: 0, not_found_count: 0 }
+  });
+
+  try {
+    const { batchSetSelectedChannelsProtocolMode } = loadChannelsModals();
+    await batchSetSelectedChannelsProtocolMode();
+
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].url, '/admin/channels/batch-protocol-mode');
+    assert.equal(fixture.requests[0].options.method, 'POST');
+    assert.deepEqual(JSON.parse(fixture.requests[0].options.body), {
+      channel_ids: [11, 22],
+      protocol_transform_mode: 'local'
+    });
+    assert.equal(fixture.selectedChannelIds.size, 0);
+    assert.equal(fixture.filterSaves, 1);
+    assert.equal(fixture.reloads, 1);
+    assert.deepEqual(fixture.notifications, [{
+      type: 'success',
+      message: {
+        key: 'channels.batchProtocolModeSummary',
+        params: {
+          mode: 'channels.batchProtocolModeValue.local',
+          updated: 2,
+          unchanged: 0,
+          notFound: 0
+        }
+      }
+    }]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch protocol mode keeps the selection when the request fails', async () => {
+  const fixture = installBatchProtocolModeGlobals({ success: false, error: 'database unavailable' });
+
+  try {
+    const { batchSetSelectedChannelsProtocolMode } = loadChannelsModals();
+    await batchSetSelectedChannelsProtocolMode();
+
+    assert.equal(fixture.selectedChannelIds.size, 2);
+    assert.equal(fixture.filterSaves, 0);
+    assert.equal(fixture.reloads, 0);
+    assert.deepEqual(fixture.notifications, [{
+      type: 'error',
+      message: {
+        key: 'channels.batchOperationFailed',
+        params: { error: 'database unavailable' }
+      }
+    }]);
+    assert.equal(fixture.elements.batchApplyProtocolBtn.disabled, false);
+    assert.equal(fixture.elements.batchProtocolTransformMode.disabled, false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch refresh options persist and restore across page initialization', () => {
+  const storageData = new Map();
+  const storage = {
+    getItem: key => storageData.get(key) ?? null,
+    setItem: (key, value) => storageData.set(key, value)
+  };
+  const createCheckbox = () => {
+    const listeners = new Map();
+    return {
+      checked: false,
+      dataset: {},
+      addEventListener(type, listener) { listeners.set(type, listener); },
+      dispatchChange() { listeners.get('change')?.(); }
+    };
+  };
+  let inputs = {
+    batchRefreshLowercaseModels: createCheckbox(),
+    batchRefreshStripModelSourcePrefix: createCheckbox()
+  };
+  const previousDocument = Object.getOwnPropertyDescriptor(global, 'document');
+  Object.defineProperty(global, 'document', {
+    configurable: true,
+    writable: true,
+    value: { getElementById: id => inputs[id] || null }
+  });
+
+  try {
+    const { initBatchRefreshOptions } = loadChannelsModals();
+    initBatchRefreshOptions(storage);
+    assert.equal(inputs.batchRefreshLowercaseModels.checked, false);
+    assert.equal(inputs.batchRefreshStripModelSourcePrefix.checked, false);
+
+    inputs.batchRefreshLowercaseModels.checked = true;
+    inputs.batchRefreshLowercaseModels.dispatchChange();
+    inputs.batchRefreshStripModelSourcePrefix.checked = true;
+    inputs.batchRefreshStripModelSourcePrefix.dispatchChange();
+    assert.deepEqual(JSON.parse(storageData.get('channels.batchRefreshOptions')), {
+      lowercase_models: true,
+      strip_model_source_prefix: true
+    });
+
+    inputs = {
+      batchRefreshLowercaseModels: createCheckbox(),
+      batchRefreshStripModelSourcePrefix: createCheckbox()
+    };
+    initBatchRefreshOptions(storage);
+    assert.equal(inputs.batchRefreshLowercaseModels.checked, true);
+    assert.equal(inputs.batchRefreshStripModelSourcePrefix.checked, true);
+
+    storageData.set('channels.batchRefreshOptions', '{');
+    inputs = {
+      batchRefreshLowercaseModels: createCheckbox(),
+      batchRefreshStripModelSourcePrefix: createCheckbox()
+    };
+    initBatchRefreshOptions(storage);
+    assert.equal(inputs.batchRefreshLowercaseModels.checked, false);
+    assert.equal(inputs.batchRefreshStripModelSourcePrefix.checked, false);
+  } finally {
+    if (previousDocument) Object.defineProperty(global, 'document', previousDocument);
+    else delete global.document;
+  }
+});
+
+test('quick add parses connection text and only returns setup after model discovery succeeds', async () => {
+  const { discoverQuickAddChannelSetup } = loadChannelsModals();
+  let request;
+
+  const setup = await discoverQuickAddChannelSetup(`
+    export OPENAI_BASE_URL="https://gateway.example.com/api/"
+    export OPENAI_API_KEY="sk-test-secret"
+  `, async (url, options) => {
+    request = { url, body: JSON.parse(options.body) };
+    return {
+      success: true,
+      data: {
+        protocol: 'openai',
+        models: [
+          { model: 'z-model', redirect_model: 'z-upstream' },
+          { model: 'a-model', redirect_model: 'a-upstream' }
+        ]
+      }
+    };
+  });
+
+  assert.deepEqual(request, {
+    url: '/admin/channels/models/fetch',
+    body: {
+      urls: [{ url: 'https://gateway.example.com/api', exact: false, protocols: [] }],
+      protocol: 'openai',
+      api_key: 'sk-test-secret'
+    }
+  });
+  assert.deepEqual(setup, {
+    url: { url: 'https://gateway.example.com/api', exact: false, protocols: [] },
+    key: { api_key: 'sk-test-secret', note: '' },
+    models: [
+      { model: 'a-model', redirect_model: 'a-upstream', disabled: false },
+      { model: 'z-model', redirect_model: 'z-upstream', disabled: false }
+    ]
+  });
+});
+
+test('quick add falls back from OpenAI to Anthropic model discovery', async () => {
+  const { discoverQuickAddChannelSetup } = loadChannelsModals();
+  const attemptedProtocols = [];
+
+  const setup = await discoverQuickAddChannelSetup(
+    'URL=https://gateway.example.com\nAPI_KEY=sk-fallback',
+    async (_url, options) => {
+      const body = JSON.parse(options.body);
+      attemptedProtocols.push(body.protocol);
+      if (body.protocol === 'openai') {
+        return { success: false, error: 'OpenAI models endpoint is unsupported' };
+      }
+      return {
+        success: true,
+        data: {
+          protocol: 'anthropic',
+          models: [{ model: 'claude-test', redirect_model: 'claude-test' }]
+        }
+      };
+    }
+  );
+
+  assert.deepEqual(attemptedProtocols, ['openai', 'anthropic']);
+  assert.deepEqual(setup.models, [
+    { model: 'claude-test', redirect_model: 'claude-test', disabled: false }
+  ]);
+});
+
+test('quick add rejects invalid discovery without producing partial setup', async () => {
+  const { discoverQuickAddChannelSetup } = loadChannelsModals();
+
+  await assert.rejects(
+    discoverQuickAddChannelSetup(
+      '{"base_url":"https://gateway.example.com","api_key":"sk-invalid"}',
+      async () => ({ success: false, error: 'unauthorized' })
+    ),
+    /unauthorized/
+  );
+});
+
+test('quick add parses URL and key labels on one line', () => {
+  const { parseQuickAddChannelInfo } = loadChannelsModals();
+  assert.deepEqual(
+    parseQuickAddChannelInfo('URL: https://gateway.example.com/api  API Key: sk-one-line'),
+    { url: 'https://gateway.example.com/api', apiKey: 'sk-one-line' }
+  );
+});
+
+test('quick add normalizes a versioned API endpoint to the channel base URL', () => {
+  const { parseQuickAddChannelInfo } = loadChannelsModals();
+  assert.deepEqual(
+    parseQuickAddChannelInfo('OPENAI_BASE_URL=https://gateway.example.com/openai/v1\nOPENAI_API_KEY=sk-versioned'),
+    { url: 'https://gateway.example.com/openai', apiKey: 'sk-versioned' }
+  );
+});
+
+test('quick add derives an empty channel name and applies the setup atomically', () => {
+  const previous = new Map();
+  const redirectBody = {
+    dataset: {},
+    innerHTML: '',
+    addEventListener() {},
+    appendChild() {}
+  };
+  const redirectCount = { textContent: '' };
+  const channelNameInput = { value: '   ' };
+  const globals = {
+    window: { t: key => key },
+    document: {
+      getElementById: id => ({
+        redirectTableBody: redirectBody,
+        redirectCount,
+        channelName: channelNameInput
+      })[id] || null,
+      createDocumentFragment: () => ({ appendChild() {} })
+    },
+    TemplateEngine: { render: () => ({ querySelector: () => null }) },
+    inlineURLTableData: [{ url: '', exact: false, protocols: [] }],
+    inlineKeyTableData: [{ api_key: '', note: '' }],
+    redirectTableData: [{ model: 'stale-model', redirect_model: '', disabled: false }],
+    currentModelFilter: '',
+    currentChannelKeyCooldowns: [{ key_index: 0, disabled: true }],
+    selectedKeyIndices: new Set([0]),
+    selectedModelIndices: new Set([0]),
+    selectedURLIndices: new Set([0]),
+    setInlineURLTableData: urls => { global.inlineURLTableData = urls; },
+    setInlineKeyTableDataFromAPI: keys => { global.inlineKeyTableData = keys; },
+    renderInlineKeyTable() {},
+    syncChannelEditorTableSizing() {},
+    scheduleChannelEditorTableSizingSync() {},
+    markChannelFormDirty: () => { global.quickAddFormDirty = true; },
+    quickAddFormDirty: false
+  };
+  for (const [name, value] of Object.entries(globals)) {
+    previous.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  }
+
+  try {
+    const { applyQuickAddChannelSetup } = loadChannelsModals();
+    const setup = {
+      url: { url: 'https://gateway.example.com', exact: false, protocols: [] },
+      key: { api_key: 'sk-valid', note: '' },
+      models: [{ model: 'gpt-test', redirect_model: 'gpt-test', disabled: false }]
+    };
+    applyQuickAddChannelSetup(setup);
+
+    assert.deepEqual(global.inlineURLTableData, [
+      { url: 'https://gateway.example.com', exact: false, protocols: [] }
+    ]);
+    assert.deepEqual(global.inlineKeyTableData, [{ api_key: 'sk-valid', note: '' }]);
+    assert.deepEqual(global.redirectTableData, [
+      { model: 'gpt-test', redirect_model: 'gpt-test', disabled: false }
+    ]);
+    assert.equal(channelNameInput.value, 'gateway.example.com');
+    assert.deepEqual(global.currentChannelKeyCooldowns, []);
+    assert.equal(global.selectedModelIndices.size, 0);
+    assert.equal(global.quickAddFormDirty, true);
+
+    channelNameInput.value = '保留现有名称';
+    applyQuickAddChannelSetup({
+      ...setup,
+      url: { url: 'https://other.example.com', exact: false, protocols: [] }
+    });
+    assert.equal(channelNameInput.value, '保留现有名称');
+  } finally {
+    for (const [name, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(global, name, descriptor);
+      else delete global[name];
+    }
+  }
 });

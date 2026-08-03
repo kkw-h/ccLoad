@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,9 +42,9 @@ func TestAdminModels_FetchModelsPreview(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		payload := map[string]any{
-			"channel_type": " openai ",
-			"url":          upstream.URL,
-			"api_key":      "sk-test",
+			"protocol": " openai ",
+			"urls":     []map[string]any{{"url": upstream.URL}},
+			"api_key":  "sk-test",
 		}
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
 
@@ -68,52 +69,216 @@ func TestAdminModels_FetchModelsPreview(t *testing.T) {
 		}
 	})
 
-	t.Run("multi url fallback", func(t *testing.T) {
-		failCalls := 0
-		okCalls := 0
+}
 
-		failUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			failCalls++
-			http.Error(w, "boom", http.StatusBadGateway)
-		}))
-		t.Cleanup(failUpstream.Close)
-
-		okUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			okCalls++
-			time.Sleep(15 * time.Millisecond)
-			if r.URL.Path != "/v1/models" {
-				http.NotFound(w, r)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-4.1-mini"}]}`))
-		}))
-		t.Cleanup(okUpstream.Close)
-
-		payload := map[string]any{
-			"channel_type": "openai",
-			"url":          failUpstream.URL + "\n" + okUpstream.URL,
-			"api_key":      "sk-test",
+func TestAdminModels_FetchSub2APIBillingPreview(t *testing.T) {
+	var gotAuth string
+	var gotAccept string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/sub2api/billing" {
+			http.NotFound(w, r)
+			return
 		}
-		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
+		gotAuth = r.Header.Get("Authorization")
+		gotAccept = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"object":"sub2api.key_billing",
+			"schema_version":1,
+			"billing_scope":"token",
+			"group_rate_multiplier":1.2,
+			"user_rate_multiplier":0.8,
+			"resolved_rate_multiplier":0.8,
+			"peak_rate_enabled":true,
+			"effective_rate_multiplier":1.2,
+			"observed_at":"2026-08-02T10:00:00Z"
+		}`))
+	}))
+	t.Cleanup(upstream.Close)
 
-		server.HandleFetchModelsPreview(c)
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	for _, baseURL := range []string{upstream.URL, upstream.URL + "/v1/"} {
+		payload := map[string]any{
+			"base_url": baseURL,
+			"api_key":  "sk-billing-test",
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
+
+		server.HandleFetchSub2APIBilling(c)
 		if w.Code != http.StatusOK {
-			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+			t.Fatalf("baseURL=%q status=%d, want %d, body=%s", baseURL, w.Code, http.StatusOK, w.Body.String())
 		}
 
 		var resp struct {
-			Success bool                `json:"success"`
-			Data    FetchModelsResponse `json:"data"`
+			Success bool                        `json:"success"`
+			Data    fetchSub2APIBillingResponse `json:"data"`
 		}
 		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
-		if !resp.Success || len(resp.Data.Models) != 1 || resp.Data.Models[0].Model != "gpt-4.1-mini" {
-			t.Fatalf("unexpected resp: %+v", resp)
+		if !resp.Success || resp.Data.EffectiveRateMultiplier != 1.2 {
+			t.Fatalf("baseURL=%q unexpected resp: %+v", baseURL, resp)
 		}
-		if failCalls < 1 || okCalls < 1 {
-			t.Fatalf("expected fallback attempts, failCalls=%d okCalls=%d", failCalls, okCalls)
-		}
-	})
+	}
+
+	if gotAuth != "Bearer sk-billing-test" {
+		t.Fatalf("Authorization=%q, want %q", gotAuth, "Bearer sk-billing-test")
+	}
+	if gotAccept != "application/json" {
+		t.Fatalf("Accept=%q, want application/json", gotAccept)
+	}
+}
+
+func TestAdminModels_FetchSub2APIBillingRejectsUntrustedResponses(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		body     string
+		wantCode string
+	}{
+		{
+			name:     "invalid key",
+			status:   http.StatusUnauthorized,
+			body:     `{"error":{"message":"sk-upstream-secret"}}`,
+			wantCode: sub2APIBillingErrorAuthentication,
+		},
+		{
+			name:     "unsupported upstream",
+			status:   http.StatusNotFound,
+			body:     `not a Sub2API server`,
+			wantCode: sub2APIBillingErrorUnsupported,
+		},
+		{
+			name:     "key without billing group",
+			status:   http.StatusForbidden,
+			body:     `{"error":{"type":"permission_error"}}`,
+			wantCode: sub2APIBillingErrorPermission,
+		},
+		{
+			name:     "method unsupported",
+			status:   http.StatusMethodNotAllowed,
+			body:     `method not allowed`,
+			wantCode: sub2APIBillingErrorUnsupported,
+		},
+		{
+			name:   "inconsistent resolved rate",
+			status: http.StatusOK,
+			body: `{
+				"object":"sub2api.key_billing",
+				"schema_version":1,
+				"billing_scope":"token",
+				"group_rate_multiplier":0.5,
+				"resolved_rate_multiplier":0.8,
+				"effective_rate_multiplier":0.8,
+				"observed_at":"2026-08-02T10:00:00Z"
+			}`,
+			wantCode: sub2APIBillingErrorInvalid,
+		},
+		{
+			name:   "negative effective rate",
+			status: http.StatusOK,
+			body: `{
+				"object":"sub2api.key_billing",
+				"schema_version":1,
+				"billing_scope":"token",
+				"group_rate_multiplier":0.5,
+				"resolved_rate_multiplier":0.5,
+				"effective_rate_multiplier":-1,
+				"observed_at":"2026-08-02T10:00:00Z"
+			}`,
+			wantCode: sub2APIBillingErrorInvalid,
+		},
+		{
+			name:   "invalid observation time",
+			status: http.StatusOK,
+			body: `{
+				"object":"sub2api.key_billing",
+				"schema_version":1,
+				"billing_scope":"token",
+				"group_rate_multiplier":0.5,
+				"resolved_rate_multiplier":0.5,
+				"effective_rate_multiplier":0.5,
+				"observed_at":"yesterday"
+			}`,
+			wantCode: sub2APIBillingErrorInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(upstream.Close)
+
+			server, _, cleanup := setupAdminTestServer(t)
+			defer cleanup()
+			payload := map[string]any{"base_url": upstream.URL, "api_key": "sk-request-secret"}
+			c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
+
+			server.HandleFetchSub2APIBilling(c)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+			}
+			var resp struct {
+				Success bool `json:"success"`
+				Data    struct {
+					Code string `json:"code"`
+				} `json:"data"`
+			}
+			mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+			if resp.Success || resp.Data.Code != tt.wantCode {
+				t.Fatalf("unexpected resp: %+v, body=%s", resp, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "sk-upstream-secret") || strings.Contains(w.Body.String(), "sk-request-secret") {
+				t.Fatalf("response leaked a secret: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestAdminModels_FetchSub2APIBillingDoesNotFollowRedirects(t *testing.T) {
+	redirectTargetCalled := false
+	redirectTarget := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectTargetCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"object":"sub2api.key_billing",
+			"schema_version":1,
+			"billing_scope":"token",
+			"group_rate_multiplier":0.5,
+			"resolved_rate_multiplier":0.5,
+			"effective_rate_multiplier":0.5,
+			"observed_at":"2026-08-02T10:00:00Z"
+		}`))
+	}))
+	t.Cleanup(redirectTarget.Close)
+
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL+"/v1/sub2api/billing", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	payload := map[string]any{"base_url": upstream.URL, "api_key": "sk-redirect-secret"}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
+
+	server.HandleFetchSub2APIBilling(c)
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Code string `json:"code"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+	if resp.Success || resp.Data.Code != sub2APIBillingErrorAPI {
+		t.Fatalf("unexpected resp: %+v, body=%s", resp, w.Body.String())
+	}
+	if redirectTargetCalled {
+		t.Fatal("billing probe followed an upstream redirect")
+	}
 }
 
 func TestAdminModels_HandleFetchModels(t *testing.T) {
@@ -145,9 +310,8 @@ func TestAdminModels_HandleFetchModels(t *testing.T) {
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "c1",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
 	})
@@ -230,9 +394,8 @@ func TestAdminModels_HandleFetchModels_MultiURL(t *testing.T) {
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "multi-url-channel",
-		URL:          failUpstream.URL + "\n" + okUpstream.URL,
+		URLs:         channelURLsForTest(failUpstream.URL, okUpstream.URL),
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
 	})
@@ -308,9 +471,8 @@ func TestAdminModels_HandleFetchModels_MultiURL_KeyErrorDoesNotCooldownURL(t *te
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "multi-url-key-error",
-		URL:          keyErrUpstream.URL + "\n" + okUpstream.URL,
+		URLs:         channelURLsForTest(keyErrUpstream.URL, okUpstream.URL),
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
 	})
@@ -381,9 +543,8 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		ctx := context.Background()
 		c1, err := store.CreateConfig(ctx, &model.Config{
 			Name:         "c1",
-			URL:          upstream1.URL,
+			URLs:         model.ChannelURLs{{URL: upstream1.URL}},
 			Priority:     1,
-			ChannelType:  "openai",
 			ModelEntries: []model.ModelEntry{{Model: "m1"}},
 			Enabled:      true,
 		})
@@ -392,9 +553,8 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		}
 		c2, err := store.CreateConfig(ctx, &model.Config{
 			Name:         "c2",
-			URL:          upstream2.URL,
+			URLs:         model.ChannelURLs{{URL: upstream2.URL}},
 			Priority:     1,
-			ChannelType:  "openai",
 			ModelEntries: []model.ModelEntry{{Model: "x1"}},
 			Enabled:      true,
 		})
@@ -403,9 +563,8 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		}
 		c3, err := store.CreateConfig(ctx, &model.Config{
 			Name:         "c3-no-key",
-			URL:          upstream2.URL,
+			URLs:         model.ChannelURLs{{URL: upstream2.URL}},
 			Priority:     1,
-			ChannelType:  "openai",
 			ModelEntries: []model.ModelEntry{{Model: "y1"}},
 			Enabled:      true,
 		})
@@ -466,6 +625,69 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		}
 	})
 
+	t.Run("merge mode skips models already used as redirect targets", func(t *testing.T) {
+		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"UPSTREAM-MODEL"}]}`))
+		}))
+		t.Cleanup(upstream.Close)
+
+		server, store, cleanup := setupAdminTestServer(t)
+		defer cleanup()
+
+		ctx := context.Background()
+		cfg, err := store.CreateConfig(ctx, &model.Config{
+			Name:         "redirect-dedup-channel",
+			URLs:         model.ChannelURLs{{URL: upstream.URL}},
+			Priority:     1,
+			ModelEntries: []model.ModelEntry{{Model: "client-alias", RedirectModel: "upstream-model"}},
+			Enabled:      true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig failed: %v", err)
+		}
+		if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+			{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "k", KeyStrategy: model.KeyStrategySequential},
+		}); err != nil {
+			t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+		}
+
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/refresh-batch", map[string]any{
+			"channel_ids": []int64{cfg.ID},
+			"mode":        "merge",
+		}))
+		server.HandleBatchRefreshModels(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		var resp struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Updated   int `json:"updated"`
+				Unchanged int `json:"unchanged"`
+			} `json:"data"`
+		}
+		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+		if !resp.Success || resp.Data.Updated != 0 || resp.Data.Unchanged != 1 {
+			t.Fatalf("unexpected response: %+v body=%s", resp, w.Body.String())
+		}
+
+		got, err := store.GetConfig(ctx, cfg.ID)
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		want := []model.ModelEntry{{Model: "client-alias", RedirectModel: "upstream-model"}}
+		if !reflect.DeepEqual(got.ModelEntries, want) {
+			t.Fatalf("models=%#v, want %#v", got.ModelEntries, want)
+		}
+	})
+
 	t.Run("replace mode", func(t *testing.T) {
 		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/v1/models" {
@@ -482,12 +704,11 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 
 		ctx := context.Background()
 		cfg, err := store.CreateConfig(ctx, &model.Config{
-			Name:        "replace-channel",
-			URL:         upstream.URL,
-			Priority:    1,
-			ChannelType: "openai",
+			Name:     "replace-channel",
+			URLs:     model.ChannelURLs{{URL: upstream.URL}},
+			Priority: 1,
 			ModelEntries: []model.ModelEntry{
-				{Model: "old-1"},
+				{Model: "new-1", Disabled: true},
 				{Model: "old-2"},
 			},
 			Enabled: true,
@@ -514,7 +735,7 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetConfig failed: %v", err)
 		}
-		if len(got.ModelEntries) != 1 || got.ModelEntries[0].Model != "new-1" {
+		if len(got.ModelEntries) != 1 || got.ModelEntries[0].Model != "new-1" || !got.ModelEntries[0].Disabled {
 			t.Fatalf("unexpected models after replace: %#v", got.ModelEntries)
 		}
 	})
@@ -536,9 +757,8 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		ctx := context.Background()
 		cfg, err := store.CreateConfig(ctx, &model.Config{
 			Name:                  "lowercase-channel",
-			URL:                   upstream.URL,
+			URLs:                  model.ChannelURLs{{URL: upstream.URL}},
 			Priority:              1,
-			ChannelType:           "openai",
 			ModelEntries:          []model.ModelEntry{{Model: "CamelCase-Model"}},
 			ScheduledCheckEnabled: true,
 			ScheduledCheckModel:   "CamelCase-Model",
@@ -592,10 +812,9 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		ctx := context.Background()
 		cfg, err := store.CreateConfig(ctx, &model.Config{
 			Name:                  "strip-prefix-channel",
-			URL:                   upstream.URL,
+			URLs:                  model.ChannelURLs{{URL: upstream.URL}},
 			Priority:              1,
-			ChannelType:           "openai",
-			ModelEntries:          []model.ModelEntry{{Model: "cloudcompile/Grok-4.5"}},
+			ModelEntries:          []model.ModelEntry{{Model: "cloudcompile/Grok-4.5", Disabled: true}},
 			ScheduledCheckEnabled: true,
 			ScheduledCheckModel:   "cloudcompile/Grok-4.5",
 			Enabled:               true,
@@ -625,7 +844,7 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 			t.Fatalf("GetConfig failed: %v", err)
 		}
 		wantModels := []model.ModelEntry{
-			{Model: "grok-4.5"},
+			{Model: "grok-4.5", Disabled: true},
 			{Model: "other-model", RedirectModel: "a-source/Other-Model"},
 		}
 		if !reflect.DeepEqual(got.ModelEntries, wantModels) {
@@ -649,9 +868,8 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		ctx := context.Background()
 		cfg, err := store.CreateConfig(ctx, &model.Config{
 			Name:                  "lowercase-merge-channel",
-			URL:                   upstream.URL,
+			URLs:                  model.ChannelURLs{{URL: upstream.URL}},
 			Priority:              1,
-			ChannelType:           "openai",
 			ModelEntries:          []model.ModelEntry{{Model: "legacy/ExistingModel"}},
 			ScheduledCheckEnabled: true,
 			ScheduledCheckModel:   "legacy/ExistingModel",
@@ -706,9 +924,8 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		ctx := context.Background()
 		cfg, err := store.CreateConfig(ctx, &model.Config{
 			Name:         "empty-list-channel",
-			URL:          upstream.URL,
+			URLs:         model.ChannelURLs{{URL: upstream.URL}},
 			Priority:     1,
-			ChannelType:  "openai",
 			ModelEntries: []model.ModelEntry{{Model: "keep-me"}},
 			Enabled:      true,
 		})

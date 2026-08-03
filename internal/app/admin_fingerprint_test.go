@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,12 +24,12 @@ func createFPChannel(t *testing.T, srv *Server, upstreamURL, modelName string) i
 	t.Helper()
 	ctx := context.Background()
 	cfg := &model.Config{
-		Name:         "fp-api-channel",
-		URL:          upstreamURL,
-		Priority:     1,
-		ChannelType:  "openai",
-		ModelEntries: []model.ModelEntry{{Model: modelName}},
-		Enabled:      true,
+		Name:                  "fp-api-channel",
+		URLs:                  model.ChannelURLs{{URL: upstreamURL}},
+		Priority:              1,
+		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
+		ModelEntries:          []model.ModelEntry{{Model: modelName}},
+		Enabled:               true,
 	}
 	created, err := srv.store.CreateConfig(ctx, cfg)
 	if err != nil {
@@ -221,22 +222,32 @@ func TestFingerprintAPI_CalibrateValidation(t *testing.T) {
 	}{
 		{
 			name:   "missing name",
-			body:   map[string]any{"channel_id": channelID, "model": "fp-model"},
+			body:   map[string]any{"channel_id": channelID, "model": "fp-model", "client_protocol": "openai"},
 			status: http.StatusBadRequest,
 		},
 		{
 			name:   "missing model",
-			body:   map[string]any{"name": "n", "channel_id": channelID},
+			body:   map[string]any{"name": "n", "channel_id": channelID, "client_protocol": "openai"},
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "missing client protocol",
+			body:   map[string]any{"name": "n", "channel_id": channelID, "model": "fp-model"},
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "invalid client protocol",
+			body:   map[string]any{"name": "n", "channel_id": channelID, "model": "fp-model", "client_protocol": "unknown"},
 			status: http.StatusBadRequest,
 		},
 		{
 			name:   "channel not found",
-			body:   map[string]any{"name": "n", "channel_id": int64(9999), "model": "fp-model"},
+			body:   map[string]any{"name": "n", "channel_id": int64(9999), "model": "fp-model", "client_protocol": "openai"},
 			status: http.StatusBadRequest,
 		},
 		{
 			name:   "model not in channel",
-			body:   map[string]any{"name": "n", "channel_id": channelID, "model": "other-model"},
+			body:   map[string]any{"name": "n", "channel_id": channelID, "model": "other-model", "client_protocol": "openai"},
 			status: http.StatusBadRequest,
 		},
 	}
@@ -251,6 +262,70 @@ func TestFingerprintAPI_CalibrateValidation(t *testing.T) {
 	}
 }
 
+func TestFingerprintAPI_CalibrateRejectsPersistedDuplicateName(t *testing.T) {
+	srv := newInMemoryServer(t)
+	upstream := cyclicUpstreamFP(t)
+	defer upstream.Close()
+	channelID := createFPChannel(t, srv, upstream.URL, "fp-model")
+
+	if _, err := srv.store.CreateModelFingerprint(context.Background(), &model.ModelFingerprint{
+		Name:          "existing-baseline",
+		Model:         "fp-model",
+		Distribution:  []float64{},
+		PromptVersion: util.FingerprintPromptVersion,
+	}); err != nil {
+		t.Fatalf("CreateModelFingerprint: %v", err)
+	}
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/calibrate", map[string]any{
+		"name":            " existing-baseline ",
+		"channel_id":      channelID,
+		"model":           "fp-model",
+		"client_protocol": "openai",
+	}))
+	srv.HandleCalibrateFingerprint(c)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("want 409 got %d — %s", w.Code, w.Body.String())
+	}
+	var resp APIResponse[any]
+	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+	if resp.Error != `baseline name "existing-baseline" already exists or is being calibrated; choose a different name` {
+		t.Fatalf("error=%q", resp.Error)
+	}
+}
+
+func TestFingerprintAPI_CalibrateRejectsRunningDuplicateName(t *testing.T) {
+	srv := newInMemoryServer(t)
+	blocked := make(chan struct{})
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-blocked
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer func() {
+		close(blocked)
+		upstream.Close()
+	}()
+	channelID := createFPChannel(t, srv, upstream.URL, "fp-model")
+	body := map[string]any{
+		"name":            "running-baseline",
+		"channel_id":      channelID,
+		"model":           "fp-model",
+		"client_protocol": "openai",
+	}
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/calibrate", body))
+	srv.HandleCalibrateFingerprint(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first calibrate: want 200 got %d — %s", w.Code, w.Body.String())
+	}
+
+	c, w = newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/calibrate", body))
+	srv.HandleCalibrateFingerprint(c)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("duplicate calibrate: want 409 got %d — %s", w.Code, w.Body.String())
+	}
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // TestFingerprintAPI_TestValidation_NoBaseline
 
@@ -261,12 +336,35 @@ func TestFingerprintAPI_TestValidation_NoBaseline(t *testing.T) {
 	channelID := createFPChannel(t, srv, upstream.URL, "fp-model")
 
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/test", map[string]any{
-		"channel_id": channelID,
-		"model":      "fp-model",
+		"channel_id":      channelID,
+		"model":           "fp-model",
+		"client_protocol": "openai",
 	}))
 	srv.HandleTestFingerprint(c)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("want 400 (no baselines) got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFingerprintAPI_TestValidation_ClientProtocol(t *testing.T) {
+	srv := newInMemoryServer(t)
+	upstream := cyclicUpstreamFP(t)
+	defer upstream.Close()
+	channelID := createFPChannel(t, srv, upstream.URL, "fp-model")
+
+	for _, clientProtocol := range []string{"", "unknown"} {
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/test", map[string]any{
+			"channel_id":      channelID,
+			"model":           "fp-model",
+			"client_protocol": clientProtocol,
+		}))
+		srv.HandleTestFingerprint(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("client_protocol=%q: want 400 got %d — %s", clientProtocol, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "client_protocol") {
+			t.Fatalf("client_protocol=%q: error must identify client_protocol — %s", clientProtocol, w.Body.String())
+		}
 	}
 }
 
@@ -309,9 +407,10 @@ func TestFingerprintAPI_TooManyJobs(t *testing.T) {
 	// fill all slots (maxRunning=2)
 	for i := 0; i < 2; i++ {
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/calibrate", map[string]any{
-			"name":       fmt.Sprintf("baseline-%d", i),
-			"channel_id": channelID,
-			"model":      "fp-model",
+			"name":            fmt.Sprintf("baseline-%d", i),
+			"channel_id":      channelID,
+			"model":           "fp-model",
+			"client_protocol": "openai",
 		}))
 		srv.HandleCalibrateFingerprint(c)
 		if w.Code != http.StatusOK {
@@ -321,9 +420,10 @@ func TestFingerprintAPI_TooManyJobs(t *testing.T) {
 
 	// third request should 429
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/calibrate", map[string]any{
-		"name":       "overflow",
-		"channel_id": channelID,
-		"model":      "fp-model",
+		"name":            "overflow",
+		"channel_id":      channelID,
+		"model":           "fp-model",
+		"client_protocol": "openai",
 	}))
 	srv.HandleCalibrateFingerprint(c)
 	if w.Code != http.StatusTooManyRequests {
@@ -332,10 +432,38 @@ func TestFingerprintAPI_TooManyJobs(t *testing.T) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TestFingerprintAPI_CalibrateAndTest (integration: calibrate → poll → test → poll → delete)
+// TestFingerprintAPI_StreamCalibrateAndTestMergesBeforeValidation exercises the public
+// calibrate/test APIs and proves that stream deltas are merged before range validation.
 
-func TestFingerprintAPI_CalibrateAndTest(t *testing.T) {
-	upstream := cyclicUpstreamFP(t)
+func TestFingerprintAPI_StreamCalibrateAndTestMergesBeforeValidation(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	var nonStreamingRequests atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if stream, _ := payload["stream"].(bool); !stream {
+			nonStreamingRequests.Add(1)
+		}
+
+		call := upstreamCalls.Add(1)
+		chunks := []string{"1", "23"}
+		if call > 40 && call <= 50 {
+			// Both chunks are valid numbers in isolation, but the merged value 356 is out of range.
+			chunks = []string{"3", "56"}
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, chunk := range chunks {
+			_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", chunk)
+		}
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
 	defer upstream.Close()
 
 	srv := newInMemoryServer(t)
@@ -343,11 +471,13 @@ func TestFingerprintAPI_CalibrateAndTest(t *testing.T) {
 
 	// ── Calibrate ──────────────────────────────────────────────────────────
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/calibrate", map[string]any{
-		"name":        "integration-baseline",
-		"channel_id":  channelID,
-		"model":       "fp-model",
-		"iterations":  50,
-		"concurrency": 5,
+		"name":            "integration-baseline",
+		"channel_id":      channelID,
+		"model":           "fp-model",
+		"client_protocol": "openai",
+		"stream":          true,
+		"iterations":      50,
+		"concurrency":     5,
 	}))
 	srv.HandleCalibrateFingerprint(c)
 	if w.Code != http.StatusOK {
@@ -368,6 +498,9 @@ func TestFingerprintAPI_CalibrateAndTest(t *testing.T) {
 	if jobView.Status != "succeeded" {
 		t.Fatalf("calibrate job status want succeeded got %s (err=%s)", jobView.Status, jobView.Error)
 	}
+	if jobView.Progress.Success != 40 || jobView.Progress.Failed != 10 {
+		t.Fatalf("calibrate progress=%+v, want 40 merged-valid and 10 merged-invalid samples", jobView.Progress)
+	}
 
 	// ── List fingerprints — should contain our new baseline ─────────────────
 	c, w = newTestContext(t, newRequest(http.MethodGet, "/admin/fingerprints", nil))
@@ -380,15 +513,26 @@ func TestFingerprintAPI_CalibrateAndTest(t *testing.T) {
 	if len(listResp.Data) == 0 {
 		t.Fatal("list: expected ≥1 fingerprint after calibrate")
 	}
-	fpID := listResp.Data[0].ID
+	fingerprint := listResp.Data[0]
+	if fingerprint.SampleCount != 40 || len(fingerprint.RawData) != 40 {
+		t.Fatalf("calibrate samples=%d raw=%d, want 40", fingerprint.SampleCount, len(fingerprint.RawData))
+	}
+	for _, sample := range fingerprint.RawData {
+		if sample != 123 {
+			t.Fatalf("calibrate sample=%d, want merged stream value 123", sample)
+		}
+	}
+	fpID := fingerprint.ID
 
 	// ── Test ───────────────────────────────────────────────────────────────
 	c, w = newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/test", map[string]any{
-		"channel_id":     channelID,
-		"model":          "fp-model",
-		"fingerprint_id": fpID,
-		"iterations":     50,
-		"concurrency":    5,
+		"channel_id":      channelID,
+		"model":           "fp-model",
+		"client_protocol": "openai",
+		"stream":          true,
+		"fingerprint_id":  fpID,
+		"iterations":      50,
+		"concurrency":     5,
 	}))
 	srv.HandleTestFingerprint(c)
 	if w.Code != http.StatusOK {
@@ -406,6 +550,9 @@ func TestFingerprintAPI_CalibrateAndTest(t *testing.T) {
 	if testView.Status != "succeeded" {
 		t.Fatalf("test job status want succeeded got %s (err=%s)", testView.Status, testView.Error)
 	}
+	if testView.Progress.Success != 50 || testView.Progress.Failed != 0 {
+		t.Fatalf("test progress=%+v, want 50 merged-valid samples", testView.Progress)
+	}
 
 	// result should have non-zero score
 	resultBytes, _ := json.Marshal(testView.Result)
@@ -416,6 +563,20 @@ func TestFingerprintAPI_CalibrateAndTest(t *testing.T) {
 	}
 	if result.Matches[0].Score <= 0 {
 		t.Fatalf("test: expected positive score, got %f", result.Matches[0].Score)
+	}
+	if len(result.RawData) != 50 {
+		t.Fatalf("test raw samples=%d, want 50", len(result.RawData))
+	}
+	for _, sample := range result.RawData {
+		if sample != 123 {
+			t.Fatalf("test sample=%d, want merged stream value 123", sample)
+		}
+	}
+	if got := upstreamCalls.Load(); got != 100 {
+		t.Fatalf("upstream calls=%d, want 100", got)
+	}
+	if got := nonStreamingRequests.Load(); got != 0 {
+		t.Fatalf("non-streaming upstream requests=%d, want 0", got)
 	}
 
 	// ── Delete fingerprint ──────────────────────────────────────────────────
@@ -442,9 +603,10 @@ func TestFingerprintAPI_CancelJob(t *testing.T) {
 	channelID := createFPChannel(t, srv, upstream.URL, "fp-model")
 
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/fingerprints/calibrate", map[string]any{
-		"name":       "cancel-test",
-		"channel_id": channelID,
-		"model":      "fp-model",
+		"name":            "cancel-test",
+		"channel_id":      channelID,
+		"model":           "fp-model",
+		"client_protocol": "openai",
 	}))
 	srv.HandleCalibrateFingerprint(c)
 	if w.Code != http.StatusOK {

@@ -255,6 +255,20 @@ func (h *HybridStore) UpdateChannelEnabled(ctx context.Context, id int64, enable
 	return result, nil
 }
 
+func (h *HybridStore) BatchUpdateProtocolTransformMode(ctx context.Context, channelIDs []int64, mode string) (int64, error) {
+	affected, err := h.mysql.BatchUpdateProtocolTransformMode(ctx, channelIDs, mode)
+	if err != nil {
+		return 0, err
+	}
+
+	h.syncToSQLite("BatchUpdateProtocolTransformMode", func() error {
+		_, err := h.sqlite.BatchUpdateProtocolTransformMode(ctx, channelIDs, mode)
+		return err
+	})
+
+	return affected, nil
+}
+
 func (h *HybridStore) DeleteConfig(ctx context.Context, id int64) error {
 	if err := h.mysql.DeleteConfig(ctx, id); err != nil {
 		return err
@@ -269,18 +283,6 @@ func (h *HybridStore) DeleteConfig(ctx context.Context, id int64) error {
 
 func (h *HybridStore) GetEnabledChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error) {
 	return h.sqlite.GetEnabledChannelsByModel(ctx, modelName)
-}
-
-func (h *HybridStore) GetEnabledChannelsByType(ctx context.Context, channelType string) ([]*model.Config, error) {
-	return h.sqlite.GetEnabledChannelsByType(ctx, channelType)
-}
-
-func (h *HybridStore) GetEnabledChannelsByExposedProtocol(ctx context.Context, protocol string) ([]*model.Config, error) {
-	return h.sqlite.GetEnabledChannelsByExposedProtocol(ctx, protocol)
-}
-
-func (h *HybridStore) GetEnabledChannelsByModelAndProtocol(ctx context.Context, modelName, protocol string) ([]*model.Config, error) {
-	return h.sqlite.GetEnabledChannelsByModelAndProtocol(ctx, modelName, protocol)
 }
 
 func (h *HybridStore) BatchUpdatePriority(ctx context.Context, updates []struct {
@@ -533,6 +535,26 @@ func (h *HybridStore) GetAllModelCooldowns(ctx context.Context) (map[int64]map[s
 	return h.sqlite.GetAllModelCooldowns(ctx)
 }
 
+func (h *HybridStore) BumpModelCooldown(
+	ctx context.Context,
+	channelID int64,
+	model string,
+	now time.Time,
+	statusCode int,
+) (time.Duration, error) {
+	duration, err := h.mysql.BumpModelCooldown(ctx, channelID, model, now, statusCode)
+	if err != nil {
+		return 0, err
+	}
+
+	h.syncToSQLite("BumpModelCooldown", func() error {
+		_, err := h.sqlite.BumpModelCooldown(ctx, channelID, model, now, statusCode)
+		return err
+	})
+
+	return duration, nil
+}
+
 func (h *HybridStore) SetModelCooldown(ctx context.Context, channelID int64, model string, until time.Time) error {
 	if err := h.mysql.SetModelCooldown(ctx, channelID, model, until); err != nil {
 		return err
@@ -639,16 +661,16 @@ func (h *HybridStore) AggregateRangeWithFilter(ctx context.Context, since, until
 	return h.sqlite.AggregateRangeWithFilter(ctx, since, until, bucket, filter)
 }
 
-func (h *HybridStore) GetDistinctModels(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]string, error) {
-	return h.sqlite.GetDistinctModels(ctx, since, until, channelType, filter)
+func (h *HybridStore) GetDistinctModels(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]string, error) {
+	return h.sqlite.GetDistinctModels(ctx, since, until, filter)
 }
 
-func (h *HybridStore) GetDistinctStatusCodes(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]int, error) {
-	return h.sqlite.GetDistinctStatusCodes(ctx, since, until, channelType, filter)
+func (h *HybridStore) GetDistinctStatusCodes(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]int, error) {
+	return h.sqlite.GetDistinctStatusCodes(ctx, since, until, filter)
 }
 
-func (h *HybridStore) GetDistinctChannels(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]model.ChannelNameID, error) {
-	return h.sqlite.GetDistinctChannels(ctx, since, until, channelType, filter)
+func (h *HybridStore) GetDistinctChannels(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]model.ChannelNameID, error) {
+	return h.sqlite.GetDistinctChannels(ctx, since, until, filter)
 }
 
 func (h *HybridStore) GetStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) ([]model.StatsEntry, error) {
@@ -657,6 +679,10 @@ func (h *HybridStore) GetStats(ctx context.Context, startTime, endTime time.Time
 
 func (h *HybridStore) GetStatsLite(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.StatsEntry, error) {
 	return h.sqlite.GetStatsLite(ctx, startTime, endTime, filter)
+}
+
+func (h *HybridStore) GetClientProtocolStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.ClientProtocolStats, error) {
+	return h.sqlite.GetClientProtocolStats(ctx, startTime, endTime, filter)
 }
 
 func (h *HybridStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) (*model.RPMStats, error) {
@@ -880,6 +906,10 @@ func (h *HybridStore) ListModelFingerprints(ctx context.Context) ([]*model.Model
 
 func (h *HybridStore) GetModelFingerprint(ctx context.Context, id int64) (*model.ModelFingerprint, error) {
 	return h.sqlite.GetModelFingerprint(ctx, id)
+}
+
+func (h *HybridStore) ModelFingerprintNameExists(ctx context.Context, name string) (bool, error) {
+	return h.mysql.ModelFingerprintNameExists(ctx, name)
 }
 
 func (h *HybridStore) CreateModelFingerprint(ctx context.Context, fp *model.ModelFingerprint) (*model.ModelFingerprint, error) {

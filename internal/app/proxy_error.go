@@ -59,15 +59,18 @@ func (s *Server) decideCooldownAction(
 }
 
 func (s *Server) completeCooldownInput(cfg *model.Config, in cooldown.ErrorInput) cooldown.ErrorInput {
-	in.ChannelType = cfg.ChannelType
-	in.CooldownDetectionRules = cfg.CooldownDetectionRules
-	if in.CooldownDetectionRules == nil || in.CooldownDetectionRules.IsEmpty() {
-		in.CooldownDetectionRules = s.globalCooldownDetectionRules
-	}
+	in.CooldownDetectionRules, _ = s.effectiveChannelCooldownDetectionRules(cfg.CooldownDetectionRules)
 	if strings.TrimSpace(in.Model) != "" && len(in.ChannelModels) == 0 {
 		in.ChannelModels = s.channelModelCooldownKeys(cfg)
 	}
 	return in
+}
+
+func (s *Server) effectiveChannelCooldownDetectionRules(channelRules *model.CooldownDetectionRules) (*model.CooldownDetectionRules, bool) {
+	if channelRules == nil || channelRules.IsEmpty() {
+		return s.globalCooldownDetectionRules, true
+	}
+	return channelRules, false
 }
 
 func (s *Server) channelModelCooldownKeys(cfg *model.Config) []string {
@@ -75,13 +78,14 @@ func (s *Server) channelModelCooldownKeys(cfg *model.Config) []string {
 		return nil
 	}
 
-	protocols := cfg.SupportedProtocols()
 	seen := make(map[string]struct{}, len(cfg.ModelEntries))
 	models := make([]string, 0, len(cfg.ModelEntries))
-	for _, clientProtocol := range protocols {
-		upstreamProtocol := cfg.ResolveUpstreamProtocol(clientProtocol)
+	for _, upstreamProtocol := range protocol.AllProtocols() {
 		for _, entry := range cfg.ModelEntries {
-			modelName := strings.TrimSpace(s.resolveFinalUpstreamModel(cfg, entry.Model, upstreamProtocol))
+			if entry.Disabled {
+				continue
+			}
+			modelName := strings.TrimSpace(s.resolveFinalUpstreamModel(cfg, entry.Model, string(upstreamProtocol)))
 			if modelName == "" {
 				continue
 			}
@@ -140,13 +144,11 @@ func cooldownInputForModel(in cooldown.ErrorInput, model string) cooldown.ErrorI
 	return in
 }
 
-func isAlphaSearchEndpointUnsupported(reqCtx *proxyRequestContext, res *fwResult) bool {
-	if reqCtx == nil || res == nil || res.Status != 404 ||
-		protocol.DetectRequestFamily(reqCtx.requestPath) != protocol.RequestFamilyAlphaSearch {
+func isProtocolEndpointMissing(res *fwResult) bool {
+	if res == nil || res.ResponseCommitted {
 		return false
 	}
-	classification := util.ClassifyHTTPResponseWithMeta(res.Status, res.Header, res.Body)
-	return classification.Level == util.ErrorLevelChannel && !classification.ModelScoped
+	return util.ShouldFallbackProtocol(res.Status, res.Body)
 }
 
 func (s *Server) logProxyResult(
@@ -169,6 +171,8 @@ func (s *Server) logProxyResult(
 		IsStreaming:      reqCtx.isStreaming,
 		APIKeyUsed:       selectedKey,
 		AuthTokenID:      reqCtx.tokenID,
+		ClientProtocol:   reqCtx.clientProtocol,
+		UpstreamProtocol: reqCtx.upstreamProtocol,
 		ClientIP:         reqCtx.clientIP,
 		BaseURL:          reqCtx.baseURL,
 		Result:           res,
@@ -568,14 +572,6 @@ func (s *Server) handleProxyErrorResponse(
 		channelID: &cfg.ID,
 		duration:  duration,
 		succeeded: false,
-	}
-
-	// alpha/search 是独立能力。端点缺失只说明当前 URL 不支持搜索，
-	// 不能冷却 Key、模型或整个渠道，也不能阻断后续候选渠道。
-	if isAlphaSearchEndpointUnsupported(reqCtx, res) {
-		failure.nextAction = cooldown.ActionRetryChannel
-		failure.alphaSearchUnsupported = true
-		return failure, cooldown.ActionRetryChannel
 	}
 
 	if forceReturnClient {

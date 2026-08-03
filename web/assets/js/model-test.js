@@ -6,7 +6,6 @@ const TEST_MODE_FINGERPRINT = 'fingerprint';
 // localStorage keys
 const STORAGE_KEY_TEST_MODE = 'ccload_model_test_mode';
 const STORAGE_KEY_SELECTED_CHANNEL_ID = 'ccload_model_test_channel_id';
-const STORAGE_KEY_SELECTED_MODEL_TYPE = 'ccload_model_test_model_type';
 const STORAGE_KEY_SELECTED_MODEL_NAME = 'ccload_model_test_model_name';
 const STORAGE_KEY_SELECTED_PROTOCOL = 'ccload_model_test_protocol';
 const STORAGE_KEY_STREAM_ENABLED = 'ccload_model_test_stream_enabled';
@@ -19,7 +18,6 @@ const STORAGE_KEY_CHAT_MESSAGES = 'ccload_model_test_chat_messages';
 
 let channelsList = [];
 let selectedChannel = null;
-let selectedModelType = '';
 let selectedModelName = '';
 let selectedProtocol = '';
 let selectedModelModeProtocol = '';
@@ -37,6 +35,7 @@ let chatModel = '';
 let isChatSending = false;
 let chatChannelCombobox = null;
 let chatModelCombobox = null;
+let chatProtocolCombobox = null;
 let chatThinkingCombobox = null;
 let chatThinkingEffort = '';
 let chatPendingImages = [];
@@ -50,16 +49,14 @@ let chatAdvancedOptions = {
 
 let channelSelectCombobox = null;
 let modelSelectCombobox = null;
+let clientProtocolCombobox = null;
 
 const headRow = document.getElementById('model-test-head-row');
 const tbody = document.getElementById('model-test-tbody');
 const toolbar = document.querySelector('.model-test-toolbar');
 const channelSelectorLabel = document.getElementById('channelSelectorLabel');
-const modelTypeLabel = document.getElementById('modelTypeLabel');
-const modelTypeSelect = document.getElementById('testModelType');
 const modelSelectorLabel = document.getElementById('modelSelectorLabel');
-const protocolTransformContainer = document.getElementById('protocolTransformContainer');
-const protocolTransformOptions = document.getElementById('protocolTransformOptions');
+const clientProtocolSelect = document.getElementById('clientProtocolSelect');
 const modelSelect = document.getElementById('testModelSelect');
 const mobileNameFilterInput = document.getElementById('modelTestMobileNameFilter');
 const chatToolbar = document.getElementById('chatToolbar');
@@ -514,10 +511,10 @@ function normalizeProtocol(value) {
 
 function protocolLabel(protocol) {
   const labels = {
-    anthropic: 'channels.protocolTransformAnthropic',
-    codex: 'channels.protocolTransformCodex',
-    openai: 'channels.protocolTransformOpenAI',
-    gemini: 'channels.protocolTransformGemini'
+    anthropic: 'modelTest.clientProtocolAnthropic',
+    codex: 'modelTest.clientProtocolCodex',
+    openai: 'modelTest.clientProtocolOpenAI',
+    gemini: 'modelTest.clientProtocolGemini'
   };
   const key = labels[protocol] || protocol;
   return i18nText(key, protocol);
@@ -1268,73 +1265,13 @@ function getModelName(entry) {
   return (typeof entry === 'string') ? entry : entry?.model;
 }
 
-function getChannelType(channel) {
-  return normalizeProtocol(channel?.channel_type) || 'anthropic';
-}
-
-function getAvailableChannelTypes() {
-  // 类型下拉与后端 fetchChannelIDsByType 一致：原生 channel_type + protocol_transforms
-  const types = new Set();
-  channelsList.forEach((ch) => {
-    getExposedProtocols(ch).forEach((protocol) => types.add(protocol));
-  });
-  return Array.from(types).sort((a, b) => a.localeCompare(b));
-}
-
-function ensureSelectedModelType() {
-  const channelTypes = getAvailableChannelTypes();
-  if (!channelTypes.length) {
-    selectedModelType = '';
-    return;
-  }
-
-  if (!selectedModelType || !channelTypes.includes(selectedModelType)) {
-    selectedModelType = channelTypes[0];
-  }
-}
-
-function populateModelTypeSelect() {
-  if (!modelTypeSelect) return;
-
-  ensureSelectedModelType();
-  const channelTypes = getAvailableChannelTypes();
-  modelTypeSelect.innerHTML = channelTypes.map((channelType) => `
-    <option value="${channelType}" ${selectedModelType === channelType ? 'selected' : ''}>${protocolLabel(channelType)}</option>
-  `).join('');
-}
-
-function getSupportedProtocols(channel) {
-  const upstreamProtocol = getChannelType(channel);
-  if (!ALL_PROTOCOLS.includes(upstreamProtocol)) {
-    return [upstreamProtocol];
-  }
+function getClientProtocols() {
   return [...ALL_PROTOCOLS];
 }
 
-function getExposedProtocols(channel) {
-  const upstreamProtocol = getChannelType(channel);
-  const protocols = new Set([upstreamProtocol]);
-  const transforms = Array.isArray(channel?.protocol_transforms) ? channel.protocol_transforms : [];
-  transforms.forEach((protocol) => {
-    const normalized = normalizeProtocol(protocol);
-    if (!normalized || normalized === upstreamProtocol) return;
-    if (!ALL_PROTOCOLS.includes(normalized)) return;
-    protocols.add(normalized);
-  });
-  return Array.from(protocols);
-}
-
-function channelExposesProtocol(channel, protocol) {
-  return getExposedProtocols(channel).includes(normalizeProtocol(protocol));
-}
-
-function getAllModelsForProtocol(protocol) {
-  const normalizedProtocol = normalizeProtocol(protocol);
+function getAllModels() {
   const modelSet = new Set();
   channelsList.forEach(ch => {
-    // 暴露该协议即可（原生类型或 protocol_transforms），不要再用原生类型二次收窄，
-    // 否则转换渠道上的模型永远进不了「按模型测试」列表。
-    if (!channelExposesProtocol(ch, normalizedProtocol)) return;
     (ch.models || []).forEach(entry => {
       const modelName = getModelName(entry);
       if (modelName) modelSet.add(modelName);
@@ -1344,45 +1281,63 @@ function getAllModelsForProtocol(protocol) {
 }
 
 function ensureSelectedProtocolForCurrentMode() {
-  if (testMode === TEST_MODE_CHANNEL && selectedChannel) {
-    const supportedProtocols = getSupportedProtocols(selectedChannel);
-    if (!selectedProtocol || !supportedProtocols.includes(selectedProtocol)) {
-      selectedProtocol = getChannelType(selectedChannel);
-    }
+  if (!getClientProtocols().includes(selectedProtocol)) selectedProtocol = 'anthropic';
+}
+
+function syncClientProtocolCombobox() {
+  ensureSelectedProtocolForCurrentMode();
+
+  if (!clientProtocolCombobox && clientProtocolSelect && typeof window.createSearchableCombobox === 'function') {
+    clientProtocolCombobox = window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'clientProtocolSelect',
+      dropdownId: 'clientProtocolSelectDropdown',
+      initialValue: selectedProtocol,
+      initialLabel: protocolLabel(selectedProtocol),
+      getOptions: () => ALL_PROTOCOLS.map(protocol => ({
+        value: protocol,
+        label: protocolLabel(protocol)
+      })),
+      onSelect: (value) => selectClientProtocol(value)
+    });
+  }
+
+  const label = protocolLabel(selectedProtocol);
+  if (clientProtocolCombobox) {
+    clientProtocolCombobox.setValue(selectedProtocol, label);
+    clientProtocolCombobox.refresh();
+  } else if (clientProtocolSelect) {
+    clientProtocolSelect.value = label;
+  }
+}
+
+function syncChatClientProtocolCombobox() {
+  if (!chatProtocolCombobox) return;
+  ensureSelectedProtocolForCurrentMode();
+  chatProtocolCombobox.setValue(selectedProtocol, protocolLabel(selectedProtocol));
+  chatProtocolCombobox.refresh();
+}
+
+function selectClientProtocol(value) {
+  const protocol = normalizeProtocol(value);
+  if (!ALL_PROTOCOLS.includes(protocol)) {
+    syncClientProtocolCombobox();
+    syncChatClientProtocolCombobox();
     return;
   }
 
-  if (selectedProtocol) return;
-  selectedProtocol = selectedModelType || (channelsList[0] ? getChannelType(channelsList[0]) : 'anthropic');
-}
-
-function renderProtocolTransformOptions() {
-  if (!protocolTransformOptions) return;
-
-  ensureSelectedProtocolForCurrentMode();
-
-  const supported = testMode === TEST_MODE_CHANNEL && selectedChannel
-    ? new Set(getSupportedProtocols(selectedChannel))
-    : null;
-
-  if (supported && !supported.has(selectedProtocol)) {
-    selectedProtocol = getChannelType(selectedChannel);
+  selectedProtocol = protocol;
+  if (testMode === TEST_MODE_MODEL) {
+    selectedModelModeProtocol = selectedProtocol;
   }
+  saveSelectedProtocolToStorage(selectedProtocol);
+  clearProgress();
+  syncClientProtocolCombobox();
+  syncChatClientProtocolCombobox();
 
-  protocolTransformOptions.innerHTML = ALL_PROTOCOLS.map((protocol) => {
-    const disabled = Boolean(supported) && !supported.has(protocol);
-    const checked = selectedProtocol === protocol;
-    return `
-      <label class="channel-editor-radio-option">
-        <input type="radio"
-               name="modelTestProtocolTransform"
-               value="${protocol}"
-               ${checked ? 'checked' : ''}
-               ${disabled ? 'disabled' : ''}>
-        <span>${protocolLabel(protocol)}</span>
-      </label>
-    `;
-  }).join('');
+  if (testMode === TEST_MODE_MODEL) {
+    renderModelModeRows();
+  }
 }
 
 function isModelSupported(channel, modelName) {
@@ -1390,28 +1345,24 @@ function isModelSupported(channel, modelName) {
   return channel.models.some(entry => getModelName(entry) === modelName);
 }
 
-function getChannelsSupportingModel(protocol, modelName) {
-  const normalizedProtocol = normalizeProtocol(protocol);
+function getChannelsSupportingModel(modelName) {
   return channelsList
-    // 模型类型只用于缩小模型候选，不应把同模型的转换渠道挡掉。
-    .filter(ch => channelExposesProtocol(ch, normalizedProtocol) && isModelSupported(ch, modelName))
+    .filter(ch => isModelSupported(ch, modelName))
     .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name));
 }
 
-function isExactModelInProtocol(protocol, modelName) {
+function isExactModel(modelName) {
   if (!modelName) return false;
   const target = String(modelName).trim().toLowerCase();
   if (!target) return false;
-  return getAllModelsForProtocol(protocol).some(m => m.toLowerCase() === target);
+  return getAllModels().some(m => m.toLowerCase() === target);
 }
 
-function getChannelModelPairsMatching(protocol, keyword) {
+function getChannelModelPairsMatching(keyword) {
   const trimmed = String(keyword || '').trim().toLowerCase();
   if (!trimmed) return [];
-  const normalizedProtocol = normalizeProtocol(protocol);
   const pairs = [];
   channelsList
-    .filter(ch => channelExposesProtocol(ch, normalizedProtocol))
     .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
     .forEach(ch => {
       (ch.models || []).forEach(entry => {
@@ -1452,7 +1403,7 @@ function ensureModelSelectCombobox() {
     initialLabel: selectedModelName,
     allowCustomInput: true,
     getOptions: () => {
-      const models = getAllModelsForProtocol(selectedProtocol);
+      const models = getAllModels();
       const options = models.map(name => ({ value: name, label: name }));
 
       const typedModel = getModelInputValue();
@@ -1568,8 +1519,7 @@ function renderChannelModeRows() {
 }
 
 function populateModelSelector() {
-  ensureSelectedModelType();
-  const models = getAllModelsForProtocol(selectedProtocol);
+  const models = getAllModels();
   const typedModel = getModelInputValue();
 
   if (models.length === 0) {
@@ -1579,7 +1529,7 @@ function populateModelSelector() {
     return;
   }
 
-  // 输入框有用户输入（含模糊关键字）→ 保留；否则当前选择不在新协议下时回退到首项。
+  // 输入框有用户输入（含模糊关键字）→ 保留；否则当前选择不在模型全集时回退到首项。
   if (typedModel && models.includes(typedModel)) {
     selectedModelName = typedModel;
   } else if (!selectedModelName || !models.includes(selectedModelName)) {
@@ -1592,15 +1542,14 @@ function populateModelSelector() {
 
 function renderModelModeRows() {
   const previousSelectionState = captureRowSelectionState();
-  ensureSelectedModelType();
   if (!selectedProtocol) {
-    renderEmptyRow(i18nText('modelTest.selectProtocolFirst', '请先选择协议转换'));
+    renderEmptyRow(i18nText('modelTest.selectProtocolFirst', '请先选择请求协议'));
     return;
   }
 
-  const models = getAllModelsForProtocol(selectedProtocol);
+  const models = getAllModels();
   if (models.length === 0) {
-    renderEmptyRow(i18nText('modelTest.noModelForProtocol', '该协议下没有可用模型'));
+    renderEmptyRow(i18nText('modelTest.noModelsAvailable', '没有可用模型'));
     return;
   }
 
@@ -1614,11 +1563,11 @@ function renderModelModeRows() {
     }
   }
 
-  const isExact = isExactModelInProtocol(selectedProtocol, selectedModelName);
+  const isExact = isExactModel(selectedModelName);
   const pairs = isExact
-    ? getChannelsSupportingModel(selectedProtocol, selectedModelName)
+    ? getChannelsSupportingModel(selectedModelName)
         .map(ch => ({ channel: ch, model: selectedModelName }))
-    : getChannelModelPairsMatching(selectedProtocol, selectedModelName);
+    : getChannelModelPairsMatching(selectedModelName);
 
   if (pairs.length === 0) {
     renderEmptyRow(i18nText('modelTest.noChannelSupportsModel', '没有渠道支持该模型'));
@@ -1709,10 +1658,6 @@ function updateModeUI() {
   toolbar?.classList.toggle('model-test-toolbar--model-mode', isModelMode);
 
   channelSelectorLabel.style.display = isModelMode ? 'none' : 'flex';
-  if (modelTypeLabel) {
-    modelTypeLabel.style.display = isModelMode ? 'flex' : 'none';
-    modelTypeLabel.classList.toggle('hidden', !isModelMode);
-  }
   if (modelSelectorLabel) {
     modelSelectorLabel.style.display = isModelMode ? 'flex' : 'none';
     modelSelectorLabel.classList.toggle('hidden', !isModelMode);
@@ -1728,10 +1673,7 @@ function updateModeUI() {
     deleteModelsBtn.disabled = false;
     deleteModelsBtn.title = isModelMode ? i18nText('modelTest.deleteBySelectionHint', '按勾选记录删除对应渠道中的模型') : '';
   }
-  if (isModelMode) {
-    populateModelTypeSelect();
-  }
-  renderProtocolTransformOptions();
+  syncClientProtocolCombobox();
 }
 
 function getSelectedTargets() {
@@ -1750,7 +1692,7 @@ function getSelectedTargets() {
           row,
           model: row.dataset.model || selectedModelName,
           channelId: channel.id,
-          protocolTransform: selectedProtocol
+          clientProtocol: selectedProtocol
         };
       }
 
@@ -1759,7 +1701,7 @@ function getSelectedTargets() {
         row,
         model: row.dataset.model,
         channelId: selectedChannel.id,
-        protocolTransform: selectedProtocol
+        clientProtocol: selectedProtocol
       };
     })
     .filter(Boolean);
@@ -1950,12 +1892,12 @@ async function runBatchTests(targets) {
   targets.forEach(({ row }) => resetRowStatus(row));
 
   const testOne = async (target) => {
-    const { row, model, channelId, protocolTransform } = target;
-    const selectedProtocol = protocolTransform;
+    const { row, model, channelId, clientProtocol } = target;
+    const selectedProtocol = clientProtocol;
     row.querySelector('.response').textContent = i18nText('modelTest.testing', '测试中...');
 
     try {
-      const data = await fetchModelTestWithRPMWait(target, { model, stream: streamEnabled, content, protocol_transform: selectedProtocol });
+      const data = await fetchModelTestWithRPMWait(target, { model, stream: streamEnabled, content, client_protocol: selectedProtocol });
       applyTestResultToRow(row, data);
     } catch (e) {
       row.style.background = 'rgba(239, 68, 68, 0.1)';
@@ -2357,28 +2299,7 @@ async function executeDeletePlan(deletePlan, progress = null) {
   return { failed, successCount, totalChannelCount };
 }
 
-function parseBatchModelInput(value) {
-  const seen = new Set();
-  return String(value || '')
-    .split(/[,\n]+/)
-    .map(item => item.trim())
-    .filter(Boolean)
-    .filter((modelName) => {
-      const key = modelName.toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-}
-
-function buildModelEntriesFromNames(modelNames) {
-  return modelNames.map(modelName => ({
-    model: modelName,
-    redirect_model: ''
-  }));
-}
-
-function appendModelsToChannelCache(channel, modelNames) {
+function appendModelsToChannelCache(channel, modelEntries) {
   if (!channel) return 0;
   if (!Array.isArray(channel.models)) {
     channel.models = [];
@@ -2392,13 +2313,13 @@ function appendModelsToChannelCache(channel, modelNames) {
   );
 
   let addedCount = 0;
-  modelNames.forEach((modelName) => {
-    const key = modelName.toLowerCase();
+  modelEntries.forEach((entry) => {
+    const key = entry.model.toLowerCase();
     if (existing.has(key)) return;
 
     channel.models.push({
-      model: modelName,
-      redirect_model: ''
+      model: entry.model,
+      redirect_model: entry.redirect_model
     });
     existing.add(key);
     addedCount++;
@@ -2431,11 +2352,10 @@ function formatAddFailDetails(failed, maxItems = 5) {
   return formatDeleteFailDetails(failed, maxItems);
 }
 
-async function executeAddModelsToChannels(modelNames, targets) {
+async function executeAddModelsToChannels(modelEntries, targets) {
   const failed = [];
   let successCount = 0;
   let addedModelCount = 0;
-  const modelEntries = buildModelEntriesFromNames(modelNames);
 
   for (const target of targets) {
     try {
@@ -2454,7 +2374,7 @@ async function executeAddModelsToChannels(modelNames, targets) {
       }
 
       successCount++;
-      addedModelCount += appendModelsToChannelCache(target.channel, modelNames);
+      addedModelCount += appendModelsToChannelCache(target.channel, modelEntries);
     } catch (error) {
       failed.push({
         channelId: target.channelId,
@@ -2517,8 +2437,8 @@ function openAddModelsModal() {
 async function confirmAddModelsFromModal() {
   if (isAddingModels) return;
 
-  const modelNames = parseBatchModelInput(addModelsTextarea?.value || '');
-  if (modelNames.length === 0) {
+  const modelEntries = window.ModelEntryParser.parseModelEntries(addModelsTextarea?.value || '');
+  if (modelEntries.length === 0) {
     showError(i18nText('modelTest.addModelsEmpty', '请输入要添加的模型'));
     return;
   }
@@ -2531,7 +2451,7 @@ async function confirmAddModelsFromModal() {
 
   setAddModelsModalBusy(true);
   try {
-    const result = await executeAddModelsToChannels(modelNames, targets);
+    const result = await executeAddModelsToChannels(modelEntries, targets);
     setAddModelsModalBusy(false);
 
     populateModelSelector();
@@ -2589,9 +2509,8 @@ async function fetchAndAddModels() {
     return;
   }
 
-  const channelType = getChannelType(selectedChannel);
   try {
-    const resp = await fetchAPIWithAuth(`/admin/channels/${selectedChannel.id}/models/fetch?channel_type=${channelType}`);
+    const resp = await fetchAPIWithAuth(`/admin/channels/${selectedChannel.id}/models/fetch`);
     if (!resp.success || !resp.data?.models) {
       showError(resp.error || i18nText('modelTest.fetchModelsFailed', '获取模型失败'));
       return;
@@ -2740,14 +2659,12 @@ async function deleteSelectedModels() {
 
 async function onChannelChange() {
   if (!selectedChannel) {
-    renderProtocolTransformOptions();
+    syncClientProtocolCombobox();
     renderEmptyRow(i18nText('modelTest.selectChannelFirst', '请先选择渠道'));
     return;
   }
 
-  selectedProtocol = getChannelType(selectedChannel);
-  renderProtocolTransformOptions();
-  populateModelTypeSelect();
+  syncClientProtocolCombobox();
   populateModelSelector();
 
   if (testMode === TEST_MODE_CHANNEL) {
@@ -2760,7 +2677,7 @@ async function onChannelChange() {
 
 function formatModelTestChannelOptionLabel(ch) {
   if (!ch) return '';
-  return `[${getChannelType(ch)}] ${ch.name}`;
+  return ch.name;
 }
 
 function getModelTestChannelOptionClass(ch) {
@@ -2796,13 +2713,12 @@ async function loadChannels(options = {}) {
   const { preserveSelection = false, preserveTableState = false } = options;
   const preservedChannelId = preserveSelection ? (selectedChannel?.id ?? null) : null;
   const preservedProtocol = preserveSelection ? selectedProtocol : '';
-  const preservedModelType = preserveSelection ? selectedModelType : '';
   const preservedModelName = preserveSelection ? selectedModelName : '';
   const preservedTableState = preserveTableState ? captureModelTestTableState() : null;
 
   try {
     const list = (await fetchDataWithAuth('/admin/channels')) || [];
-    channelsList = list.sort((a, b) => getChannelType(a).localeCompare(getChannelType(b)) || b.priority - a.priority);
+    channelsList = list.sort((a, b) => b.priority - a.priority || String(a.name || '').localeCompare(String(b.name || '')));
     // 指纹模式等跨脚本读取：let 重绑定后必须同步到 window
     window.channelsList = channelsList;
 
@@ -2817,17 +2733,13 @@ async function loadChannels(options = {}) {
     }
 
     if (preserveSelection) {
-      if (preservedModelType) selectedModelType = preservedModelType;
       if (preservedModelName) selectedModelName = preservedModelName;
     } else {
-      const storedModelType = loadSelectedModelTypeFromStorage();
       const storedModelName = loadSelectedModelNameFromStorage();
-      if (storedModelType) selectedModelType = storedModelType;
       if (storedModelName) selectedModelName = storedModelName;
     }
 
     renderSearchableChannelSelect();
-    ensureSelectedModelType();
 
     if (preserveSelection && preservedProtocol) {
       selectedProtocol = preservedProtocol;
@@ -2836,17 +2748,16 @@ async function loadChannels(options = {}) {
       if (storedProtocol) {
         selectedProtocol = storedProtocol;
       } else {
-        selectedProtocol = channelsList[0] ? getChannelType(channelsList[0]) : 'anthropic';
+        selectedProtocol = 'anthropic';
       }
     } else {
-      selectedProtocol = channelsList[0] ? getChannelType(channelsList[0]) : 'anthropic';
+      selectedProtocol = 'anthropic';
     }
     if (testMode === TEST_MODE_MODEL) {
       selectedModelModeProtocol = selectedProtocol;
     }
 
-    populateModelTypeSelect();
-    renderProtocolTransformOptions();
+    syncClientProtocolCombobox();
     populateModelSelector();
     renderRowsByMode();
 
@@ -2880,6 +2791,11 @@ async function loadDefaultTestContent() {
 
 function bindEvents() {
   ensureModelSelectCombobox();
+  syncClientProtocolCombobox();
+  window.addEventListener('localechange', () => {
+    syncClientProtocolCombobox();
+    syncChatClientProtocolCombobox();
+  });
   const streamEnabled = document.getElementById('streamEnabled');
   if (streamEnabled) {
     streamEnabled.addEventListener('change', () => {
@@ -2895,29 +2811,6 @@ function bindEvents() {
     });
   }
 
-  protocolTransformOptions?.addEventListener('change', (event) => {
-    const target = event.target;
-    if (!(target instanceof HTMLInputElement) || target.name !== 'modelTestProtocolTransform') return;
-    if (target.disabled) return;
-
-    selectedProtocol = normalizeProtocol(target.value) || selectedProtocol;
-    if (testMode === TEST_MODE_MODEL) {
-      selectedModelModeProtocol = selectedProtocol;
-      // 协议与类型保持同步，并立刻刷新模型候选/渠道行。
-      selectedModelType = selectedProtocol;
-      saveSelectedModelTypeToStorage(selectedModelType);
-      if (modelTypeSelect) modelTypeSelect.value = selectedModelType;
-    }
-    saveSelectedProtocolToStorage(selectedProtocol);
-    clearProgress();
-    renderProtocolTransformOptions();
-
-    if (testMode === TEST_MODE_MODEL) {
-      populateModelSelector();
-      renderModelModeRows();
-    }
-  });
-
   if (!modelSelectCombobox && modelSelect) {
     modelSelect.addEventListener('change', () => {
       selectedModelName = getModelInputValue();
@@ -2928,24 +2821,6 @@ function bindEvents() {
 
     modelSelect.addEventListener('input', () => {
       selectedModelName = getModelInputValue();
-      if (testMode === TEST_MODE_MODEL) {
-        renderModelModeRows();
-      }
-    });
-  }
-
-  if (modelTypeSelect) {
-    modelTypeSelect.addEventListener('change', () => {
-      selectedModelType = normalizeProtocol(modelTypeSelect.value) || selectedModelType;
-      saveSelectedModelTypeToStorage(selectedModelType);
-      if (selectedModelType) {
-        selectedProtocol = selectedModelType;
-        selectedModelModeProtocol = selectedProtocol;
-        saveSelectedProtocolToStorage(selectedProtocol);
-      }
-      clearProgress();
-      renderProtocolTransformOptions();
-      populateModelSelector();
       if (testMode === TEST_MODE_MODEL) {
         renderModelModeRows();
       }
@@ -3077,9 +2952,6 @@ function setTestMode(mode) {
     return;
   }
 
-  if (testMode === TEST_MODE_CHANNEL && selectedChannel) {
-    selectedProtocol = getChannelType(selectedChannel);
-  }
   updateHeadByMode();
   updateModeUI();
 
@@ -3089,7 +2961,7 @@ function setTestMode(mode) {
     }
     if (selectedModelModeProtocol) {
       selectedProtocol = selectedModelModeProtocol;
-      renderProtocolTransformOptions();
+      syncClientProtocolCombobox();
     }
     populateModelSelector();
   }
@@ -3143,23 +3015,6 @@ function loadSelectedChannelIdFromStorage() {
     }
   } catch (_) { /* ignore */ }
   return null;
-}
-
-function saveSelectedModelTypeToStorage(modelType) {
-  try {
-    if (modelType) {
-      localStorage.setItem(STORAGE_KEY_SELECTED_MODEL_TYPE, modelType);
-    } else {
-      localStorage.removeItem(STORAGE_KEY_SELECTED_MODEL_TYPE);
-    }
-  } catch (_) { /* ignore */ }
-}
-
-function loadSelectedModelTypeFromStorage() {
-  try {
-    return localStorage.getItem(STORAGE_KEY_SELECTED_MODEL_TYPE) || '';
-  } catch (_) { /* ignore */ }
-  return '';
 }
 
 function saveSelectedModelNameToStorage(modelName) {
@@ -3486,6 +3341,25 @@ function initChatPanel() {
   } else {
     chatModelCombobox.refresh();
   }
+
+  // 请求协议 combobox（与其他测试模式共享协议状态和持久化）
+  if (!chatProtocolCombobox) {
+    chatProtocolCombobox = window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'chatProtocolSelect',
+      dropdownId: 'chatProtocolSelectDropdown',
+      allowCustomInput: false,
+      initialValue: selectedProtocol,
+      initialLabel: protocolLabel(selectedProtocol),
+      getOptions: () => ALL_PROTOCOLS.map(protocol => ({
+        value: protocol,
+        label: protocolLabel(protocol)
+      })),
+      onSelect: (value) => selectClientProtocol(value),
+      onCancel: syncChatClientProtocolCombobox
+    });
+  }
+  syncChatClientProtocolCombobox();
 
   // 渠道 combobox（仅显示支持当前模型的渠道）
   if (!chatChannelCombobox) {
@@ -3900,6 +3774,7 @@ async function sendChatMessage() {
     const advancedAPI = getChatAdvancedOptionsAPI();
     const basePayload = {
       model: chatModel,
+      client_protocol: selectedProtocol,
       stream: chatStreamEnabled,
       thinking_effort: chatThinkingEffort,
       builtin_search: chatBuiltinSearch

@@ -48,6 +48,32 @@ func TestModelFingerprintCreatePreservesExplicitIDAndTimestamps(t *testing.T) {
 	}
 }
 
+func TestModelFingerprintNameMustBeUnique(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.CreateSQLiteStore(filepath.Join(t.TempDir(), "fp-unique-name.db"))
+	if err != nil {
+		t.Fatalf("create sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+	if _, err := store.CreateModelFingerprint(ctx, newFingerprintForStorageTest(0)); err != nil {
+		t.Fatalf("create first fingerprint: %v", err)
+	}
+	if _, err := store.CreateModelFingerprint(ctx, newFingerprintForStorageTest(0)); err == nil {
+		t.Fatal("creating a second fingerprint with the same name must fail")
+	}
+
+	fingerprints, err := store.ListModelFingerprints(ctx)
+	if err != nil {
+		t.Fatalf("list fingerprints: %v", err)
+	}
+	if len(fingerprints) != 1 {
+		t.Fatalf("fingerprints len=%d, want 1", len(fingerprints))
+	}
+}
+
 func TestFingerprintTestResultCreateSetsAndPreservesID(t *testing.T) {
 	t.Parallel()
 
@@ -113,7 +139,6 @@ func TestModelFingerprintCRUDAndClearChannel(t *testing.T) {
 		ChannelName:  "test-channel",
 		Model:        "gpt-4",
 		ActualModel:  "gpt-4-0613",
-		ChannelType:  "openai",
 		SampleCount:  5,
 		Distribution: []float64{0.1, 0.2, 0.3, 0.2, 0.2},
 		Stats: model.FingerprintStats{
@@ -222,7 +247,6 @@ func TestModelFingerprintNullChannelID(t *testing.T) {
 		Name:         "orphan-baseline",
 		ChannelID:    nil,
 		Model:        "claude-3-5-sonnet",
-		ChannelType:  "anthropic",
 		SampleCount:  3,
 		Distribution: []float64{0.33, 0.33, 0.34},
 		Stats: model.FingerprintStats{

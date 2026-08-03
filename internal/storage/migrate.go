@@ -10,8 +10,11 @@ import (
 )
 
 const (
-	channelModelsRedirectMigrationVersion = "v1_channel_models_redirect"
-	channelModelsOrderRepairVersion       = "v2_channel_models_created_at_order"
+	channelModelsRedirectMigrationVersion  = "v1_channel_models_redirect"
+	channelModelsOrderRepairVersion        = "v2_channel_models_created_at_order"
+	structuredChannelURLsMigrationVersion  = "v4_structured_channel_urls"
+	clientProtocolBackfillMigrationVersion = "v5_logs_client_protocol_backfill"
+	modelFingerprintNameMaxRunes           = 191
 )
 
 // Dialect 数据库方言
@@ -49,6 +52,9 @@ func migratePostgres(ctx context.Context, db *sql.DB) error {
 
 // migrate 统一迁移逻辑
 func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	// 迁移约束：不得在启动迁移中删除废弃字段或表。
+	// 新库由当前 schema 决定不创建；旧库保留原结构和数据，以支持版本回退。
+	// 确需执行破坏性迁移时，必须脱离启动路径，由显式运维操作完成。
 	// 表定义（顺序重要：外键依赖）
 	tables := []func() *schema.TableBuilder{
 		schema.DefineSchemaMigrationsTable, // 迁移版本表必须最先创建
@@ -56,7 +62,6 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		schema.DefineAPIKeysTable,
 		schema.DefineChannelModelsTable,
 		schema.DefineChannelModelCooldownsTable,
-		schema.DefineChannelProtocolTransformsTable,
 		schema.DefineChannelURLStatesTable,
 		schema.DefineAuthTokensTable,
 		schema.DefineSystemSettingsTable,
@@ -122,6 +127,12 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureLogsUpstreamWebsocket(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate logs upstream_websocket: %w", err)
 			}
+			if err := ensureLogsClientProtocol(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate logs client_protocol: %w", err)
+			}
+			if err := ensureLogsUpstreamProtocol(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate logs upstream_protocol: %w", err)
+			}
 		}
 
 		// 增量迁移：确保channels表有daily_cost_limit字段（2026-01新增）
@@ -134,9 +145,6 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			}
 			if err := ensureChannelsMaxConcurrency(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels max_concurrency: %w", err)
-			}
-			if err := ensureChannelsProtocolTransformMode(ctx, db, dialect); err != nil {
-				return fmt.Errorf("migrate channels protocol_transform_mode: %w", err)
 			}
 			if err := ensureChannelsScheduledCheckEnabled(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels scheduled_check_enabled: %w", err)
@@ -159,9 +167,15 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureChannelsWebsockets(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels websockets: %w", err)
 			}
+			if err := ensureChannelsProtocolTransformMode(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels protocol_transform_mode: %w", err)
+			}
 			// 增量迁移：将url字段从VARCHAR(191)扩展为TEXT（支持多URL存储）
 			if err := migrateChannelsURLToText(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels url to text: %w", err)
+			}
+			if err := migrateChannelURLsToStructuredJSON(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels url to structured JSON: %w", err)
 			}
 		}
 
@@ -220,14 +234,31 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := migrateChannelModelsSchema(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channel_models schema: %w", err)
 			}
+			if err := ensureChannelModelsDisabled(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channel_models disabled: %w", err)
+			}
 			if err := repairLegacyChannelModelOrder(ctx, db, dialect); err != nil {
 				return fmt.Errorf("repair legacy channel_models order: %w", err)
+			}
+		}
+
+		if tb.Name() == "channel_model_cooldowns" {
+			if err := ensureModelCooldownDuration(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channel_model_cooldowns cooldown_duration_ms: %w", err)
 			}
 		}
 
 		if tb.Name() == "fingerprint_test_results" {
 			if err := ensureFingerprintTestResultsDistribution(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate fingerprint_test_results distribution: %w", err)
+			}
+		}
+		if tb.Name() == "model_fingerprints" {
+			if err := ensureModelFingerprintsClientProtocol(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate model_fingerprints client_protocol: %w", err)
+			}
+			if err := deduplicateModelFingerprintNames(ctx, db, dialect); err != nil {
+				return fmt.Errorf("deduplicate model fingerprint names: %w", err)
 			}
 		}
 
@@ -253,6 +284,12 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		return fmt.Errorf("migrate auth_tokens effective_cost: %w", err)
 	}
 
+	// client_protocol 回填同时写 logs 与 model_fingerprints，两表的列迁移都在建表循环内完成，
+	// 必须等循环结束后执行（logs 在循环中先于 model_fingerprints 处理）。
+	if err := backfillLogsClientProtocol(ctx, db, dialect); err != nil {
+		return fmt.Errorf("backfill logs client_protocol: %w", err)
+	}
+
 	// 初始化默认配置
 	if err := initDefaultSettings(ctx, db, dialect); err != nil {
 		return err
@@ -264,6 +301,115 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	}
 
 	return nil
+}
+
+func deduplicateModelFingerprintNames(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	type fingerprintNameRecord struct {
+		id        int64
+		name      string
+		createdAt int64
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, name, created_at
+		FROM model_fingerprints
+		ORDER BY created_at, id
+	`)
+	if err != nil {
+		return fmt.Errorf("query fingerprints: %w", err)
+	}
+	var records []fingerprintNameRecord
+	for rows.Next() {
+		var record fingerprintNameRecord
+		if err := rows.Scan(&record.id, &record.name, &record.createdAt); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan fingerprint name: %w", err)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate fingerprint names: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close fingerprint names: %w", err)
+	}
+
+	earlierNameCountSQL := rebindIfPostgres(dialect, `
+		SELECT COUNT(*)
+		FROM model_fingerprints
+		WHERE name = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+	`)
+	nameCountSQL := rebindIfPostgres(dialect, `SELECT COUNT(*) FROM model_fingerprints WHERE name = ?`)
+	updateNameSQL := rebindIfPostgres(dialect, `UPDATE model_fingerprints SET name = ? WHERE id = ?`)
+	for _, record := range records {
+		var earlierCount int64
+		if err := tx.QueryRowContext(ctx, earlierNameCountSQL,
+			record.name, record.createdAt, record.createdAt, record.id,
+		).Scan(&earlierCount); err != nil {
+			return fmt.Errorf("check earlier fingerprint name for id=%d: %w", record.id, err)
+		}
+		if earlierCount == 0 {
+			continue
+		}
+
+		for suffix := 1; ; suffix++ {
+			candidate := fingerprintNameWithSuffix(record.name, suffix)
+			var candidateCount int64
+			if err := tx.QueryRowContext(ctx, nameCountSQL, candidate).Scan(&candidateCount); err != nil {
+				return fmt.Errorf("check fingerprint name candidate for id=%d: %w", record.id, err)
+			}
+			if candidateCount != 0 {
+				continue
+			}
+
+			result, err := tx.ExecContext(ctx, updateNameSQL, candidate, record.id)
+			if err != nil {
+				return fmt.Errorf("rename fingerprint id=%d: %w", record.id, err)
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("count renamed fingerprint id=%d: %w", record.id, err)
+			}
+			if affected != 1 {
+				return fmt.Errorf("rename fingerprint id=%d affected %d rows, want 1", record.id, affected)
+			}
+			break
+		}
+	}
+
+	var rowCount, uniqueNameCount int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*), COUNT(DISTINCT name)
+		FROM model_fingerprints
+	`).Scan(&rowCount, &uniqueNameCount); err != nil {
+		return fmt.Errorf("validate renamed fingerprints: %w", err)
+	}
+	if rowCount != int64(len(records)) {
+		return fmt.Errorf("fingerprint row count changed from %d to %d", len(records), rowCount)
+	}
+	if uniqueNameCount != rowCount {
+		return fmt.Errorf("fingerprint names remain duplicated: rows=%d unique_names=%d", rowCount, uniqueNameCount)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+func fingerprintNameWithSuffix(name string, suffix int) string {
+	suffixText := fmt.Sprintf("-%d", suffix)
+	nameRunes := []rune(name)
+	maxBaseRunes := modelFingerprintNameMaxRunes - len([]rune(suffixText))
+	if len(nameRunes) > maxBaseRunes {
+		nameRunes = nameRunes[:maxBaseRunes]
+	}
+	return string(nameRunes) + suffixText
 }
 
 func cleanupRemovedSettings(ctx context.Context, db *sql.DB, dialect Dialect) error {
@@ -392,6 +538,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"cooldown_min_seconds", "10", "int", "指数退避冷却下限(秒)", "10"},
 		{"global_cooldown_detection_rules", "{}", "json", "未配置渠道专属规则时继承的全局冷却探测规则", "{}"},
 		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
+		{"upstream_connection_reuse_limit_seconds", "0", "duration", "上游连接最长复用时间(秒,0=不限制;达到时限后不接收新请求,在途请求完成后关闭)", "0"},
 		{"stream_timeout", "0", "duration", "流式请求总超时(秒,0=禁用)", "0"},
 		{"non_stream_timeout", "120", "duration", "非流式请求超时(秒,0=禁用)", "120"},
 		{"anthropic_first_byte_timeout", "0", "duration", "Anthropic流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},

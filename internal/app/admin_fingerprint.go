@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
 
 	"github.com/gin-gonic/gin"
@@ -82,10 +83,23 @@ func (s *Server) HandleCalibrateFingerprint(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "model is required")
 		return
 	}
-
+	nameExists, err := s.store.ModelFingerprintNameExists(c.Request.Context(), req.Name)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	if nameExists {
+		RespondErrorMsg(c, http.StatusConflict, fingerprintNameConflictMessage(req.Name))
+		return
+	}
 	cfg, err := s.store.GetConfig(c.Request.Context(), req.ChannelID)
 	if err != nil || cfg == nil {
 		RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("channel %d not found", req.ChannelID))
+		return
+	}
+	req.ClientProtocol, err = validateFingerprintClientProtocol(req.ClientProtocol)
+	if err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -103,6 +117,10 @@ func (s *Server) HandleCalibrateFingerprint(c *gin.Context) {
 	// ClampFingerprintParams is called inside StartCalibrate; params errors surface as non-limit errors.
 	jobID, err := s.fingerprintJobs.StartCalibrate(s, req)
 	if err != nil {
+		if errors.Is(err, ErrFingerprintNameConflict) {
+			RespondErrorMsg(c, http.StatusConflict, fingerprintNameConflictMessage(req.Name))
+			return
+		}
 		if isFPJobLimitError(err) {
 			RespondErrorMsg(c, http.StatusTooManyRequests, err.Error())
 			return
@@ -111,6 +129,10 @@ func (s *Server) HandleCalibrateFingerprint(c *gin.Context) {
 		return
 	}
 	RespondJSON(c, http.StatusOK, gin.H{"job_id": jobID})
+}
+
+func fingerprintNameConflictMessage(name string) string {
+	return fmt.Sprintf("baseline name %q already exists or is being calibrated; choose a different name", name)
 }
 
 // HandleTestFingerprint POST /admin/fingerprints/test
@@ -125,10 +147,14 @@ func (s *Server) HandleTestFingerprint(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "model is required")
 		return
 	}
-
 	cfg, err := s.store.GetConfig(c.Request.Context(), req.ChannelID)
 	if err != nil || cfg == nil {
 		RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("channel %d not found", req.ChannelID))
+		return
+	}
+	req.ClientProtocol, err = validateFingerprintClientProtocol(req.ClientProtocol)
+	if err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -158,6 +184,14 @@ func (s *Server) HandleTestFingerprint(c *gin.Context) {
 		return
 	}
 	RespondJSON(c, http.StatusOK, gin.H{"job_id": jobID})
+}
+
+func validateFingerprintClientProtocol(clientProtocol string) (string, error) {
+	clientProtocol = strings.ToLower(strings.TrimSpace(clientProtocol))
+	if !protocol.IsValid(protocol.Protocol(clientProtocol)) {
+		return "", fmt.Errorf("invalid client_protocol %q", clientProtocol)
+	}
+	return clientProtocol, nil
 }
 
 // HandleFingerprintJob GET /admin/fingerprints/jobs/:id

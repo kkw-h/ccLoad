@@ -24,12 +24,15 @@ import (
 )
 
 const (
-	responsesWebsocketRequestCreate = "response.create"
-	responsesWebsocketRequestAppend = "response.append"
-	responsesWebsocketIdleTimeout   = 5 * time.Minute
-	responsesWebsocketPingInterval  = 2 * time.Minute
-	responsesWebsocketWriteTimeout  = 30 * time.Second
-	responsesWebsocketRetryMessage  = "upstream channel failed before response output; retry the request"
+	responsesWebsocketRequestCreate      = "response.create"
+	responsesWebsocketRequestAppend      = "response.append"
+	responsesWebsocketIdleTimeout        = 5 * time.Minute
+	responsesWebsocketPingInterval       = 2 * time.Minute
+	responsesWebsocketWriteTimeout       = 30 * time.Second
+	responsesWebsocketRetryCode          = "upstream_unavailable"
+	responsesWebsocketRetryMessage       = "upstream channel failed before response output; retry the request"
+	responsesWebsocketInterruptedCode    = "upstream_stream_interrupted"
+	responsesWebsocketInterruptedMessage = "upstream response was interrupted after a complete tool call; reconnect and replay the full conversation state"
 )
 
 // responsesWebsocketUpgradePaths lists every downstream path that terminates a
@@ -214,10 +217,13 @@ func (s *Server) HandleResponsesWebsocket(c *gin.Context) {
 				connectionCtx, c, conn, requestBody, nativeRequestBody, executionSession.upstream, allowLocalPrewarm,
 			)
 			if errTurn != nil {
+				if turnResult.interrupted {
+					s.responsesExecutionSessions.commit(executionSession, requestBody, turnResult)
+				}
 				executionSession.releaseTurn()
 				var retryErr *responsesWebsocketClientRetryError
 				if errors.As(errTurn, &retryErr) {
-					if errWrite := writeResponsesWebsocketClientRetryError(conn); errWrite != nil {
+					if errWrite := writeResponsesWebsocketClientRetryError(conn, retryErr); errWrite != nil {
 						return
 					}
 					_ = closeResponsesWebsocketForClientRetry(conn)
@@ -364,6 +370,7 @@ type responsesWebsocketTurnResult struct {
 	completedOutput     []byte
 	completedResponseID string
 	pendingToolCallIDs  []string
+	interrupted         bool
 }
 
 type responsesWebsocketTerminalError struct {
@@ -378,10 +385,23 @@ func (e *responsesWebsocketTerminalError) Error() string {
 	return safeBodyToString(e.payload)
 }
 
-type responsesWebsocketClientRetryError struct{}
+type responsesWebsocketClientRetryError struct {
+	code    string
+	message string
+}
 
-func (*responsesWebsocketClientRetryError) Error() string {
+func (e *responsesWebsocketClientRetryError) Error() string {
+	if e != nil && e.message != "" {
+		return e.message
+	}
 	return responsesWebsocketRetryMessage
+}
+
+func (e *responsesWebsocketClientRetryError) responseCode() string {
+	if e != nil && e.code != "" {
+		return e.code
+	}
+	return responsesWebsocketRetryCode
 }
 
 func (s *Server) executeResponsesWebsocketTurn(
@@ -426,7 +446,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 		}
 	}
 
-	candidates, err := s.selectCandidatesByModelAndType(ctx, modelName, string(protocol.Codex))
+	candidates, err := s.selectCandidatesByModelAndClientProtocol(ctx, modelName, string(protocol.Codex))
 	if err != nil {
 		return responsesWebsocketTurnResult{}, fmt.Errorf("select upstream candidates: %w", err)
 	}
@@ -519,6 +539,18 @@ func (s *Server) executeResponsesWebsocketTurn(
 					payload: bytes.Clone(bridgeWriter.failedPayload), forwarded: true,
 				}
 			}
+			interruptedOutput := bridgeWriter.collectedOutput()
+			pendingToolCallIDs := responsesWebsocketPendingToolCallIDs(interruptedOutput)
+			if len(pendingToolCallIDs) > 0 {
+				return responsesWebsocketTurnResult{
+						completedOutput:    interruptedOutput,
+						pendingToolCallIDs: pendingToolCallIDs,
+						interrupted:        true,
+					}, &responsesWebsocketClientRetryError{
+						code:    responsesWebsocketInterruptedCode,
+						message: responsesWebsocketInterruptedMessage,
+					}
+			}
 			return responsesWebsocketTurnResult{}, errors.New("upstream stream closed before response.completed")
 		}
 		return responsesWebsocketTurnResult{
@@ -555,7 +587,7 @@ func responsesWebsocketGenerateDisabled(payload []byte) bool {
 
 func isNativeCodexWebsocketCandidate(candidate *model.Config) bool {
 	return candidate != nil && candidate.Websockets &&
-		protocol.Protocol(candidate.ResolveUpstreamProtocol(string(protocol.Codex))) == protocol.Codex
+		configCanUseUpstreamProtocol(candidate, protocol.Codex)
 }
 
 func isResponsesWebsocketClientRetryAction(action cooldown.Action) bool {
@@ -963,14 +995,17 @@ func writeResponsesWebsocketRateLimit(conn *websocket.Conn, message string) erro
 	)
 }
 
-func writeResponsesWebsocketClientRetryError(conn *websocket.Conn) error {
+func writeResponsesWebsocketClientRetryError(
+	conn *websocket.Conn,
+	retryErr *responsesWebsocketClientRetryError,
+) error {
 	return writeResponsesWebsocketErrorPayload(
 		conn,
 		http.StatusBadGateway,
 		"server_error",
-		"upstream_unavailable",
+		retryErr.responseCode(),
 		"",
-		responsesWebsocketRetryMessage,
+		retryErr.Error(),
 	)
 }
 

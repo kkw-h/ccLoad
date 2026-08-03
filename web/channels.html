@@ -28,13 +28,13 @@
   <script defer src="/web/assets/js/template-engine.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/date-range-selector.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-state.js?v=__VERSION__"></script>
-  <script defer src="/web/assets/js/channels-protocols.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-render.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-filters.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-data.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-import-export.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-keys.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-urls.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/model-entry-parser.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-modals.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-custom-rules.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-cooldown-detection.js?v=__VERSION__"></script>
@@ -76,14 +76,6 @@
         <!-- Filter Bar -->
         <div class="filter-bar">
           <div class="filter-controls channels-filter-controls">
-            <!-- 渠道类型筛选 -->
-            <div class="filter-group">
-              <label class="filter-label" data-i18n="channels.filterChannelType">渠道类型</label>
-              <select id="channelTypeFilter" class="filter-select filter-control--compact">
-                <!-- 动态加载渠道类型选项 -->
-              </select>
-            </div>
-
             <div class="filter-group">
               <label class="filter-label" data-i18n="channels.filterStatus">状态</label>
               <select id="statusFilter" class="filter-select filter-control--compact">
@@ -192,7 +184,7 @@
           </div>
         </div>
 
-        <div id="batchFloatingMenu" class="channel-batch-float" aria-hidden="true">
+        <div id="batchFloatingMenu" class="channel-batch-float" aria-hidden="true" inert>
           <div class="channel-batch-float__content">
             <div class="channel-batch-float__header">
               <div class="channel-batch-selection">
@@ -204,33 +196,76 @@
               <span class="channel-batch-divider" aria-hidden="true"></span>
             </div>
             <div class="channel-batch-actions">
-              <button id="batchEnableChannelsBtn" type="button"
-                class="btn btn-sm channel-batch-action channel-batch-action--enable"
-                data-action="batch-enable-channels" disabled>
-                <span class="channel-batch-action__icon" aria-hidden="true">
-                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M4.5 10.3L8.15 13.95L15.35 6.75" stroke="currentColor" stroke-width="2.2"
-                      stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </span>
-                <span data-i18n="channels.batchEnableChannels">批量启用</span>
-              </button>
-              <button id="batchDisableChannelsBtn" type="button"
-                class="btn btn-sm channel-batch-action channel-batch-action--disable"
-                data-action="batch-disable-channels" disabled>
-                <span class="channel-batch-action__icon" aria-hidden="true">
-                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8" />
-                    <path d="M5.5 5.5L14.5 14.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-                  </svg>
-                </span>
-                <span data-i18n="channels.batchDisableChannels">批量禁用</span>
-              </button>
+              <div class="channel-batch-action-group channel-batch-action-group--state" role="group"
+                data-i18n-aria-label="channels.batchStateActions" aria-label="状态操作">
+                <button id="batchEnableChannelsBtn" type="button"
+                  class="btn btn-sm channel-batch-action channel-batch-action--enable"
+                  data-action="batch-enable-channels" disabled>
+                  <span class="channel-batch-action__icon" aria-hidden="true">
+                    <svg width="16" height="16" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path d="M4.5 10.3L8.15 13.95L15.35 6.75" stroke="currentColor" stroke-width="2.2"
+                        stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </span>
+                  <span data-i18n="channels.batchEnableChannels">启用</span>
+                </button>
+                <button id="batchDisableChannelsBtn" type="button"
+                  class="btn btn-sm channel-batch-action channel-batch-action--disable"
+                  data-action="batch-disable-channels" disabled>
+                  <span class="channel-batch-action__icon" aria-hidden="true">
+                    <svg width="16" height="16" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8" />
+                      <path d="M5.5 5.5L14.5 14.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                    </svg>
+                  </span>
+                  <span data-i18n="channels.batchDisableChannels">禁用</span>
+                </button>
+              </div>
+              <div class="channel-batch-action-group channel-batch-action-group--protocol" role="group"
+                data-i18n-aria-label="channels.batchProtocolMode" aria-label="协议处理">
+                <select id="batchProtocolTransformMode" class="channel-batch-select"
+                  data-i18n-aria-label="channels.batchProtocolMode" aria-label="协议处理" disabled>
+                  <option value="auto" data-i18n="channels.batchProtocolModeAuto">协议：自动</option>
+                  <option value="upstream" data-i18n="channels.batchProtocolModeUpstream">协议：直通</option>
+                  <option value="local" data-i18n="channels.batchProtocolModeLocal">协议：转换</option>
+                </select>
+                <button id="batchApplyProtocolBtn" type="button"
+                  class="btn btn-sm channel-batch-action channel-batch-action--apply"
+                  data-action="batch-set-protocol-mode" disabled>
+                  <span data-i18n="channels.batchApplyProtocol">应用</span>
+                </button>
+              </div>
+              <div class="channel-batch-action-group channel-batch-action-group--refresh" role="group"
+                data-i18n-aria-label="channels.batchModelActions" aria-label="模型操作">
+                <button id="batchRefreshMergeBtn" type="button"
+                  class="btn btn-sm channel-batch-action channel-batch-action--refresh"
+                  data-action="batch-refresh-channels-merge" disabled>
+                  <span data-i18n="channels.batchRefreshMerge">增量</span>
+                </button>
+                <button id="batchRefreshReplaceBtn" type="button"
+                  class="btn btn-sm channel-batch-action channel-batch-action--refresh"
+                  data-action="batch-refresh-channels-replace" disabled>
+                  <span data-i18n="channels.batchRefreshReplace">覆盖</span>
+                </button>
+                <details id="batchRefreshOptions" class="channel-batch-refresh-options">
+                  <summary data-i18n="channels.batchRefreshOptions">刷新选项</summary>
+                  <div class="channel-batch-refresh-options__panel">
+                    <label class="channel-batch-option" for="batchRefreshLowercaseModels">
+                      <input id="batchRefreshLowercaseModels" type="checkbox">
+                      <span data-i18n="channels.batchRefreshLowercaseModels">模型转小写</span>
+                    </label>
+                    <label class="channel-batch-option" for="batchRefreshStripModelSourcePrefix">
+                      <input id="batchRefreshStripModelSourcePrefix" type="checkbox">
+                      <span data-i18n="channels.batchRefreshStripModelSourcePrefix">去来源前缀</span>
+                    </label>
+                  </div>
+                </details>
+              </div>
               <button id="batchDeleteChannelsBtn" type="button"
                 class="btn btn-sm channel-batch-action channel-batch-action--delete"
                 data-action="batch-delete-channels" disabled>
                 <span class="channel-batch-action__icon" aria-hidden="true">
-                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <svg width="16" height="16" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                     <path d="M6.2 6.2H13.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
                     <path d="M7.3 6.2V4.9C7.3 4.4 7.7 4 8.2 4H11.8C12.3 4 12.7 4.4 12.7 4.9V6.2" stroke="currentColor"
                       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
@@ -240,50 +275,8 @@
                       stroke-linecap="round" />
                   </svg>
                 </span>
-                <span data-i18n="channels.batchDeleteChannels">批量删除</span>
+                <span data-i18n="channels.batchDeleteChannels">删除</span>
               </button>
-              <button id="batchRefreshMergeBtn" type="button"
-                class="btn btn-sm channel-batch-action channel-batch-action--refresh"
-                data-action="batch-refresh-channels-merge" disabled>
-                <span class="channel-batch-action__icon" aria-hidden="true">
-                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M15.9 7.5A6.6 6.6 0 0 0 4.2 7.1" stroke="currentColor" stroke-width="1.8"
-                      stroke-linecap="round" />
-                    <path d="M15.8 4.3V7.7H12.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
-                      stroke-linejoin="round" />
-                    <path d="M4.1 12.5A6.6 6.6 0 0 0 15.8 12.9" stroke="currentColor" stroke-width="1.8"
-                      stroke-linecap="round" />
-                    <path d="M4.2 15.7V12.3H7.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
-                      stroke-linejoin="round" />
-                  </svg>
-                </span>
-                <span data-i18n="channels.batchRefreshMerge">模型增量刷新</span>
-              </button>
-              <button id="batchRefreshReplaceBtn" type="button"
-                class="btn btn-sm channel-batch-action channel-batch-action--refresh"
-                data-action="batch-refresh-channels-replace" disabled>
-                <span class="channel-batch-action__icon" aria-hidden="true">
-                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M15.9 7.5A6.6 6.6 0 0 0 4.2 7.1" stroke="currentColor" stroke-width="1.8"
-                      stroke-linecap="round" />
-                    <path d="M15.8 4.3V7.7H12.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
-                      stroke-linejoin="round" />
-                    <path d="M4.1 12.5A6.6 6.6 0 0 0 15.8 12.9" stroke="currentColor" stroke-width="1.8"
-                      stroke-linecap="round" />
-                    <path d="M4.2 15.7V12.3H7.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
-                      stroke-linejoin="round" />
-                  </svg>
-                </span>
-                <span data-i18n="channels.batchRefreshReplace">模型覆盖刷新</span>
-              </button>
-              <label class="channel-batch-option" for="batchRefreshLowercaseModels">
-                <input id="batchRefreshLowercaseModels" type="checkbox">
-                <span data-i18n="channels.batchRefreshLowercaseModels">模型名转小写</span>
-              </label>
-              <label class="channel-batch-option" for="batchRefreshStripModelSourcePrefix">
-                <input id="batchRefreshStripModelSourcePrefix" type="checkbox">
-                <span data-i18n="channels.batchRefreshStripModelSourcePrefix">移除模型来源前缀</span>
-              </label>
             </div>
             <button id="batchFloatingMenuCloseBtn" type="button" class="channel-batch-close"
               data-action="clear-selected-channels" data-i18n-title="common.close" title="关闭" disabled>
@@ -313,31 +306,20 @@
               <label class="form-label channel-editor-inline-label" data-i18n="channels.channelName">渠道名称
                 *</label>
               <input type="text" id="channelName" class="form-input channel-editor-input" required>
+              <button type="button" id="quickAddChannelBtn" class="btn btn-secondary channel-quick-add-button"
+                data-action="open-quick-add-channel" data-i18n-title="channels.quickAdd.button"
+                data-i18n-aria-label="channels.quickAdd.button" title="一键填充渠道配置"
+                aria-label="一键填充渠道配置" hidden>
+                <span class="channel-quick-add-emoji" aria-hidden="true">✨</span>
+              </button>
             </div>
 
             <div class="channel-editor-primary-field channel-editor-primary-field--type">
-              <label class="form-label channel-editor-inline-label channel-editor-inline-label--muted"
-                data-i18n="channels.modal.upstreamProtocol">主协议</label>
-              <div class="channel-editor-radio-group" id="channelTypeRadios">
-                <!-- 动态加载渠道类型 -->
-              </div>
-            </div>
-          </div>
-          <div class="channel-editor-primary-row">
-            <div class="channel-editor-primary-field channel-editor-primary-field--transforms">
-              <div class="channel-editor-inline-group">
-                <label class="form-label channel-editor-inline-label"
-                  data-i18n="channels.modal.protocolTransforms">额外支持</label>
-                <div class="channel-editor-radio-group" id="protocolTransformsContainer">
-                  <!-- 动态渲染额外支持选项 -->
-                </div>
-              </div>
-            </div>
-            <div class="channel-editor-primary-field channel-editor-primary-field--mode">
-              <label class="form-label channel-editor-inline-label"
-                data-i18n="channels.modal.protocolTransformMode">协议处理</label>
-              <div class="channel-editor-radio-group" id="protocolTransformModeContainer">
-                <!-- 动态渲染协议处理选项 -->
+              <div class="channel-editor-protocol-control">
+                <label class="form-label channel-editor-inline-label channel-editor-inline-label--muted"
+                  for="protocolTransformModeInput" data-i18n="channels.modal.protocolTransformMode">协议处理</label>
+                <input id="protocolTransformModeValue" type="hidden" value="auto">
+                <div id="protocolTransformModeSelectContainer" class="channel-editor-protocol-select"></div>
               </div>
             </div>
           </div>
@@ -351,7 +333,7 @@
                 <span data-i18n="channels.apiUrl">API URL *</span> <span class="models-hint channel-editor-section-meta"><span data-i18n="channels.keyCountPrefix">共</span> <span
                     id="inlineUrlCount">0</span> <span data-i18n="channels.urlCountSuffix">个URL</span></span>
                 <span class="models-hint channel-editor-section-meta channel-editor-exact-url-hint"
-                  data-i18n="channels.exactUrlMarkerHint">URL 末尾 # 表示完整上游请求地址，不自动追加协议路径</span>
+                  data-i18n="channels.urlProtocolsHint">为每个 URL 选择上游协议，默认为自动检测</span>
               </label>
               <div class="channel-editor-section-actions">
                 <button type="button" class="btn btn-secondary btn-sm channel-editor-action-btn" data-action="add-inline-url"
@@ -375,9 +357,6 @@
               </div>
             </div>
 
-            <!-- 隐藏字段：与后端保持兼容，提交时按换行拼接 -->
-            <input type="hidden" id="channelUrl" required>
-
             <div class="inline-table-container mobile-inline-table-container">
               <table class="inline-table mobile-inline-table inline-url-table">
                 <thead>
@@ -395,6 +374,7 @@
                         <span class="models-hint inline-url-header-hint" data-i18n="channels.multiUrlStrategyHint">多URL时自动启用智能调度：基于延迟加权随机分发请求，失败URL独立冷却（2min→30min指数退避），优先探索未测试的URL</span>
                       </div>
                     </th>
+                    <th class="inline-url-col-protocols" data-i18n="channels.urlProtocols">支持协议</th>
                     <th class="inline-url-col-exact" data-i18n="channels.fullUrl">完整URL</th>
                     <th class="inline-url-col-actions"></th>
                   </tr>
@@ -527,7 +507,7 @@
             <div class="channel-editor-section-actions channel-editor-section-actions--models">
               <div class="channel-editor-action-row">
                 <button type="button" class="btn btn-secondary btn-sm" data-action="add-common-models"
-                  data-i18n-title="channels.addCommonModelsTitle" title="添加当前渠道类型的常用模型">
+                  data-i18n-title="channels.addCommonModelsTitle" title="选择类型并添加常用模型">
                   <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
                     <path d="M8 1L10 5.5L15 6L11.5 9.5L12.5 14.5L8 12L3.5 14.5L4.5 9.5L1 6L6 5.5L8 1Z"
                       stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
@@ -608,12 +588,12 @@
           <div class="channel-editor-footer">
             <div class="channel-editor-websocket-control">
               <label class="form-label channel-editor-checkbox-label" data-i18n-title="channels.enableWebsocketsHelp"
-                title="仅 Codex 渠道：复用原生上游 Responses WebSocket">
-                <input type="checkbox" id="channelWebsockets"> <span data-i18n="channels.enableWebsockets">原生 WebSocket</span>
+                title="实际使用 Codex Responses 上游协议时复用原生 WebSocket">
+                <input type="checkbox" id="channelWebsockets"> <span data-i18n="channels.enableWebsockets">支持 WS</span>
               </label>
               <button type="button" id="channelWebsocketProbeBtn" class="btn btn-secondary btn-sm channel-websocket-probe-button"
                 data-action="probe-channel-websocket" data-i18n-title="channels.websocketsProbeHelp"
-                title="检测当前上游是否支持原生 WebSocket">
+                title="使用 Codex 协议检测当前上游是否支持原生 WebSocket">
                 <span data-i18n="channels.websocketsProbe">检测</span>
               </button>
             </div>
@@ -626,33 +606,40 @@
               </div>
               <div class="channel-editor-inline-field">
                 <label class="form-label channel-editor-inline-label" for="channelRPMLimit"
-                  data-i18n="channels.rpmLimit">RPM限制</label>
+                  data-i18n="channels.rpmLimit">RPM</label>
                 <input type="number" id="channelRPMLimit" class="form-input" value="0" min="0" step="1"
                   style="width: 74px; min-width: 74px;" data-i18n-placeholder="channels.rpmLimitPlaceholder"
                   placeholder="0=无限制">
               </div>
               <div class="channel-editor-inline-field">
                 <label class="form-label channel-editor-inline-label" for="channelMaxConcurrency"
-                  data-i18n="channels.maxConcurrency">并发限制</label>
+                  data-i18n="channels.maxConcurrency">并发</label>
                 <input type="number" id="channelMaxConcurrency" class="form-input" value="0" min="0" step="1"
                   style="width: 74px; min-width: 74px;" data-i18n-placeholder="channels.maxConcurrencyPlaceholder"
                   placeholder="0=无限制">
               </div>
               <div class="channel-editor-inline-field channel-editor-inline-field--currency">
                 <label class="form-label channel-editor-inline-label" for="channelDailyCostLimit"
-                  data-i18n="channels.dailyCostLimit">每日限额</label>
+                  data-i18n="channels.dailyCostLimit">日限额</label>
                 <div class="channel-editor-inline-field-input">
                   <input type="number" id="channelDailyCostLimit" class="form-input" value="0" min="0" step="1"
                     style="width: 74px; min-width: 74px;" data-i18n-placeholder="channels.dailyCostLimitPlaceholder"
                     placeholder="0=无限制">
                 </div>
               </div>
-              <div class="channel-editor-inline-field">
+              <div class="channel-editor-inline-field channel-editor-inline-field--rate">
                 <label class="form-label channel-editor-inline-label" for="channelCostMultiplier"
-                  data-i18n="channels.costMultiplier">成本倍率</label>
-                <input type="number" id="channelCostMultiplier" class="form-input" value="1" min="0" step="0.01"
-                  style="width: 84px; min-width: 84px;" data-i18n-placeholder="channels.costMultiplierPlaceholder"
-                  placeholder="默认1">
+                  data-i18n="channels.costMultiplier">倍率</label>
+                <div class="channel-editor-inline-field-input channel-editor-rate-input">
+                  <input type="number" id="channelCostMultiplier" class="form-input" value="1" min="0" step="0.01"
+                    style="width: 84px; min-width: 84px;" data-i18n-placeholder="channels.costMultiplierPlaceholder"
+                    placeholder="默认1">
+                  <button type="button" id="fetchSub2APIRateBtn" class="btn btn-secondary btn-sm channel-editor-rate-fetch-btn"
+                    data-action="fetch-sub2api-rate" data-i18n-title="channels.fetchRateTitle"
+                    title="从 Sub2API 获取当前有效倍率">
+                    <span id="fetchSub2APIRateLabel" data-i18n="channels.fetchRate">获取倍率</span>
+                  </button>
+                </div>
               </div>
             </div>
             <div class="channel-editor-footer-actions">
@@ -675,6 +662,86 @@
           </div>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- 一键填充渠道配置模态框 -->
+  <div id="quickAddChannelModal" class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="quickAddChannelTitle" aria-describedby="quickAddChannelDescription" aria-hidden="true">
+    <div class="modal-content modal-content--sm quick-add-channel-modal-content">
+      <div class="modal-header">
+        <h2 id="quickAddChannelTitle" class="modal-title" data-i18n="channels.quickAdd.title">一键填充渠道配置</h2>
+        <button type="button" class="close-btn" data-action="close-quick-add-channel"
+          data-i18n-aria-label="common.close" aria-label="关闭">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"
+            aria-hidden="true" focusable="false">
+            <path d="M10.5 3.5L3.5 10.5M3.5 3.5L10.5 10.5" stroke="currentColor" stroke-width="1.5"
+              stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+      <form id="quickAddChannelForm" class="quick-add-channel-form">
+        <p id="quickAddChannelDescription" class="quick-add-channel-description"
+          data-i18n="channels.quickAdd.description">粘贴包含 API URL 和密钥的文本。系统会解析配置并获取模型，全部成功后再回填表单。</p>
+        <label class="form-label" for="quickAddChannelInput" data-i18n="channels.quickAdd.inputLabel">连接信息</label>
+        <textarea id="quickAddChannelInput" class="form-input quick-add-channel-input" rows="7"
+          autocomplete="off" spellcheck="false" aria-invalid="false"
+          aria-describedby="quickAddChannelDescription quickAddChannelHint quickAddChannelError"
+          data-i18n-placeholder="channels.quickAdd.placeholder"
+          placeholder="OPENAI_BASE_URL=https://api.example.com&#10;OPENAI_API_KEY=sk-..."></textarea>
+        <p id="quickAddChannelHint" class="quick-add-channel-hint" data-i18n="channels.quickAdd.hint">支持 JSON、环境变量、URL/Key 标签文本。密钥仅用于本次模型探测，不会在确认前保存。</p>
+        <p id="quickAddChannelError" class="quick-add-channel-error" role="alert" hidden></p>
+        <div id="quickAddChannelStatus" class="quick-add-channel-status" role="status"></div>
+        <div class="form-actions quick-add-channel-actions">
+          <button type="button" class="btn btn-secondary" data-action="close-quick-add-channel"
+            data-i18n="common.cancel">取消</button>
+          <button type="submit" id="quickAddChannelConfirmBtn" class="btn btn-primary quick-add-channel-confirm">
+            <span class="loading-spinner" aria-hidden="true"></span>
+            <span data-i18n="channels.quickAdd.confirm">检查并填充</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 常用模型类型选择模态框 -->
+  <div id="commonModelsModal" class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="commonModelsModalTitle" aria-describedby="commonModelsModalDescription" aria-hidden="true">
+    <div class="modal-content modal-content--sm common-models-modal-content">
+      <div class="modal-header">
+        <h2 id="commonModelsModalTitle" class="modal-title" data-i18n="channels.commonModelsDialogTitle">选择常用模型类型</h2>
+        <button type="button" class="close-btn" data-action="close-common-models-modal"
+          data-i18n-aria-label="common.close" aria-label="关闭">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"
+            aria-hidden="true" focusable="false">
+            <path d="M10.5 3.5L3.5 10.5M3.5 3.5L10.5 10.5" stroke="currentColor" stroke-width="1.5"
+              stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+      <p id="commonModelsModalDescription" class="common-models-description"
+        data-i18n="channels.commonModelsDialogDescription">可多选；确认后会添加对应类型的全部常用模型，并自动忽略重复项。</p>
+      <fieldset class="common-model-types">
+        <legend data-i18n="channels.commonModelTypeLegend">模型类型</legend>
+        <label class="common-model-type-option">
+          <input type="checkbox" name="commonModelType" value="anthropic">
+          <span>Anthropic</span>
+        </label>
+        <label class="common-model-type-option">
+          <input type="checkbox" name="commonModelType" value="codex">
+          <span>Codex</span>
+        </label>
+        <label class="common-model-type-option">
+          <input type="checkbox" name="commonModelType" value="gemini">
+          <span>Gemini</span>
+        </label>
+      </fieldset>
+      <div class="form-actions common-models-actions">
+        <button type="button" class="btn btn-secondary" data-action="close-common-models-modal"
+          data-i18n="common.cancel">取消</button>
+        <button type="button" class="btn btn-primary" data-action="confirm-common-models"
+          data-i18n="channels.addSelectedCommonModels">添加所选模型</button>
+      </div>
     </div>
   </div>
 
@@ -764,7 +831,8 @@
         <div id="customRulesError" class="custom-rules-error" hidden></div>
       </section>
 
-      <section id="advancedSettingsPanelCooldownDetection" class="advanced-settings-panel hidden" role="tabpanel">
+      <section id="advancedSettingsPanelCooldownDetection" class="advanced-settings-panel hidden" role="tabpanel"
+        data-cooldown-detection-rules-source="channel">
         <div class="cooldown-detection-toolbar">
           <p class="cooldown-detection-intro" data-i18n="channels.cooldownDetection.intro">规则按显示顺序匹配；第一条命中即停止。未命中或动态重置时间无效时，继续使用内置分类。</p>
           <button type="button" class="btn btn-secondary cooldown-detection-add-btn" data-action="add-cooldown-detection-rule"
@@ -834,17 +902,14 @@
       </div>
       <div class="channel-test-grid">
         <div class="form-group channel-test-field">
-          <label class="form-label" for="testChannelType" data-i18n="channels.channelType">渠道类型</label>
-          <select id="testChannelType" class="form-input" data-change-action="update-test-url">
-            <!-- 动态加载渠道类型 -->
-          </select>
-        </div>
-
-        <div class="form-group channel-test-field">
           <label class="form-label" for="testModelSelect" data-i18n="channels.selectTestModel">选择测试模型</label>
           <select id="testModelSelect" class="model-select">
             <!-- 动态填充模型选项 -->
           </select>
+        </div>
+        <div class="form-group channel-test-field">
+          <label class="form-label" for="testClientProtocolSelect" data-i18n="modelTest.clientProtocol">请求协议</label>
+          <select id="testClientProtocolSelect" class="model-select"></select>
         </div>
       </div>
 
@@ -1040,9 +1105,10 @@
         <div class="form-group">
           <label class="form-label"><span data-i18n="channels.inputModelNames">输入模型名称</span>
             <span class="channel-import-hint"
-              data-i18n="channels.keysSeparatorHint">(支持逗号或换行分隔)</span></label>
+              data-i18n="channels.modelSeparatorHint">(逗号或换行分隔)</span></label>
           <textarea id="modelImportTextarea" class="form-input channel-import-textarea" rows="10"
-            placeholder="gpt-4o,gpt-4o-mini&#10;claude-3-5-sonnet-20241022&#10;claude-3-5-haiku-latest"></textarea>
+            data-i18n-placeholder="channels.modelImportPlaceholder"
+            placeholder="gpt-4o|gpt-4.1&#10;gpt-4o-mini&#10;claude-3-5-sonnet-20241022"></textarea>
         </div>
         <div class="channel-import-info">
           <div class="channel-import-info-row">
@@ -1054,11 +1120,11 @@
             <div>
               <strong data-i18n="channels.usageInstructions">使用说明：</strong>
               <ul class="channel-import-info-list">
-                <li><span data-i18n="channels.commaSeparatedModel">支持逗号分隔：</span><code
-                    class="channel-import-code">model1,model2,model3</code>
+                <li><span data-i18n="channels.commaSeparatedModel">重定向格式：</span><code
+                    class="channel-import-code">request-model|redirect-model</code>
                 </li>
-                <li data-i18n="channels.newlineSeparatedModel">支持换行分隔：每行一个模型</li>
-                <li data-i18n="channels.autoDedupModel">自动去除空格、空行和重复模型</li>
+                <li data-i18n="channels.newlineSeparatedModel">无需重定向时只填写请求模型</li>
+                <li data-i18n="channels.autoDedupModel">自动去除空格、空项和重复请求模型</li>
               </ul>
             </div>
           </div>
@@ -1205,6 +1271,11 @@
           placeholder="https://api.example.com"
           style="width: 100%; padding: 4px 7px; border: 1px solid var(--neutral-300); border-radius: 6px; font-family: 'Monaco', 'Menlo', 'Courier New', monospace; font-size: 13px;">
       </td>
+      <td class="inline-url-col-protocols" data-mobile-label="{{mobileLabelProtocols}}">
+        <label class="inline-url-protocol-label" for="inlineURLProtocolInput-{{index}}">{{mobileLabelProtocols}}</label>
+        <div id="inlineURLProtocolSelectContainer-{{index}}"
+          class="channel-editor-protocol-select"></div>
+      </td>
       <td class="inline-url-col-exact inline-url-cell-center" data-mobile-label="{{mobileLabelExactURL}}">
         <label class="inline-url-exact-label" data-i18n-title="channels.fullUrlTitle" title="使用输入的完整URL，不自动追加协议路径">
           <input type="checkbox" class="inline-url-exact-checkbox" data-index="{{index}}" {{exactURLChecked}}>
@@ -1215,14 +1286,14 @@
         <div class="inline-url-actions">
           <button type="button" class="inline-url-test-btn" data-index="{{index}}" data-i18n-title="channels.testThisUrl"
             title="测试此URL"
-            style="width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--surface-border-strong); background: var(--surface-bg-strong); color: var(--neutral-500); cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center; padding: 0;">
+            style="width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--surface-border-strong); background: var(--surface-bg-strong); color: var(--neutral-500); cursor: pointer; transition: color 0.2s, border-color 0.2s, background-color 0.2s; display: inline-flex; align-items: center; justify-content: center; padding: 0;">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
               <path d="M13 2L4 14H11L9 22L20 10H13L13 2Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </button>
           <button type="button" class="inline-url-delete-btn" data-index="{{index}}" data-i18n-title="channels.deleteThisUrl"
             title="删除此URL"
-            style="width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--surface-border-strong); background: var(--surface-bg-strong); color: var(--neutral-500); cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center; padding: 0;">
+            style="width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--surface-border-strong); background: var(--surface-bg-strong); color: var(--neutral-500); cursor: pointer; transition: color 0.2s, border-color 0.2s, background-color 0.2s; display: inline-flex; align-items: center; justify-content: center; padding: 0;">
             <svg width="12" height="12" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
               <path
                 d="M5.5 2.5V1.5C5.5 1.22386 5.72386 1 6 1H8C8.27614 1 8.5 1.22386 8.5 1.5V2.5M2 3.5H12M3 3.5V11.5C3 12.0523 3.44772 12.5 4 12.5H10C10.5523 12.5 11 12.0523 11 11.5V3.5M5.5 6.5V9.5M8.5 6.5V9.5"
@@ -1236,7 +1307,7 @@
 
   <template id="tpl-url-empty">
     <tr>
-      <td colspan="4" style="padding: 20px; text-align: center; color: var(--neutral-500);">
+      <td colspan="5" style="padding: 20px; text-align: center; color: var(--neutral-500);">
         {{message}}
       </td>
     </tr>
@@ -1252,13 +1323,12 @@
       <td class="ch-col-name">
         <div class="ch-name-cell">
           <div class="ch-name-line">
-            <div class="ch-name-main">{{{typeBadge}}}<strong>{{name}}</strong>{{{protocolTransformBadges}}}</div>
+            <div class="ch-name-main"><strong>{{name}}</strong>{{{nameMultiplierBadge}}}</div>
           </div>
           <div class="ch-url-line" title="{{url}}">{{url}}</div>
           <div class="ch-refresh-result-slot">{{{batchRefreshStatusHtml}}}</div>
           {{{healthHtml}}}
           <div class="ch-last-request-slot ch-last-request-slot--desktop">{{{lastRequestFailureHtml}}}</div>
-          {{{nameMultiplierBadge}}}
         </div>
       </td>
       <td class="ch-col-models" data-mobile-label="{{mobileLabelModels}}">
@@ -1331,14 +1401,26 @@
         <div class="redirect-target-field">
           <input type="text" class="redirect-to-input modal-inline-input" data-index="{{index}}" value="{{to}}"
             placeholder="{{toPlaceholder}}">
-          <button type="button" class="redirect-delete-btn" data-index="{{index}}"
-            data-i18n-title="channels.deleteThisModel" title="删除此模型">
-            <svg width="12" height="12" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path
-                d="M5.5 2.5V1.5C5.5 1.22386 5.72386 1 6 1H8C8.27614 1 8.5 1.22386 8.5 1.5V2.5M2 3.5H12M3 3.5V11.5C3 12.0523 3.44772 12.5 4 12.5H10C10.5523 12.5 11 12.0523 11 11.5V3.5M5.5 6.5V9.5M8.5 6.5V9.5"
-                stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-          </button>
+          <div class="redirect-row-actions">
+            <button type="button" class="redirect-model-toggle-btn" data-index="{{index}}"></button>
+            <button type="button" class="redirect-model-test-btn" data-index="{{index}}"
+              title="测试此模型" aria-label="测试此模型">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"
+                aria-hidden="true" focusable="false">
+                <path d="M13 2L4 14H11L9 22L20 10H13V2Z" stroke="currentColor" stroke-width="1.8"
+                  stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button type="button" class="redirect-delete-btn" data-index="{{index}}"
+              data-i18n-title="channels.deleteThisModel" title="删除此模型" aria-label="删除此模型">
+              <svg width="12" height="12" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"
+                aria-hidden="true" focusable="false">
+                <path
+                  d="M5.5 2.5V1.5C5.5 1.22386 5.72386 1 6 1H8C8.27614 1 8.5 1.22386 8.5 1.5V2.5M2 3.5H12M3 3.5V11.5C3 12.0523 3.44772 12.5 4 12.5H10C10.5523 12.5 11 12.0523 11 11.5V3.5M5.5 6.5V9.5M8.5 6.5V9.5"
+                  stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+          </div>
         </div>
       </td>
       <td class="redirect-col-status" data-mobile-label="{{mobileLabelStatus}}"></td>

@@ -23,6 +23,9 @@ var ErrFingerprintJobsBusy = errors.New("too many running fingerprint jobs")
 // ErrFingerprintJobsClosed is returned after the manager begins shutdown.
 var ErrFingerprintJobsClosed = errors.New("fingerprint jobs are shutting down")
 
+// ErrFingerprintNameConflict is returned when a calibration name is already in use.
+var ErrFingerprintNameConflict = errors.New("fingerprint baseline name already exists")
+
 // FingerprintJobType 区分标定 vs 测试任务。
 type FingerprintJobType string
 
@@ -119,22 +122,26 @@ func (j *fpJob) finish(status string, result any, errStr string, now time.Time) 
 
 // calibrateReq POST /fingerprints/calibrate body。
 type calibrateReq struct {
-	Name        string `json:"name" binding:"required"`
-	ChannelID   int64  `json:"channel_id" binding:"required"`
-	Model       string `json:"model" binding:"required"`
-	Iterations  int    `json:"iterations"`
-	Concurrency int    `json:"concurrency"`
-	KeyIndex    int    `json:"key_index"`
+	Name           string `json:"name" binding:"required"`
+	ChannelID      int64  `json:"channel_id" binding:"required"`
+	Model          string `json:"model" binding:"required"`
+	ClientProtocol string `json:"client_protocol"`
+	Iterations     int    `json:"iterations"`
+	Concurrency    int    `json:"concurrency"`
+	KeyIndex       int    `json:"key_index"`
+	Stream         bool   `json:"stream"`
 }
 
 // testFingerprintReq POST /fingerprints/test body。
 type testFingerprintReq struct {
-	ChannelID     int64  `json:"channel_id" binding:"required"`
-	Model         string `json:"model" binding:"required"`
-	FingerprintID *int64 `json:"fingerprint_id"`
-	Iterations    int    `json:"iterations"`
-	Concurrency   int    `json:"concurrency"`
-	KeyIndex      int    `json:"key_index"`
+	ChannelID      int64  `json:"channel_id" binding:"required"`
+	Model          string `json:"model" binding:"required"`
+	ClientProtocol string `json:"client_protocol"`
+	FingerprintID  *int64 `json:"fingerprint_id"`
+	Iterations     int    `json:"iterations"`
+	Concurrency    int    `json:"concurrency"`
+	KeyIndex       int    `json:"key_index"`
+	Stream         bool   `json:"stream"`
 }
 
 // FingerprintJobManager 管理内存 job（最多 2 个同时运行，完成后保留 1h）。
@@ -142,11 +149,12 @@ type FingerprintJobManager struct {
 	maxRunning int
 	parentCtx  context.Context
 
-	mu      sync.Mutex
-	jobs    map[string]*fpJob
-	running int
-	closing bool
-	wg      sync.WaitGroup
+	mu               sync.Mutex
+	jobs             map[string]*fpJob
+	calibratingNames map[string]struct{}
+	running          int
+	closing          bool
+	wg               sync.WaitGroup
 }
 
 // NewFingerprintJobManager 构造，maxRunning ≤ 0 归 2。
@@ -158,9 +166,10 @@ func NewFingerprintJobManager(parentCtx context.Context, maxRunning int) *Finger
 		maxRunning = 2
 	}
 	return &FingerprintJobManager{
-		maxRunning: maxRunning,
-		parentCtx:  parentCtx,
-		jobs:       make(map[string]*fpJob),
+		maxRunning:       maxRunning,
+		parentCtx:        parentCtx,
+		jobs:             make(map[string]*fpJob),
+		calibratingNames: make(map[string]struct{}),
 	}
 }
 
@@ -201,16 +210,16 @@ func (m *FingerprintJobManager) StartCalibrate(s *Server, req calibrateReq) (str
 		return "", fmt.Errorf("invalid params: %s", errMsg)
 	}
 
-	ctx, j, err := m.startJob(FingerprintJobCalibrate, iters)
+	ctx, j, err := m.startJob(FingerprintJobCalibrate, iters, req.Name)
 	if err != nil {
 		return "", err
 	}
 
 	go func() {
-		defer m.finishJob()
+		defer m.finishJob(req.Name)
 		defer j.cancel()
 
-		samples, cancelled, sampleErr := m.runSampling(ctx, j, s, req.ChannelID, req.Model, req.KeyIndex, iters, conc)
+		samples, cancelled, sampleErr := m.runSampling(ctx, j, s, req.ChannelID, req.Model, req.ClientProtocol, req.KeyIndex, req.Stream, iters, conc)
 		if cancelled {
 			j.finish("cancelled", nil, "cancelled", time.Now())
 			return
@@ -229,19 +238,19 @@ func (m *FingerprintJobManager) StartCalibrate(s *Server, req calibrateReq) (str
 		dist := util.FingerprintDistribution(samples)
 		utilStats := util.CalculateFingerprintStats(samples)
 		fp := &model.ModelFingerprint{
-			Name:          req.Name,
-			ChannelID:     &req.ChannelID,
-			Model:         req.Model,
-			SampleCount:   len(samples),
-			Distribution:  dist,
-			Stats:         statsToModel(utilStats),
-			RawData:       samples,
-			PromptVersion: util.FingerprintPromptVersion,
+			Name:           req.Name,
+			ChannelID:      &req.ChannelID,
+			Model:          req.Model,
+			SampleCount:    len(samples),
+			Distribution:   dist,
+			Stats:          statsToModel(utilStats),
+			RawData:        samples,
+			PromptVersion:  util.FingerprintPromptVersion,
+			ClientProtocol: req.ClientProtocol,
 		}
 		// 尝试获取渠道元信息快照
 		if cfg, err := s.store.GetConfig(ctx, req.ChannelID); err == nil && cfg != nil {
 			fp.ChannelName = cfg.Name
-			fp.ChannelType = cfg.ChannelType
 		}
 
 		if ctx.Err() != nil {
@@ -271,16 +280,16 @@ func (m *FingerprintJobManager) StartTest(s *Server, req testFingerprintReq) (st
 		return "", fmt.Errorf("invalid params: %s", errMsg)
 	}
 
-	ctx, j, err := m.startJob(FingerprintJobTest, iters)
+	ctx, j, err := m.startJob(FingerprintJobTest, iters, "")
 	if err != nil {
 		return "", err
 	}
 
 	go func() {
-		defer m.finishJob()
+		defer m.finishJob("")
 		defer j.cancel()
 
-		samples, cancelled, sampleErr := m.runSampling(ctx, j, s, req.ChannelID, req.Model, req.KeyIndex, iters, conc)
+		samples, cancelled, sampleErr := m.runSampling(ctx, j, s, req.ChannelID, req.Model, req.ClientProtocol, req.KeyIndex, req.Stream, iters, conc)
 		if cancelled {
 			j.finish("cancelled", nil, "cancelled", time.Now())
 			return
@@ -413,11 +422,16 @@ func (m *FingerprintJobManager) StartTest(s *Server, req testFingerprintReq) (st
 }
 
 // startJob reserves a slot and registers a job atomically with manager shutdown.
-func (m *FingerprintJobManager) startJob(jobType FingerprintJobType, iters int) (context.Context, *fpJob, error) {
+func (m *FingerprintJobManager) startJob(jobType FingerprintJobType, iters int, calibrationName string) (context.Context, *fpJob, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closing {
 		return nil, nil, ErrFingerprintJobsClosed
+	}
+	if calibrationName != "" {
+		if _, exists := m.calibratingNames[calibrationName]; exists {
+			return nil, nil, fmt.Errorf("%w: %q", ErrFingerprintNameConflict, calibrationName)
+		}
 	}
 	if m.running >= m.maxRunning {
 		return nil, nil, fmt.Errorf("%w (%d/%d)", ErrFingerprintJobsBusy, m.running, m.maxRunning)
@@ -437,13 +451,17 @@ func (m *FingerprintJobManager) startJob(jobType FingerprintJobType, iters int) 
 	}
 	m.evictExpired()
 	m.jobs[id] = j
+	if calibrationName != "" {
+		m.calibratingNames[calibrationName] = struct{}{}
+	}
 	m.running++
 	m.wg.Add(1)
 	return ctx, j, nil
 }
 
-func (m *FingerprintJobManager) finishJob() {
+func (m *FingerprintJobManager) finishJob(calibrationName string) {
 	m.mu.Lock()
+	delete(m.calibratingNames, calibrationName)
 	m.running--
 	m.mu.Unlock()
 	m.wg.Done()
@@ -500,7 +518,9 @@ func (m *FingerprintJobManager) runSampling(
 	s *Server,
 	channelID int64,
 	modelName string,
+	clientProtocol string,
 	keyIndex int,
+	stream bool,
 	iterations, concurrency int,
 ) (samples []int, cancelled bool, err error) {
 	cfg, err := s.store.GetConfig(ctx, channelID)
@@ -555,10 +575,10 @@ func (m *FingerprintJobManager) runSampling(
 				}
 				testReq := &testutil.TestChannelRequest{
 					Model:           modelName,
+					ClientProtocol:  clientProtocol,
 					Content:         util.FingerprintPrompt,
-					MaxTokens:       10,
 					Temperature:     &temp,
-					Stream:          false,
+					Stream:          stream,
 					KeyIndex:        keyIndex,
 					WaitForCapacity: true,
 				}
@@ -568,7 +588,7 @@ func (m *FingerprintJobManager) runSampling(
 					cfg,
 					model.LogSourceManualTest,
 					requestedModel,
-					testReq.Model,
+					channelTestActualModel(result, testReq.Model),
 					apiKey,
 					"",
 					testReq.ThinkingEffort,

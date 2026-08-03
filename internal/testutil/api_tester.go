@@ -351,15 +351,6 @@ func applyGeminiSamplingAndSystemPrompt(obj map[string]any, req *TestChannelRequ
 	}
 }
 
-func appendAnthropicSystemPrompt(obj map[string]any, prompt string) {
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
-		return
-	}
-	system, _ := obj["system"].([]any)
-	obj["system"] = append(system, map[string]any{"type": "text", "text": prompt})
-}
-
 func normalizeTestThinkingEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "":
@@ -517,28 +508,89 @@ func applyGeminiTestOptions(body []byte, req *TestChannelRequest) ([]byte, error
 
 func applyAnthropicTestOptions(body []byte, req *TestChannelRequest) ([]byte, error) {
 	effort := normalizeTestThinkingEffort(req.ThinkingEffort)
-	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) {
+	if len(req.Messages) == 0 && effort == "" && !req.BuiltinSearch &&
+		req.Temperature == nil && req.TopP == nil && strings.TrimSpace(req.SystemPrompt) == "" {
 		return body, nil
 	}
-	return patchBodyObject(body, func(obj map[string]any) {
-		setOpenAILikeSampling(obj, req, "max_tokens")
-		appendAnthropicSystemPrompt(obj, req.SystemPrompt)
-		if effort == "none" {
-			obj["thinking"] = map[string]any{"type": "disabled"}
-		} else if effort != "" {
-			obj["thinking"] = map[string]any{"type": "adaptive"}
-			obj["output_config"] = map[string]any{"effort": testAnthropicOutputEffort(effort)}
+
+	// RawMessage keeps the template's nested objects byte-for-byte while this
+	// struct fixes the top-level Anthropic field order. Decoding into map here
+	// used to scramble Claude Code's request fingerprint whenever sampling
+	// options were present.
+	type anthropicRequestBody struct {
+		Model        sonic.NoCopyRawMessage `json:"model"`
+		Messages     sonic.NoCopyRawMessage `json:"messages"`
+		System       sonic.NoCopyRawMessage `json:"system"`
+		Tools        sonic.NoCopyRawMessage `json:"tools"`
+		Metadata     sonic.NoCopyRawMessage `json:"metadata"`
+		MaxTokens    int                    `json:"max_tokens"`
+		Temperature  *float64               `json:"temperature,omitempty"`
+		TopP         *float64               `json:"top_p,omitempty"`
+		Thinking     map[string]any         `json:"thinking,omitempty"`
+		OutputConfig map[string]any         `json:"output_config,omitempty"`
+		Stream       bool                   `json:"stream"`
+	}
+
+	var obj anthropicRequestBody
+	if err := sonic.Unmarshal(body, &obj); err != nil {
+		return nil, err
+	}
+	obj.Temperature = req.Temperature
+	obj.TopP = req.TopP
+
+	if len(req.Messages) > 0 {
+		messages, err := sonic.Marshal(toAnthropicMessages(req.Messages))
+		if err != nil {
+			return nil, err
 		}
-		if req.BuiltinSearch {
-			appendTestTool(obj, map[string]any{
-				"type": "web_search_20250305",
-				"name": "web_search",
-			})
+		obj.Messages = sonic.NoCopyRawMessage(messages)
+	}
+
+	appendRawArrayItem := func(raw sonic.NoCopyRawMessage, item any) (sonic.NoCopyRawMessage, error) {
+		var items []sonic.NoCopyRawMessage
+		if err := sonic.Unmarshal(raw, &items); err != nil {
+			return nil, err
 		}
-	})
+		encoded, err := sonic.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, sonic.NoCopyRawMessage(encoded))
+		encoded, err = sonic.Marshal(items)
+		return sonic.NoCopyRawMessage(encoded), err
+	}
+
+	if prompt := strings.TrimSpace(req.SystemPrompt); prompt != "" {
+		var err error
+		obj.System, err = appendRawArrayItem(obj.System, struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{Type: "text", Text: prompt})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if effort == "none" {
+		obj.Thinking = map[string]any{"type": "disabled"}
+	} else if effort != "" {
+		obj.Thinking = map[string]any{"type": "adaptive"}
+		obj.OutputConfig = map[string]any{"effort": testAnthropicOutputEffort(effort)}
+	}
+	if req.BuiltinSearch {
+		var err error
+		obj.Tools, err = appendRawArrayItem(obj.Tools, struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		}{Type: "web_search_20250305", Name: "web_search"})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return sonic.Marshal(obj)
 }
 
-// ChannelTester 定义不同渠道类型的测试协议（OCP：新增类型无需修改调用方）
+// ChannelTester 定义不同上游协议的测试器（OCP：新增协议无需修改调用方）
 type ChannelTester interface {
 	// Build 构造完整请求：URL、基础请求头、请求体
 	// apiKey: 实际使用的API Key字符串（由调用方从数据库查询）
@@ -638,7 +690,7 @@ func buildTesterURL(baseURL, endpointSuffix string) string {
 	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + endpointSuffix
 }
 
-// CodexTester 兼容 Codex 风格（渠道类型: codex）
+// CodexTester 兼容 Codex 风格协议。
 type CodexTester struct{}
 
 // Build 构建 Codex 格式的 API 请求
@@ -758,7 +810,7 @@ func (t *CodexTester) Parse(_ int, respBody []byte) map[string]any {
 	return parseAPIResponse(respBody, extractCodexResponseText, "usage")
 }
 
-// OpenAITester 标准OpenAI API格式（渠道类型: openai）
+// OpenAITester 使用标准 OpenAI API 格式。
 type OpenAITester struct{}
 
 // Build 构建 OpenAI 格式的 API 请求
@@ -948,12 +1000,6 @@ func (t *AnthropicTester) Build(cfg *model.Config, apiKey string, req *TestChann
 		return "", nil, nil, err
 	}
 
-	if len(req.Messages) > 0 {
-		body, err = patchMessagesInBody(body, "messages", toAnthropicMessages(req.Messages))
-		if err != nil {
-			return "", nil, nil, err
-		}
-	}
 	body, err = applyAnthropicTestOptions(body, req)
 	if err != nil {
 		return "", nil, nil, err

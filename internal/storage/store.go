@@ -31,11 +31,9 @@ type Store interface {
 	CreateConfig(ctx context.Context, c *model.Config) (*model.Config, error)
 	UpdateConfig(ctx context.Context, id int64, upd *model.Config) (*model.Config, error)
 	UpdateChannelEnabled(ctx context.Context, id int64, enabled bool) (*model.Config, error)
+	BatchUpdateProtocolTransformMode(ctx context.Context, channelIDs []int64, mode string) (int64, error)
 	DeleteConfig(ctx context.Context, id int64) error
 	GetEnabledChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error)
-	GetEnabledChannelsByModelAndProtocol(ctx context.Context, modelName, protocol string) ([]*model.Config, error)
-	GetEnabledChannelsByType(ctx context.Context, channelType string) ([]*model.Config, error)
-	GetEnabledChannelsByExposedProtocol(ctx context.Context, protocol string) ([]*model.Config, error)
 	BatchUpdatePriority(ctx context.Context, updates []struct {
 		ID       int64
 		Priority int
@@ -74,6 +72,7 @@ type Store interface {
 	SetKeyCooldown(ctx context.Context, channelID int64, keyIndex int, until time.Time) error
 	// Model-level cooldown
 	GetAllModelCooldowns(ctx context.Context) (map[int64]map[string]time.Time, error)
+	BumpModelCooldown(ctx context.Context, channelID int64, model string, now time.Time, statusCode int) (time.Duration, error)
 	SetModelCooldown(ctx context.Context, channelID int64, model string, until time.Time) error
 	ResetModelCooldown(ctx context.Context, channelID int64, model string) error
 
@@ -96,11 +95,12 @@ type Store interface {
 
 	// === Metrics & Statistics ===
 	AggregateRangeWithFilter(ctx context.Context, since, until time.Time, bucket time.Duration, filter *model.LogFilter) ([]model.MetricPoint, error)
-	GetDistinctModels(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]string, error)
-	GetDistinctStatusCodes(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]int, error)
-	GetDistinctChannels(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]model.ChannelNameID, error)
+	GetDistinctModels(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]string, error)
+	GetDistinctStatusCodes(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]int, error)
+	GetDistinctChannels(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]model.ChannelNameID, error)
 	GetStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) ([]model.StatsEntry, error)
 	GetStatsLite(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.StatsEntry, error) // 轻量版：跳过RPM计算和渠道名填充
+	GetClientProtocolStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.ClientProtocolStats, error)
 	GetRPMStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) (*model.RPMStats, error)
 	GetChannelSuccessRates(ctx context.Context, since time.Time) (map[int64]model.ChannelHealthStats, error)
 	GetHealthTimeline(ctx context.Context, params model.HealthTimelineParams) ([]model.HealthTimelineRow, error)
@@ -143,6 +143,7 @@ type Store interface {
 	// === Model Fingerprint Management ===
 	ListModelFingerprints(ctx context.Context) ([]*model.ModelFingerprint, error)
 	GetModelFingerprint(ctx context.Context, id int64) (*model.ModelFingerprint, error)
+	ModelFingerprintNameExists(ctx context.Context, name string) (bool, error)
 	CreateModelFingerprint(ctx context.Context, fp *model.ModelFingerprint) (*model.ModelFingerprint, error)
 	DeleteModelFingerprint(ctx context.Context, id int64) error
 	ClearFingerprintChannelID(ctx context.Context, channelID int64) error

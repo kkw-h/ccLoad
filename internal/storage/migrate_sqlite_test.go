@@ -5,8 +5,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
+	"ccLoad/internal/model"
 	"ccLoad/internal/storage/schema"
 
 	_ "modernc.org/sqlite"
@@ -21,6 +26,62 @@ func openTestDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func TestMigrate_SQLite_AddsProtocolTransformModeWithAutoDefault(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channels (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			url TEXT NOT NULL,
+			priority INTEGER NOT NULL DEFAULT 0,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			cooldown_until INTEGER NOT NULL DEFAULT 0,
+			cooldown_duration_ms INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		INSERT INTO channels(name, url, created_at, updated_at)
+		VALUES('legacy', 'https://example.com
+https://example.com/v1/messages#', 1, 1)
+	`); err != nil {
+		t.Fatalf("create legacy channels: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy channels: %v", err)
+	}
+	columns, err := sqliteExistingColumns(ctx, db, "channels")
+	if err != nil {
+		t.Fatalf("list channels columns: %v", err)
+	}
+	if !columns["protocol_transform_mode"] {
+		t.Fatalf("channels missing protocol_transform_mode: %v", columns)
+	}
+	var mode string
+	if err := db.QueryRowContext(ctx, "SELECT protocol_transform_mode FROM channels WHERE name='legacy'").Scan(&mode); err != nil {
+		t.Fatalf("read migrated mode: %v", err)
+	}
+	if mode != "auto" {
+		t.Fatalf("migrated mode=%q, want auto", mode)
+	}
+	var rawURLs string
+	if err := db.QueryRowContext(ctx, "SELECT url FROM channels WHERE name='legacy'").Scan(&rawURLs); err != nil {
+		t.Fatalf("read migrated URLs: %v", err)
+	}
+	var urls model.ChannelURLs
+	if err := json.Unmarshal([]byte(rawURLs), &urls); err != nil {
+		t.Fatalf("migrated URLs are not structured JSON: %v (%q)", err, rawURLs)
+	}
+	if len(urls) != 2 || urls[0].URL != "https://example.com" || urls[0].Exact ||
+		urls[1].URL != "https://example.com/v1/messages" || !urls[1].Exact {
+		t.Fatalf("migrated URLs=%+v", urls)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("second migrate must be idempotent: %v", err)
+	}
 }
 
 func TestMigrate_SQLite_FullFlow(t *testing.T) {
@@ -75,6 +136,399 @@ func TestMigrate_SQLite_FullFlow(t *testing.T) {
 	}
 	if val != "{}" || valueType != "json" || defaultValue != "{}" {
 		t.Fatalf("global_cooldown_detection_rules=%q/%q/%q, want {}/json/{}", val, valueType, defaultValue)
+	}
+}
+
+func TestMigrate_SQLite_RenamesDuplicateModelFingerprintNames(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE model_fingerprints (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			channel_id INTEGER,
+			channel_name TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL,
+			actual_model TEXT NOT NULL DEFAULT '',
+			channel_type TEXT NOT NULL DEFAULT '',
+			client_protocol TEXT NOT NULL DEFAULT '',
+			sample_count INTEGER NOT NULL DEFAULT 0,
+			distribution TEXT NOT NULL,
+			stats TEXT NOT NULL,
+			raw_data TEXT NOT NULL,
+			prompt_version TEXT NOT NULL DEFAULT 'v1',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)
+	`); err != nil {
+		t.Fatalf("create legacy fingerprints table: %v", err)
+	}
+
+	longName := strings.Repeat("界", 191)
+	records := []struct {
+		name        string
+		model       string
+		sampleCount int
+		createdAt   int64
+	}{
+		{name: "duplicate-baseline", model: "model-a", sampleCount: 11, createdAt: 30},
+		{name: "duplicate-baseline", model: "model-b", sampleCount: 12, createdAt: 10},
+		{name: "duplicate-baseline", model: "model-c", sampleCount: 13, createdAt: 20},
+		{name: "collision", model: "collision-original", sampleCount: 21, createdAt: 1},
+		{name: "collision-1", model: "collision-suffix", sampleCount: 22, createdAt: 2},
+		{name: "collision", model: "collision-duplicate", sampleCount: 23, createdAt: 3},
+		{name: longName, model: "long-original", sampleCount: 31, createdAt: 1},
+		{name: longName, model: "long-duplicate", sampleCount: 32, createdAt: 2},
+	}
+	for _, record := range records {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO model_fingerprints
+				(name, model, sample_count, distribution, stats, raw_data, created_at, updated_at)
+			VALUES (?, ?, ?, '[]', '{}', '[]', ?, ?)
+		`, record.name, record.model, record.sampleCount, record.createdAt, record.createdAt); err != nil {
+			t.Fatalf("insert legacy fingerprint %s: %v", record.model, err)
+		}
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate duplicate fingerprints: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("second migration must be idempotent: %v", err)
+	}
+
+	want := map[string]struct {
+		name        string
+		sampleCount int
+	}{
+		"model-a":             {name: "duplicate-baseline-2", sampleCount: 11},
+		"model-b":             {name: "duplicate-baseline", sampleCount: 12},
+		"model-c":             {name: "duplicate-baseline-1", sampleCount: 13},
+		"collision-original":  {name: "collision", sampleCount: 21},
+		"collision-suffix":    {name: "collision-1", sampleCount: 22},
+		"collision-duplicate": {name: "collision-2", sampleCount: 23},
+		"long-original":       {name: longName, sampleCount: 31},
+		"long-duplicate":      {name: strings.Repeat("界", 189) + "-1", sampleCount: 32},
+	}
+	rows, err := db.QueryContext(ctx, `SELECT model, name, sample_count FROM model_fingerprints`)
+	if err != nil {
+		t.Fatalf("query migrated fingerprints: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	seen := 0
+	for rows.Next() {
+		var modelName, name string
+		var sampleCount int
+		if err := rows.Scan(&modelName, &name, &sampleCount); err != nil {
+			t.Fatalf("scan migrated fingerprint: %v", err)
+		}
+		expected, ok := want[modelName]
+		if !ok {
+			t.Fatalf("unexpected migrated model %q", modelName)
+		}
+		if name != expected.name || sampleCount != expected.sampleCount {
+			t.Errorf("model=%q got (name=%q,samples=%d), want (name=%q,samples=%d)",
+				modelName, name, sampleCount, expected.name, expected.sampleCount)
+		}
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migrated fingerprints: %v", err)
+	}
+	if seen != len(want) {
+		t.Fatalf("migrated row count=%d, want %d", seen, len(want))
+	}
+}
+
+func TestMigrate_SQLite_RollsBackFingerprintRenamesOnFailure(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, schema.DefineModelFingerprintsTable().BuildSQLite()); err != nil {
+		t.Fatalf("create fingerprints table: %v", err)
+	}
+	insert := `
+		INSERT INTO model_fingerprints
+			(name, model, distribution, stats, raw_data, created_at, updated_at)
+		VALUES (?, ?, '[]', '{}', '[]', ?, ?)
+	`
+	for _, record := range []struct {
+		name      string
+		model     string
+		createdAt int64
+	}{
+		{name: "alpha", model: "alpha-original", createdAt: 1},
+		{name: "alpha", model: "alpha-duplicate", createdAt: 2},
+		{name: "zeta", model: "zeta-original", createdAt: 3},
+		{name: "zeta", model: "zeta-fail", createdAt: 4},
+	} {
+		if _, err := db.ExecContext(ctx, insert, record.name, record.model, record.createdAt, record.createdAt); err != nil {
+			t.Fatalf("insert fingerprint %s: %v", record.model, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TRIGGER fail_fingerprint_rename
+		BEFORE UPDATE OF name ON model_fingerprints
+		WHEN OLD.model = 'zeta-fail'
+		BEGIN
+			SELECT RAISE(ABORT, 'forced fingerprint rename failure');
+		END
+	`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+
+	err := migrate(ctx, db, DialectSQLite)
+	if err == nil || !strings.Contains(err.Error(), "forced fingerprint rename failure") {
+		t.Fatalf("migrate error=%v, want forced rename failure", err)
+	}
+
+	rows, err := db.QueryContext(ctx, `SELECT name FROM model_fingerprints ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query fingerprints after rollback: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan fingerprint after rollback: %v", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate fingerprints after rollback: %v", err)
+	}
+	want := []string{"alpha", "alpha", "zeta", "zeta"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("names after rollback=%v, want %v", names, want)
+	}
+}
+
+func TestMigrate_SQLite_EnforcesUniqueModelFingerprintNames(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	insert := `
+		INSERT INTO model_fingerprints
+			(name, model, distribution, stats, raw_data, created_at, updated_at)
+		VALUES (?, ?, '[]', '{}', '[]', 1, 1)
+	`
+	if _, err := db.ExecContext(ctx, insert, "unique-baseline", "model-a"); err != nil {
+		t.Fatalf("insert first fingerprint: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, insert, "unique-baseline", "model-b"); err == nil {
+		t.Fatal("database must reject a duplicate fingerprint name")
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_fingerprints`).Scan(&count); err != nil {
+		t.Fatalf("count fingerprints: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("fingerprints count=%d, want 1", count)
+	}
+}
+
+func TestMigrateSQLite_BackfillsClientProtocolFromHistoricalModels(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+	verifyClientProtocolBackfill(t, ctx, db, DialectSQLite, func(ctx context.Context, db *sql.DB) error {
+		return migrate(ctx, db, DialectSQLite)
+	})
+}
+
+func TestBackfillLogsClientProtocolBatches_ProcessesAllRowsAcrossBatches(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+
+	const rowCount = 5
+	for i := 1; i <= rowCount; i++ {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO logs (time, model, log_source, status_code, message)
+			VALUES (?, 'claude-sonnet-5', 'proxy', 200, 'ok')
+		`, i); err != nil {
+			t.Fatalf("insert log %d: %v", i, err)
+		}
+	}
+
+	// batchSize=2 强制多批循环，验证批间推进直到清零
+	if err := backfillLogsClientProtocolBatches(ctx, db, DialectSQLite, 2); err != nil {
+		t.Fatalf("backfill batches: %v", err)
+	}
+
+	var filled int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM logs WHERE log_source = 'proxy' AND client_protocol = 'anthropic'",
+	).Scan(&filled); err != nil {
+		t.Fatalf("count filled rows: %v", err)
+	}
+	if filled != rowCount {
+		t.Fatalf("filled rows = %d, want %d", filled, rowCount)
+	}
+}
+
+func verifyClientProtocolBackfill(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+	dialect Dialect,
+	migrateDB func(context.Context, *sql.DB) error,
+) {
+	t.Helper()
+	testCases := []struct {
+		time           int64
+		model          string
+		logSource      string
+		clientProtocol string
+		wantProtocol   string
+	}{
+		{1, "gpt-5.6-sol", "proxy", "", "codex"},
+		{2, "OpenAI/GPT-5.4", "proxy", "", "codex"},
+		{3, "codex-mini-latest", "proxy", "", "codex"},
+		{4, "claude-sonnet-5", "proxy", "", "anthropic"},
+		{5, "anthropic/opus-4-8", "proxy", "", "anthropic"},
+		{6, "google/gemini-3.6-flash", "proxy", "", "gemini"},
+		{7, "grok-4.5", "proxy", "", "openai"},
+		{8, "", "proxy", "", "openai"},
+		{9, "gpt-5.6-sol", "scheduled_check", "", ""},
+		{10, "gpt-5.6-sol", "proxy", "gemini", "gemini"},
+	}
+	for _, tc := range testCases {
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, `
+			INSERT INTO logs (time, model, log_source, client_protocol, status_code, message)
+			VALUES (?, ?, ?, ?, 200, 'ok')
+		`), tc.time, tc.model, tc.logSource, tc.clientProtocol); err != nil {
+			t.Fatalf("insert log time=%d: %v", tc.time, err)
+		}
+	}
+	// model_fingerprints 历史行：client_protocol 为空时从保留的 channel_type 物理列复制
+	fingerprintCases := []struct {
+		name           string
+		channelType    string
+		clientProtocol string
+		wantProtocol   string
+	}{
+		{"fp-legacy-backfill", "anthropic", "", "anthropic"},
+		{"fp-already-set", "openai", "gemini", "gemini"},
+		{"fp-both-empty", "", "", ""},
+	}
+	for _, fp := range fingerprintCases {
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, `
+			INSERT INTO model_fingerprints (name, model, channel_type, client_protocol, distribution, stats, raw_data, created_at, updated_at)
+			VALUES (?, 'fp-model', ?, ?, '{}', '{}', '{}', 0, 0)
+		`), fp.name, fp.channelType, fp.clientProtocol); err != nil {
+			t.Fatalf("insert fingerprint %s: %v", fp.name, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, "DELETE FROM schema_migrations WHERE version = ?"), clientProtocolBackfillMigrationVersion); err != nil {
+		t.Fatalf("reset client protocol migration: %v", err)
+	}
+
+	if err := migrateDB(ctx, db); err != nil {
+		t.Fatalf("backfill client protocol: %v", err)
+	}
+	for _, tc := range testCases {
+		var got string
+		if err := db.QueryRowContext(ctx, rebindIfPostgres(dialect, "SELECT client_protocol FROM logs WHERE time = ?"), tc.time).Scan(&got); err != nil {
+			t.Fatalf("query log time=%d: %v", tc.time, err)
+		}
+		if got != tc.wantProtocol {
+			t.Errorf("model=%q source=%q protocol=%q, want %q", tc.model, tc.logSource, got, tc.wantProtocol)
+		}
+	}
+	for _, fp := range fingerprintCases {
+		var got string
+		if err := db.QueryRowContext(ctx, rebindIfPostgres(dialect, "SELECT client_protocol FROM model_fingerprints WHERE name = ?"), fp.name).Scan(&got); err != nil {
+			t.Fatalf("query fingerprint %s: %v", fp.name, err)
+		}
+		if got != fp.wantProtocol {
+			t.Errorf("fingerprint=%q protocol=%q, want %q", fp.name, got, fp.wantProtocol)
+		}
+	}
+
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, `
+		INSERT INTO logs (time, model, log_source, status_code, message)
+		VALUES (11, 'gpt-5.6-terra', 'proxy', 200, 'after migration')
+	`)); err != nil {
+		t.Fatalf("insert post-migration log: %v", err)
+	}
+	if err := migrateDB(ctx, db); err != nil {
+		t.Fatalf("idempotent migrate: %v", err)
+	}
+	var postMigrationProtocol string
+	if err := db.QueryRowContext(ctx, "SELECT client_protocol FROM logs WHERE time = 11").Scan(&postMigrationProtocol); err != nil {
+		t.Fatalf("query post-migration log: %v", err)
+	}
+	if postMigrationProtocol != "" {
+		t.Fatalf("post-migration protocol=%q, want empty", postMigrationProtocol)
+	}
+}
+
+func TestMigrate_SQLite_AddsModelCooldownDuration(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE channel_model_cooldowns"); err != nil {
+		t.Fatalf("drop current model cooldown table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channel_model_cooldowns (
+			channel_id INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			cooldown_until INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (channel_id, model),
+			FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+		)
+	`); err != nil {
+		t.Fatalf("create legacy model cooldown table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO channels (name, url, created_at, updated_at)
+		VALUES ('legacy-model-cooldown', 'https://api.example.com', 700, 700)
+	`); err != nil {
+		t.Fatalf("create legacy cooldown channel: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO channel_model_cooldowns (channel_id, model, cooldown_until, updated_at)
+		VALUES (1, 'legacy-model', 1000, 700)
+	`); err != nil {
+		t.Fatalf("insert legacy model cooldown: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("upgrade migrate: %v", err)
+	}
+
+	columns, err := sqliteExistingColumns(ctx, db, "channel_model_cooldowns")
+	if err != nil {
+		t.Fatalf("read model cooldown columns: %v", err)
+	}
+	if !columns["cooldown_duration_ms"] {
+		t.Fatal("channel_model_cooldowns.cooldown_duration_ms was not migrated")
+	}
+
+	var durationMs int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT cooldown_duration_ms
+		FROM channel_model_cooldowns
+		WHERE channel_id = 1 AND model = 'legacy-model'
+	`).Scan(&durationMs); err != nil {
+		t.Fatalf("read migrated model cooldown duration: %v", err)
+	}
+	if durationMs != int64(5*time.Minute/time.Millisecond) {
+		t.Fatalf("migrated model cooldown duration=%dms, want %dms", durationMs, 5*time.Minute/time.Millisecond)
 	}
 }
 
@@ -570,12 +1024,19 @@ func TestMigrateSQLite_BackfillsAuthTokenEffectiveCostFromLegacyLogs(t *testing.
 	if !cols["upstream_websocket"] {
 		t.Fatal("upstream_websocket column not found in logs")
 	}
+	if !cols["client_protocol"] {
+		t.Fatal("client_protocol column not found in logs")
+	}
 	var upstreamWebsocket int
-	if err := db.QueryRowContext(ctx, `SELECT upstream_websocket FROM logs WHERE time = 60000`).Scan(&upstreamWebsocket); err != nil {
+	var clientProtocol string
+	if err := db.QueryRowContext(ctx, `SELECT upstream_websocket, client_protocol FROM logs WHERE time = 60000`).Scan(&upstreamWebsocket, &clientProtocol); err != nil {
 		t.Fatalf("query legacy upstream_websocket: %v", err)
 	}
 	if upstreamWebsocket != 0 {
 		t.Fatalf("legacy upstream_websocket=%d, want 0", upstreamWebsocket)
+	}
+	if clientProtocol != "openai" {
+		t.Fatalf("legacy client_protocol=%q, want openai", clientProtocol)
 	}
 
 	var effectiveCost float64
@@ -608,6 +1069,49 @@ func TestEnsureChannelModelsRedirectField_SQLite(t *testing.T) {
 	}
 	if !cols["redirect_model"] {
 		t.Fatal("redirect_model column not found in channel_models")
+	}
+}
+
+func TestMigrateSQLite_AddsChannelModelsDisabled(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channel_models (
+			channel_id INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			redirect_model TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (channel_id, model)
+		)
+	`); err != nil {
+		t.Fatalf("create legacy channel_models: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy channel_models: %v", err)
+	}
+
+	cols, err := sqliteExistingColumns(ctx, db, "channel_models")
+	if err != nil {
+		t.Fatalf("sqliteExistingColumns: %v", err)
+	}
+	if !cols["disabled"] {
+		t.Fatal("disabled column not added to legacy channel_models")
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO channel_models (channel_id, model, redirect_model, created_at)
+		VALUES (1, 'legacy-model', '', 1)
+	`); err != nil {
+		t.Fatalf("insert legacy-shaped model: %v", err)
+	}
+	var disabled int
+	if err := db.QueryRowContext(ctx, `SELECT disabled FROM channel_models WHERE model = 'legacy-model'`).Scan(&disabled); err != nil {
+		t.Fatalf("query migrated disabled default: %v", err)
+	}
+	if disabled != 0 {
+		t.Fatalf("legacy model disabled=%d, want 0", disabled)
 	}
 }
 
@@ -687,8 +1191,8 @@ func TestMigrateModelRedirectsData_WithLegacyData(t *testing.T) {
 
 	// 插入带旧格式数据的渠道
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO channels (name, channel_type, url, priority, enabled, models, model_redirects, created_at, updated_at)
-		VALUES ('test-ch', 'openai', 'https://api.example.com', 10, 1, '["gpt-4o","gpt-3.5-turbo"]', '{"gpt-3.5-turbo":"gpt-4o-mini"}', unixepoch(), unixepoch())
+		INSERT INTO channels (name, url, priority, enabled, models, model_redirects, created_at, updated_at)
+		VALUES ('test-ch', 'https://api.example.com', 10, 1, '["gpt-4o","gpt-3.5-turbo"]', '{"gpt-3.5-turbo":"gpt-4o-mini"}', unixepoch(), unixepoch())
 	`)
 	if err != nil {
 		t.Fatalf("insert channel: %v", err)
@@ -788,8 +1292,8 @@ func TestRepairLegacyChannelModelOrder_SQLite(t *testing.T) {
 	}
 
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO channels (id, name, channel_type, url, priority, enabled, models, model_redirects, created_at, updated_at)
-		VALUES (1, 'repair-order', 'openai', 'https://api.example.com', 10, 1, '["z-model","a-model"]', '{}', 100, 100)
+		INSERT INTO channels (id, name, url, priority, enabled, models, model_redirects, created_at, updated_at)
+		VALUES (1, 'repair-order', 'https://api.example.com', 10, 1, '["z-model","a-model"]', '{}', 100, 100)
 	`)
 	if err != nil {
 		t.Fatalf("insert legacy channel: %v", err)
@@ -881,6 +1385,7 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		"log_retention_days",
 		"max_key_retries",
 		"upstream_first_byte_timeout",
+		"upstream_connection_reuse_limit_seconds",
 		"stream_timeout",
 		"non_stream_timeout",
 		"anthropic_first_byte_timeout",
@@ -932,6 +1437,9 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		}
 		if key == "external_auth_enabled" && val != "false" {
 			t.Errorf("setting %q default = %q, want false", key, val)
+		}
+		if key == "upstream_connection_reuse_limit_seconds" && val != "0" {
+			t.Errorf("setting %q default = %q, want 0", key, val)
 		}
 		if key == "responses_ws_max_connections" && val != "64" {
 			t.Errorf("setting %q default = %q, want 64", key, val)

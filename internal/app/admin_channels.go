@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
-	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
@@ -54,15 +53,19 @@ func filterConfigs(cfgs []*model.Config, keep func(*model.Config) bool) []*model
 	return out
 }
 
-func channelExposesProtocol(cfg *model.Config, normalizedProtocol string) bool {
-	if util.NormalizeChannelType(cfg.ChannelType) == normalizedProtocol {
-		return true
+func configHasURLProtocol(cfg *model.Config, configuredProtocol string) bool {
+	configuredProtocol = strings.ToLower(strings.TrimSpace(configuredProtocol))
+	if cfg == nil || configuredProtocol == "" {
+		return false
 	}
-	for _, transform := range cfg.ProtocolTransforms {
-		if strings.TrimSpace(transform) == "" {
+	for _, entry := range cfg.URLs {
+		if configuredProtocol == "auto" {
+			if entry.UsesAutomaticProtocolDetection() {
+				return true
+			}
 			continue
 		}
-		if util.NormalizeChannelType(transform) == normalizedProtocol {
+		if !entry.UsesAutomaticProtocolDetection() && entry.SupportsProtocol(configuredProtocol) {
 			return true
 		}
 	}
@@ -152,18 +155,16 @@ func (s *Server) handleListChannels(c *gin.Context) {
 }
 
 // applyChannelListFilters 串联应用所有列表过滤条件：
-//   - type: 渠道类型（标准化比较）
+//   - protocol: URL 显式声明的协议，或 auto（存在未声明协议的 URL）
 //   - channel_name | search: 名称精确/模糊（互斥，channel_name 优先）
 //   - status: enabled / disabled / cooldown（cooldown 依赖 channelCooldownsMap）
 //   - model | model_like: 模型精确/模糊（互斥，model 优先）
 //
 // 空字符串或 "all" 视为不过滤。
 func applyChannelListFilters(cfgs []*model.Config, c *gin.Context, channelCooldownsMap map[int64]time.Time, now time.Time) []*model.Config {
-	// type
-	if t := c.Query("type"); t != "" && t != "all" {
-		normalized := util.NormalizeChannelType(t)
+	if configuredProtocol := strings.TrimSpace(c.Query("protocol")); configuredProtocol != "" && configuredProtocol != "all" {
 		cfgs = filterConfigs(cfgs, func(cfg *model.Config) bool {
-			return channelExposesProtocol(cfg, normalized)
+			return configHasURLProtocol(cfg, configuredProtocol)
 		})
 	}
 
@@ -367,7 +368,7 @@ func (s *Server) HandleChannelsFilterOptions(c *gin.Context) {
 	}
 	cfgs = filterChannelOptionConfigs(
 		cfgs,
-		strings.TrimSpace(c.Query("type")),
+		strings.TrimSpace(c.Query("protocol")),
 		strings.TrimSpace(c.Query("status")),
 		cooldowns,
 		time.Now(),
@@ -377,7 +378,7 @@ func (s *Server) HandleChannelsFilterOptions(c *gin.Context) {
 
 // HandleCheckDuplicateChannel 检测渠道是否与已有渠道重复
 // POST /admin/channels/check-duplicate
-// 判断条件：channel_type 相同 且 任意 URL 行与已有渠道任意 URL 行相交
+// 判断条件：任意规范化 URL 与已有渠道相交。
 func (s *Server) HandleCheckDuplicateChannel(c *gin.Context) {
 	var req CheckDuplicateRequest
 	if err := BindAndValidate(c, &req); err != nil {
@@ -385,15 +386,10 @@ func (s *Server) HandleCheckDuplicateChannel(c *gin.Context) {
 		return
 	}
 
-	normalizedType := util.NormalizeChannelType(req.ChannelType)
-
 	// 构建新渠道 URL 集合（去除空行）
 	newURLSet := make(map[string]struct{}, len(req.URLs))
-	for _, u := range req.URLs {
-		u = strings.TrimSpace(u)
-		if u != "" {
-			newURLSet[u] = struct{}{}
-		}
+	for _, entry := range req.URLs {
+		newURLSet[entry.RuntimeURL()] = struct{}{}
 	}
 
 	cfgs, err := s.store.ListConfigs(c.Request.Context())
@@ -404,21 +400,13 @@ func (s *Server) HandleCheckDuplicateChannel(c *gin.Context) {
 
 	var duplicates []DuplicateChannelInfo
 	for _, cfg := range cfgs {
-		if util.NormalizeChannelType(cfg.ChannelType) != normalizedType {
-			continue
-		}
 		// 遍历已有渠道的 URL 行，检查是否与新渠道 URL 有交集
-		for line := range strings.SplitSeq(cfg.URL, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
+		for _, line := range cfg.GetURLs() {
 			if _, ok := newURLSet[line]; ok {
 				duplicates = append(duplicates, DuplicateChannelInfo{
-					ID:          cfg.ID,
-					Name:        cfg.Name,
-					ChannelType: cfg.ChannelType,
-					URL:         cfg.URL,
+					ID:   cfg.ID,
+					Name: cfg.Name,
+					URLs: cfg.URLs.Clone(),
 				})
 				break // 同一渠道只报告一次
 			}
@@ -584,7 +572,7 @@ func (s *Server) HandleChannelModelStats(c *gin.Context) {
 	RespondJSON(c, http.StatusOK, result)
 }
 
-// HandleChannelURLStats 返回多URL渠道各URL的实时状态（延迟、冷却）
+// HandleChannelURLStats 返回渠道各URL的实时状态（延迟、冷却）
 // GET /admin/channels/:id/url-stats
 func (s *Server) HandleChannelURLStats(c *gin.Context) {
 	id, err := ParseInt64Param(c, "id")
@@ -600,7 +588,7 @@ func (s *Server) HandleChannelURLStats(c *gin.Context) {
 	}
 
 	urls := cfg.GetURLs()
-	if len(urls) <= 1 || s.urlSelector == nil {
+	if len(urls) == 0 || s.urlSelector == nil {
 		RespondJSON(c, http.StatusOK, []URLStat{})
 		return
 	}
@@ -1201,6 +1189,75 @@ func (s *Server) HandleBatchSetEnabled(c *gin.Context) {
 		"unchanged":       unchanged,
 		"not_found":       notFound,
 		"not_found_count": len(notFound),
+	})
+}
+
+// HandleBatchSetProtocolTransformMode updates protocol handling for selected channels.
+// POST /admin/channels/batch-protocol-mode
+func (s *Server) HandleBatchSetProtocolTransformMode(c *gin.Context) {
+	var req struct {
+		ChannelIDs            []int64 `json:"channel_ids"`
+		ProtocolTransformMode string  `json:"protocol_transform_mode"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		RespondError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	rawMode := strings.TrimSpace(req.ProtocolTransformMode)
+	mode := model.NormalizeProtocolTransformMode(rawMode)
+	if rawMode == "" || mode == "" {
+		RespondError(c, http.StatusBadRequest, fmt.Errorf("invalid protocol_transform_mode: %q (allowed: auto, upstream, local)", req.ProtocolTransformMode))
+		return
+	}
+
+	channelIDs := normalizeBatchChannelIDs(req.ChannelIDs)
+	if len(channelIDs) == 0 {
+		RespondError(c, http.StatusBadRequest, fmt.Errorf("channel_ids cannot be empty"))
+		return
+	}
+
+	ctx := c.Request.Context()
+	changedIDs := make([]int64, 0, len(channelIDs))
+	notFound := make([]int64, 0)
+	unchanged := 0
+	for _, channelID := range channelIDs {
+		cfg, err := s.store.GetConfig(ctx, channelID)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				notFound = append(notFound, channelID)
+				continue
+			}
+			RespondError(c, http.StatusInternalServerError, err)
+			return
+		}
+		if cfg.GetProtocolTransformMode() == mode {
+			unchanged++
+			continue
+		}
+		changedIDs = append(changedIDs, channelID)
+	}
+
+	updated := int64(0)
+	if len(changedIDs) > 0 {
+		var err error
+		updated, err = s.store.BatchUpdateProtocolTransformMode(ctx, changedIDs, mode)
+		if err != nil {
+			log.Printf("批量更新协议处理失败: %v", err)
+			RespondError(c, http.StatusInternalServerError, err)
+			return
+		}
+		s.InvalidateChannelListCache()
+	}
+
+	RespondJSON(c, http.StatusOK, gin.H{
+		"protocol_transform_mode": mode,
+		"total":                   len(channelIDs),
+		"updated":                 updated,
+		"unchanged":               unchanged,
+		"not_found":               notFound,
+		"not_found_count":         len(notFound),
 	})
 }
 

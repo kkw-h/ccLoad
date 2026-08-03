@@ -46,7 +46,7 @@ ccLoad handles those cases with:
 - **Automatic failover**: Failed keys, models, channels, and URLs are skipped according to the classified error scope.
 - **Model-aware cooldown**: Structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, and model-unavailable 404 errors all cool only the actual upstream model first; other models on the same channel remain available. The channel is promoted to cooldown only after every configured model or every enabled key is cooling.
 - **Multi-URL scheduling**: A single channel can use multiple upstream URLs, weighted by observed latency and health.
-- **Multi-protocol handling**: Each channel has one primary protocol plus optional additional protocols, handled by upstream passthrough or ccLoad translation.
+- **Per-URL protocol routing**: Each URL can declare the upstream wire protocols it accepts. Explicit declarations route directly; an empty declaration tries the client protocol first and caches the working fallback.
 - **Responses WebSocket bridging**: Authenticated Codex clients can keep a downstream WebSocket while each candidate uses native Codex WebSocket or the existing HTTP/SSE transport.
 - **Live monitoring**: Active requests, logs, token usage, TTFB, cost, and upstream details are visible in the web dashboard.
 - **Soft-error detection**: HTTP 200 responses that are actually errors trigger the same failover path as regular upstream failures. Common cases include:
@@ -61,7 +61,7 @@ ccLoad handles those cases with:
 - 🧮 **Local Token Counting** - API-compliant local token estimation, <5ms response, 93%+ accuracy, supports large-scale tool scenarios
 - 🎯 **Smart Error Classification** - Distinguishes Key/Model/Channel/Client errors, soft error detection (200 masquerading as error), SSE rate-limit errors as 429, 1308 quota handling
 - 🔀 **Smart Routing** - Priority + smooth weighted round-robin channel selection, **pre-filters cooled channels**, multi-key load balancing, **health-based dynamic sorting** (confidence factor prevents small sample over-penalization)
-- 🛡️ **Failover** - Key/channel failures use exponential backoff; model cooldowns (structured responses, 5xx, 429, model-unavailable 404) honor the upstream reset deadline and switch channels without cooling the whole channel
+- 🛡️ **Failover** - Key, model, and channel failures share one exponential-backoff policy; explicit upstream reset deadlines take priority, and model-scoped failures switch channels without cooling the whole channel
 - 🔒 **Race-Safe** - Key selector race condition protection, startup config validation, automatic resource cleanup
 - 📊 **Real-time Monitoring** - Built-in trend analysis, logging, and stats dashboard, **Token usage stats** with time range selection and per-token classification
 - 🎯 **Transparent Proxy** - Supports Claude Code, Codex, Gemini, and OpenAI compatible APIs with smart auth detection
@@ -81,7 +81,7 @@ ccLoad handles those cases with:
 - 💵 **service_tier Pricing** - OpenAI priority/flex/default tier multipliers for accurate cost accounting
 - 🖼️ **Image Tool Billing** - Responses image_generation/gpt-image-2 cost accounting
 - 📉 **Tiered Pricing** - GPT-5.4/Qwen-Plus/Gemini long-context step pricing, auto-applies lower rate at token thresholds
-- 🔄 **Multi-Protocol Handling** - One primary protocol plus additional protocols, with all 12 local conversion paths available when upstream passthrough is not appropriate
+- 🔄 **Per-URL Protocol Routing** - Explicit Anthropic/OpenAI/Codex/Gemini capability per URL, with native-first automatic detection when left empty
 - 💬 **Conversational Model Testing** - Channel/model/chat testing modes with image upload, reasoning level, built-in search, and chat export
 - 🔍 **Debug Logs** - Upstream request/response raw data capture with sensitive header masking, essential for troubleshooting
 - 🕐 **Scheduled Checks** - Background periodic channel availability probing, auto-detect failed channels
@@ -91,7 +91,7 @@ ccLoad handles those cases with:
 
 ## 🏗️ Architecture Overview
 
-Each channel has one primary protocol and zero or more additional protocols. `upstream` (Upstream Passthrough) forwards each client protocol natively, while `local` (ccLoad Translation) converts additional protocols into the primary protocol at the Registry boundary.
+Every channel accepts all four client protocols. Upstream protocol selection is controlled by `protocol_transform_mode` and each structured URL's `protocols` declaration. `upstream` is strict client-protocol passthrough. `auto` tries the client protocol first, then probes OpenAI → Anthropic → Codex → Gemini while skipping the protocol already attempted, and advances only after an uncommitted capability error. `local` prioritizes URLs with explicit declarations and follows each URL's declared order; only when every URL is undeclared does it try Anthropic → Codex → OpenAI → Gemini. Incompatible URLs are skipped without a request or cooldown. Successful automatic detection is cached per URL and request family until restart or channel configuration changes; an all-unsupported result is probed again after 10 minutes.
 
 ```mermaid
 graph TB
@@ -567,12 +567,11 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 The downstream and upstream WebSockets are independent. Authenticated clients can always upgrade `GET /v1/responses` or the Codex direct-route alias `GET /backend-api/codex/responses`; a channel's `websockets` field only controls whether ccLoad tries a native Codex upstream WebSocket. Channels without that field still participate through the HTTP/SSE bridge and remain eligible for failover.
 
-In `/web/channels.html`, select a Codex channel, enable **Native WebSocket**, and run **Probe**. For the Admin API, the relevant fields are shown below. Keep `url` as an `http://` or `https://` URL; ccLoad converts the scheme to `ws://` or `wss://` for native upstream WebSocket requests:
+In `/web/channels.html`, select a channel with a Codex-capable URL, enable **Native WebSocket**, and run **Probe**. For the Admin API, the relevant fields are shown below. Keep the URL as an `http://` or `https://` URL; ccLoad converts the scheme to `ws://` or `wss://` for native upstream WebSocket requests:
 
 ```json
 {
-  "channel_type": "codex",
-  "url": "https://upstream.example.com",
+  "urls": [{"url": "https://upstream.example.com", "protocols": ["codex"]}],
   "websockets": true
 }
 ```
@@ -610,13 +609,15 @@ Failover applies only to upstream errors classified as retryable key-, model-, o
 
 For the same-upstream native WebSocket reconnect, `response.created`, `response.queued`, and `response.in_progress` are non-semantic, so ccLoad may still reconnect once after those events; every other event crosses that reconnect boundary. Those three lifecycle events are still visible events committed downstream, so they do not imply that cross-candidate failover remains available. Once text, reasoning, a tool call, or another actual output has been forwarded, ccLoad does not switch or replay, avoiding duplicate output, tool calls, and charges. Oversized messages close with code `1009` and do not fail over.
 
+`upstream_connection_reuse_limit_seconds` limits how long upstream HTTP/1.1, HTTP/2, and WebSocket connections remain reusable, including connections in channel proxy pools. The default `0` leaves reuse unlimited. When a connection reaches a positive limit, it stops accepting new requests; an idle connection closes immediately, while an active request or turn finishes before closure. The next request opens a new physical connection. A native WebSocket reconnect replays the complete session transcript because an upstream Response ID is scoped to the physical WebSocket connection; this planned rotation is not reported as a request failure and does not cool down the channel.
+
 Reconnects must use the same API token and stable execution headers. `Session-Id` identifies the top-level Codex session; when `Thread-Id` is present, ccLoad combines both headers so the parent and every subagent thread own independent transcripts, Response IDs, and turn locks. Clients without `Thread-Id` retain the `Session-Id`-only contract. `prompt_cache_key`, body `session_id`, and other cache-routing hints do not identify an execution session and never serialize or share local conversation state. An execution session is in-memory and process-local: by default, at most 32 sessions are retained. New installations and setting resets use a 15-minute idle TTL (10 minutes is suitable for small-memory hosts); upgrades update only the default metadata and preserve the configured value, so an existing 60-minute TTL remains 60 minutes. After all downstream attachments have been gone for five minutes, the one-minute cleanup loop closes the physical upstream connection, so actual reclamation takes about 5–6 minutes while the transcript remains until the session TTL. A stable session and its committed transcript are never evicted by session-capacity or memory-budget pressure before that TTL expires. When the session ceiling is full, only a new session identity is rejected; an existing stable session may continue. The process-wide transcript payload budget defaults to 128 MiB. Once the committed payload is over budget, every new turn, including turns on existing sessions, is rejected before upstream work starts. Both limits use a WebSocket `429/rate_limit_error/rate_limit` event; retry after TTL reclamation, or change the setting and restart. A restart loses in-memory sessions, so the client must then resend the complete conversation input without `previous_response_id`.
 
 The transcript budget is an admission threshold, not a strict allocation cap: turns already admitted are allowed to complete and commit. The finite worst-case overshoot is `responses_ws_max_sessions × max_body_bytes` in addition to the configured budget. Process restarts do not restore sessions or cumulative session metrics. Multi-instance deployments need sticky routing so reconnects reach the same instance. Otherwise, the client must send the complete conversation input without `previous_response_id`. Adjust session count, TTL, and transcript budget with `responses_ws_max_sessions`, `responses_ws_session_ttl_minutes`, and `responses_ws_max_transcript_bytes` in system settings. `GET /admin/runtime-metrics` reports the current effective payload as `transcript_bytes`; it excludes the Go runtime, WebSocket buffers, and temporary request-processing objects. The same response also exposes cumulative `ttl_expired`, `capacity_rejected`, `budget_rejected`, and `previous_response_misses` counters for the current process.
 
 **Codex Alpha Search (Native Passthrough Only)**:
 
-`POST /v1/alpha/search` accepts the native Codex search payload. The `model` field is optional. This endpoint is forwarded only to channels whose resolved upstream protocol is Codex; it is not handled by local cross-protocol transforms.
+`POST /v1/alpha/search` accepts the native Codex search payload. The `model` field is optional. This request family has no local conversion path: ccLoad tries the native endpoint, caches endpoint-missing responses per URL, and moves to the next URL or channel.
 
 ```bash
 curl -X POST http://localhost:8080/v1/alpha/search \
@@ -627,7 +628,7 @@ curl -X POST http://localhost:8080/v1/alpha/search \
   }'
 ```
 
-For a regular channel base URL, ccLoad appends `/v1/alpha/search`. If the channel uses the trailing `#` exact-URL marker, the configured URL must already point to this endpoint, for example `https://upstream.example.com/v1/alpha/search#`. Responses-only fields `prompt_cache_key` and `prompt_cache_retention` are removed before forwarding.
+For a regular channel base URL, ccLoad appends `/v1/alpha/search`. For an exact URL, set `exact: true` and make `url` point to the complete endpoint, for example `{"url":"https://upstream.example.com/v1/alpha/search","exact":true,"protocols":["codex"]}`. Responses-only fields `prompt_cache_key` and `prompt_cache_retention` are removed before forwarding.
 
 ### Local Token Counting
 
@@ -662,27 +663,30 @@ curl -X POST http://localhost:8080/v1/messages/count_tokens \
 Manage channels via Web interface `/web/channels.html` or API:
 
 ```bash
-# Add channel (supports multiple URLs, comma-separated)
+# Add a channel with per-URL protocol capabilities
 curl -X POST http://localhost:8080/admin/channels \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Claude-API",
     "api_key": "sk-ant-api03-xxx",
-    "url": "https://api.anthropic.com,https://api2.anthropic.com",
-    "channel_type": "anthropic",
-    "protocol_transforms": [],
-    "protocol_transform_mode": "upstream",
+    "urls": [
+      {"url": "https://api.anthropic.com", "protocols": ["anthropic"]},
+      {"url": "https://api2.anthropic.com"}
+    ],
+    "protocol_transform_mode": "auto",
     "priority": 10,
     "rpm_limit": 0,
     "max_concurrency": 0,
-    "models": ["claude-sonnet-4-6", "claude-opus-4-6"],
+    "models": [{"model": "claude-sonnet-4-6"}, {"model": "claude-opus-4-6"}],
     "enabled": true
   }'
 ```
 
-> **Multi-protocol configuration**: “Primary Protocol” maps to `channel_type`; it controls model discovery, scheduled checks, and fallback behavior when no client protocol is available. “Additional Protocols” map to `protocol_transforms`. The default `protocol_transform_mode=upstream` (Upstream Passthrough) forwards the client's actual protocol natively and is intended for upstreams where one URL/key supports several protocols. `local` (ccLoad Translation) converts additional protocols into the primary protocol. Protocol is not a unique property of a key or model name, so this configuration remains explicit instead of being guessed at runtime.
+> **Protocol behavior**: Each `urls` entry may list `protocols` (`anthropic`, `codex`, `openai`, `gemini`). A non-empty list is authoritative. `upstream` only passes through the client protocol; `auto` starts with the client protocol, then detects OpenAI → Anthropic → Codex → Gemini without retrying the client protocol; `local` prefers declared URLs and their configured protocol order. If every URL is undeclared in `local` mode, ccLoad tries Anthropic → Codex → OpenAI → Gemini.
 
-> **Multi-URL Note**: The `url` field supports comma-separated multiple URLs. The system uses latency-weighted random selection for optimal URL choice, with automatic cooldown for failed URLs, enabling URL-level load balancing and failover within a single channel.
+> **Multi-URL Note**: `urls` is an ordered array of `{url, exact, protocols}` objects. `exact: true` means the URL is already the complete upstream request URL. The system uses latency-weighted selection and independent URL cooldown; local mode first partitions explicitly declared URLs ahead of automatic ones while preserving order inside each group.
+
+> **Model Entry Note**: each `models` element is `{model, redirect_model, disabled}`. `redirect_model` rewrites the model name sent upstream while clients keep requesting the original name. `disabled: true` removes that model from the channel entirely — it stops being advertised, matched (exact or fuzzy), and cooled down, without deleting the entry. When you refresh the model list in `replace` mode, existing disabled flags are carried over to the newly fetched entries by original name, normalized alias, and redirect target, so a refresh does not silently re-enable models you turned off.
 
 > **RPM Limit Note**: `rpm_limit` is a per-channel request cap over a rolling 60-second window; `0` means unlimited. Proxy forwarding, manual tests, single-URL tests, and scheduled checks all count toward the cap. Multi-URL failover counts each actual upstream HTTP request. The counter is in-memory: restart clears it, and multiple instances count independently.
 
@@ -752,9 +756,9 @@ curl -X POST -H "Authorization: Bearer your_token" \
 
 **CSV Format Example**:
 ```csv
-name,api_key,url,priority,models,enabled
-Claude-API-1,sk-ant-xxx,https://api.anthropic.com,10,"[\"claude-sonnet-4-6\"]",true
-Claude-API-2,sk-ant-yyy,https://api.anthropic.com,5,"[\"claude-opus-4-6\"]",true
+name,api_key,urls,priority,models,enabled
+Claude-API-1,sk-ant-xxx,"[{""url"":""https://api.anthropic.com"",""protocols"":[""anthropic""]}]",10,claude-sonnet-4-6,true
+Claude-API-2,sk-ant-yyy,"[{""url"":""https://api.anthropic.com""}]",5,claude-opus-4-6,true
 ```
 
 **Features**:
@@ -831,11 +835,11 @@ Check out the awesome admin dashboard 👇
   - `admin_auth_tokens.go`: API access token CRUD (with token stats, cost limits, model/channel restrictions, concurrency limits)
   - `admin_settings.go`: System settings management
   - `admin_models.go`: Model list management
-  - `admin_testing.go`: Channel testing (with protocol transform testing)
+  - `admin_testing.go`: Channel testing with an explicit client request protocol
   - `admin_debug_log.go`: Debug log API (sensitive header masking + base64 binary encoding)
   - `channel_check_scheduler.go`: Scheduled channel check scheduler
   - `detection_log.go`: Detection result to LogEntry builder
-- **Protocol Transform System** (2026-07 core refresh):
+- **Protocol Transform System**:
   - `protocol/types.go`: Four protocol definitions (Anthropic/OpenAI/Gemini/Codex)
   - `protocol/registry.go`: Contract boundary for request, streaming response, and non-stream response transforms; same-protocol traffic bypasses conversion
   - `protocol/builtin/register.go`: Registers all 12 directed cross-protocol pairs
@@ -843,9 +847,9 @@ Check out the awesome admin dashboard 👇
   - `protocol/cliproxy/`: In-tree snapshot of the pure [CLIProxyAPI](https://github.com/caidaoli/CLIProxyAPI) conversion core; provenance and synchronization rules live in [`UPSTREAM.md`](internal/protocol/cliproxy/UPSTREAM.md)
   - Upstream refresh workflow: invoke `$sync-cliproxy-core` in Codex or `/sync-cliproxy-core` in Claude Code; both resolve to the same repository Skill under `.agents/skills/`
   - Requests that cannot be represented in the selected upstream protocol return `400 Bad Request`; they do not trigger channel failover or cooldown
-  - Two protocol handling modes: `upstream` (default, Upstream Passthrough) / `local` (ccLoad Translation)
-  - Channel config: `ChannelType` (primary protocol) + `ProtocolTransforms` (additional protocols) + `ProtocolTransformMode` (protocol handling)
-  - Codex `/v1/alpha/search` is native passthrough only and never enters local protocol translation
+  - Every channel accepts Anthropic, Codex, OpenAI, and Gemini clients; upstream protocol capability belongs to each structured URL
+  - Explicit protocol declarations route directly and skip incompatible URLs without request or cooldown; automatic mode starts with the client protocol, then falls back through OpenAI → Anthropic → Codex → Gemini without retrying it, while local mode falls back through Anthropic → Codex → OpenAI → Gemini only when all URLs are undeclared
+  - Automatic detection translates only after an uncommitted HTTP 400, a non-model 404/405, a structured `convert_request_failed` + `not implemented` 500, or a Cloudflare 403 block page returned before the API origin; exact URLs without declarations translate directly across protocols
 - **Cooldown Manager** (DRY):
   - `cooldown/manager.go`: Unified cooldown decision engine
   - Eliminates duplicate code, unified cooldown logic
@@ -859,16 +863,16 @@ Check out the awesome admin dashboard 👇
   - Weighted random: Weight = 1/EWMA latency, lower latency = higher selection probability
   - Independent cooldown: Failed URLs cool down independently without affecting other URLs
   - BaseURL tracking: Active requests, logs, and UI carry upstream URL throughout
-- **Storage Layer Refactor** (2025-12 optimization, eliminated 467 lines of duplicate code):
+- **Storage Layer Refactor** (eliminated 467 lines of duplicate code):
   - `storage/schema/`: Unified schema definition (supports SQLite/MySQL/PostgreSQL differences)
   - `storage/sql/`: Common SQL implementation layer shared by SQLite, MySQL, and PostgreSQL
   - `storage/factory.go`: Factory pattern auto-selects database
   - Composite index optimization, stats query performance improved
-- **OpenAI service_tier Pricing** (2026-03 new):
+- **OpenAI service_tier Pricing**:
   - `util.OpenAIServiceTierMultiplier()`: Returns multiplier for priority/flex/default tiers
   - `LogEntry.ServiceTier`: Persisted to database, log cost column shows tier annotation
   - Supports GPT-5.4, GPT-5.4-pro, and other latest model pricing
-- **Responses image_generation Tool Billing** (2026-05 new):
+- **Responses image_generation Tool Billing**:
   - Parses Responses API `tool_usage.image_gen` and the `image_generation` tool model
   - Bills `gpt-image-2` by text input, image input, and image output tokens
   - Streaming/non-streaming proxy paths and channel tests share the same usage parser to keep cost accounting consistent
@@ -970,6 +974,9 @@ These settings live in the database and are managed from `/web/settings.html`. S
 | `cooldown_rate_limit_seconds` | `60` | Rate limit error (429) initial cooldown in seconds |
 | `cooldown_min_seconds` | `10` | Exponential backoff cooldown floor in seconds |
 | `cooldown_max_seconds` | `1800` | Exponential backoff cooldown ceiling in seconds (an inverted floor/ceiling pair falls back to both defaults) |
+| `cooldown_fallback_enabled` | `true` | When every channel is cooling down, fall back to the channel that recovers soonest instead of failing (keys follow the same earliest-recovery rule); set to `false` to reject the request outright |
+| `global_cooldown_detection_rules` | `{}` | Global cooldown detection rules, inherited by channels that define no `cooldown_detection_rules` of their own |
+| `upstream_connection_reuse_limit_seconds` | `0` | Maximum upstream connection reuse time in seconds (`0` = unlimited); applies to HTTP/1.1, HTTP/2, and WebSocket, drains active requests, then reconnects on demand |
 | `upstream_first_byte_timeout` | `0` | Upstream first valid stream content timeout (seconds, 0=disabled, stream only) |
 | `stream_timeout` | `0` | Stream request total timeout (seconds, 0=disabled) |
 | `non_stream_timeout` | `120` | Non-stream request timeout (seconds, 0=disabled) |
@@ -993,12 +1000,17 @@ These settings live in the database and are managed from `/web/settings.html`. S
 | `channel_check_interval_hours` | `5` | Scheduled channel check interval (hours, supports decimals, 0=disabled) |
 | `model_catalog_sync_interval_hours` | `6` | Syncs the models.dev catalog every 6 hours; `0` disables network sync. At startup, the last-good cache is used, with the embedded catalog as fallback; channel `cost_multiplier` still applies. |
 | `auto_update_interval_hours` | `12` | Auto-update check interval (hours, 0=disabled, minimum enabled value is 1) |
+| `model_fuzzy_match` | `false` | When an exact model name misses, fall back to substring matching plus version sorting |
+| `responses_ws_max_connections` | `64` | Max concurrent downstream Responses WebSocket connections across the process |
+| `responses_ws_max_connections_per_token` | `16` | Max concurrent downstream Responses WebSocket connections per auth token |
+| `debug_log_enabled` | `false` | Capture upstream request/response debug logs |
+| `debug_log_retention_minutes` | `2` | Debug log retention in minutes |
 
 Per-protocol timeouts apply to the runtime upstream protocol: if a transformed request is forwarded to OpenAI, ccLoad reads `openai_*_timeout`; when that value is `0`, it falls back to the global timeout.
 
 #### Auto Updates
 
-ccLoad supports in-process auto updates. It checks releases every 12 hours by default, trying `ghproxy.net` first and GitHub directly if that source fails. A source is accepted only when release detection, binary download, checksum download, and SHA256 verification all succeed. The interval can be changed from the Web admin settings page via `auto_update_interval_hours`; set it to `0` to disable automatic update checks.
+ccLoad supports in-process auto updates. It checks releases every 12 hours by default, trying `gh.monlor.com`, `fastgit.cc`, and `ghfast.top` in order before falling back to GitHub directly. A source is accepted only when release detection, binary download, checksum download, and SHA256 verification all succeed. The interval can be changed from the Web admin settings page via `auto_update_interval_hours`; set it to `0` to disable automatic update checks.
 
 To use only a private mirror, set `CCLOAD_RELEASE_BASE_URL` to a complete latest-download base such as `https://mirror.example/caidaoli/ccLoad/releases/latest/download`. An explicit value disables the built-in fallback sources. This setting affects release downloads only; it does not configure `HTTP_PROXY` or `HTTPS_PROXY` for upstream API traffic.
 
@@ -1072,7 +1084,7 @@ Project supports multi-arch Docker images:
   - `latest` - Latest stable version
   - `v2.44.1` - Specific release tag, matching the GitHub Release tag
 
-The official GHCR runtime image is Alpine-based. On container startup, it downloads and verifies the latest Linux release binary, trying `ghproxy.net` first and GitHub directly on failure. After ccLoad starts, its in-process updater uses the same source order. Set `CCLOAD_RELEASE_BASE_URL` to a complete `.../releases/latest/download` URL to use only a custom mirror. The default in-process check interval is 12 hours and can be changed with `auto_update_interval_hours` in the Web admin settings.
+The official GHCR runtime image is Alpine-based. On container startup, it downloads and verifies the latest Linux release binary, trying `v4.gh-proxy.org`, `gh-proxy.com`, and `ghp.keleyaa.com` in order before falling back to GitHub directly. The in-process updater uses the separate source order documented above because it must resolve a release tag through `/releases/latest`. Set `CCLOAD_RELEASE_BASE_URL` to a complete `.../releases/latest/download` URL to use only a custom mirror. The default in-process check interval is 12 hours and can be changed with `auto_update_interval_hours` in the Web admin settings.
 
 ### Image Tag Guide
 
@@ -1095,10 +1107,10 @@ docker pull --platform linux/arm64 ghcr.io/caidaoli/ccload:latest
 storage/
 ├── store.go         # Store interface (unified contract)
 ├── factory.go       # NewStore() auto-selects database
-├── schema/          # Unified schema definition layer (2025-12 new)
+├── schema/          # Unified schema definition layer
 │   ├── tables.go    # Table definitions (DefineXxxTable functions)
 │   └── builder.go   # Schema builder (supports SQLite/MySQL/PostgreSQL differences)
-├── sql/             # Common SQL implementation layer (2025-12 refactor, eliminated 467 lines)
+├── sql/             # Common SQL implementation layer (eliminated 467 lines)
 │   ├── store_impl.go      # SQLStore core implementation
 │   ├── config.go          # Channel config CRUD
 │   ├── apikey.go          # API key CRUD
@@ -1133,7 +1145,7 @@ storage/
 - `web_sessions` - Role-aware Web sessions bound to an optional API token
 - `system_settings` - System config (database-backed, applied after automatic restart)
 
-**Architecture Features** (✅ 2025-12 through 2026-04 continuous improvements):
+**Architecture Features**:
 - ✅ **Unified SQL Layer** (refactor): SQLite, MySQL, and PostgreSQL share `storage/sql/` implementation
 - ✅ **Unified Schema Definition** (new): `storage/schema/` defines table structures, supports database differences
 - ✅ Factory pattern unified interface (OCP, easy to extend new storage)
@@ -1148,7 +1160,7 @@ storage/
 - ✅ **Responses image tool cost tracking**: `image_generation` tool costs are included in logs, stats, and cost limit accounting
 - ✅ **Tiered pricing engine**: GPT-5.4/Qwen-Plus/Gemini long-context step billing
 - ✅ **Log UX improvements**: Cost column formats to 3 decimal places (empty for zero), IP column shows full address on hover
-- ✅ **Protocol transform system**: Anthropic/OpenAI/Gemini/Codex four-protocol cross-conversion, upstream/local modes
+- ✅ **Automatic protocol fallback**: client-native routing first, then OpenAI → Anthropic → Codex → Gemini fallback with the native protocol skipped and family-aware capability caching
 - ✅ **Debug logs**: Upstream request/response raw data capture, sensitive header masking, independent cleanup policy
 - ✅ **Scheduled channel checks**: Background periodic channel availability probing, configurable check model per channel
 - ✅ **Channel RPM limits**: Per-channel rolling 60-second request caps, `0` means unlimited, over-limit channels are skipped

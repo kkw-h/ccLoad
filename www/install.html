@@ -12,8 +12,8 @@
   <script src="assets/js/theme-init.js?v=20260615-13"></script>
   <link rel="stylesheet" href="assets/css/www.css?v=20260729-1">
 
-  <script defer src="assets/locales/zh-CN.js?v=20260725-1"></script>
-  <script defer src="assets/locales/en.js?v=20260725-1"></script>
+  <script defer src="assets/locales/zh-CN.js?v=20260801-1"></script>
+  <script defer src="assets/locales/en.js?v=20260801-1"></script>
   <script defer src="assets/js/i18n.js?v=20260615-13"></script>
   <script defer src="assets/js/nav.js?v=20260729-1"></script>
   <script defer src="assets/js/www.js?v=20260615-13"></script>
@@ -124,7 +124,7 @@ docker-compose logs -f ccload</code></pre>
         </div>
 
         <div class="www-callout www-mt-4">
-          <strong>The official GHCR image is an Alpine runtime image.</strong> On container startup it downloads and verifies the latest Linux release binary, trying <code>ghproxy.net</code> first and GitHub directly on failure. ccLoad's in-process updater uses the same source order every 12 hours by default. Adjust <code>auto_update_interval_hours</code> in admin settings, or set <code>CCLOAD_RELEASE_BASE_URL</code> to a complete <code>.../releases/latest/download</code> URL to force a private mirror.
+          <strong>The official GHCR image is an Alpine runtime image.</strong> On container startup it downloads and verifies the latest Linux release binary, trying <code>v4.gh-proxy.org</code>, <code>gh-proxy.com</code>, and <code>ghp.keleyaa.com</code> before falling back to GitHub directly. The in-process updater uses a separate source order because it must resolve release tags through <code>/releases/latest</code>. Adjust <code>auto_update_interval_hours</code> in admin settings, or set <code>CCLOAD_RELEASE_BASE_URL</code> to a complete <code>.../releases/latest/download</code> URL to force a private mirror.
         </div>
       </div>
     </section>

@@ -18,7 +18,7 @@ func TestHandleCooldownDetectionTestEvaluatesDraftWithoutPersistingCooldown(t *t
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		ID:           1,
 		Name:         "cooldown-detection-test",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "test-model"}},
 		Enabled:      true,
@@ -118,6 +118,99 @@ func TestHandleCooldownDetectionTestKeepsExplicitStatusForRawBody(t *testing.T) 
 	}
 }
 
+func TestHandleCooldownDetectionTestUsesEffectiveChannelRules(t *testing.T) {
+	globalRules := &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+		Enabled:         true,
+		Name:            "Global maintenance",
+		Priority:        0,
+		StatusCodes:     []int{http.StatusNotAcceptable},
+		MessagePattern:  "planned maintenance",
+		Scope:           model.CooldownScopeChannel,
+		Mode:            model.CooldownModeFixed,
+		CooldownSeconds: 120,
+	}}}
+
+	tests := []struct {
+		name                string
+		rulesSource         string
+		channelRules        any
+		wantSource          string
+		wantActionable      bool
+		wantBuiltinFallback bool
+	}{
+		{
+			name:                "empty channel rules inherit global rules",
+			rulesSource:         cooldownDetectionRulesSourceChannel,
+			channelRules:        nil,
+			wantSource:          cooldownDetectionRulesSourceGlobal,
+			wantActionable:      true,
+			wantBuiltinFallback: false,
+		},
+		{
+			name:        "channel rules replace global rules",
+			rulesSource: cooldownDetectionRulesSourceChannel,
+			channelRules: map[string]any{"rules": []map[string]any{{
+				"enabled": true, "name": "Local teapot", "priority": 0,
+				"status_codes": []int{http.StatusTeapot}, "scope": model.CooldownScopeChannel,
+				"mode": model.CooldownModeFixed, "cooldown_seconds": 60,
+			}}},
+			wantSource:          cooldownDetectionRulesSourceChannel,
+			wantActionable:      false,
+			wantBuiltinFallback: true,
+		},
+		{
+			name:                "global draft does not inherit saved global rules",
+			rulesSource:         cooldownDetectionRulesSourceGlobal,
+			channelRules:        nil,
+			wantSource:          cooldownDetectionRulesSourceGlobal,
+			wantActionable:      false,
+			wantBuiltinFallback: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newInMemoryServer(t)
+			srv.globalCooldownDetectionRules = globalRules
+			payload := map[string]any{
+				"rules_source":             tt.rulesSource,
+				"status_code":              http.StatusNotAcceptable,
+				"error_body":               `{"error":{"message":"planned maintenance"}}`,
+				"cooldown_detection_rules": tt.channelRules,
+			}
+			c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/cooldown-detection/test", payload))
+			srv.HandleCooldownDetectionTest(c)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+			}
+
+			var data struct {
+				RulesSource       string `json:"rules_source"`
+				Actionable        bool   `json:"actionable"`
+				FallbackToBuiltin bool   `json:"fallback_to_builtin"`
+			}
+			mustUnmarshalAPIResponseData(t, w.Body.Bytes(), &data)
+			if data.RulesSource != tt.wantSource || data.Actionable != tt.wantActionable || data.FallbackToBuiltin != tt.wantBuiltinFallback {
+				t.Fatalf("unexpected effective rules result: %+v", data)
+			}
+		})
+	}
+}
+
+func TestHandleCooldownDetectionTestRejectsInvalidRulesSource(t *testing.T) {
+	srv := newInMemoryServer(t)
+	payload := map[string]any{
+		"rules_source": "unknown",
+		"status_code":  http.StatusTooManyRequests,
+		"error_body":   `{"error":{"message":"rate limited"}}`,
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/cooldown-detection/test", payload))
+	srv.HandleCooldownDetectionTest(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
+
 func TestHandleCooldownDetectionTestRejectsMalformedStandardLog(t *testing.T) {
 	tests := []struct {
 		name string
@@ -211,7 +304,7 @@ func TestHandleSetChannelCooldown(t *testing.T) {
 				cfg := &model.Config{
 					ID:           1,
 					Name:         "test-channel",
-					URL:          "http://test.example.com",
+					URLs:         model.ChannelURLs{{URL: "http://test.example.com"}},
 					Priority:     1,
 					ModelEntries: []model.ModelEntry{{Model: "test-model", RedirectModel: ""}},
 					Enabled:      true,
@@ -322,7 +415,7 @@ func TestHandleSetKeyCooldown(t *testing.T) {
 				cfg := &model.Config{
 					ID:           1,
 					Name:         "test-channel",
-					URL:          "http://test.example.com",
+					URLs:         model.ChannelURLs{{URL: "http://test.example.com"}},
 					Priority:     1,
 					ModelEntries: []model.ModelEntry{{Model: "test-model", RedirectModel: ""}},
 					Enabled:      true,
@@ -376,7 +469,7 @@ func TestSetChannelCooldown_Integration(t *testing.T) {
 	cfg := &model.Config{
 		ID:           1,
 		Name:         "test-channel",
-		URL:          "http://test.example.com",
+		URLs:         model.ChannelURLs{{URL: "http://test.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "test-model", RedirectModel: ""}},
 		Enabled:      true,
@@ -426,7 +519,7 @@ func TestSetKeyCooldown_Integration(t *testing.T) {
 	cfg := &model.Config{
 		ID:           1,
 		Name:         "test-channel",
-		URL:          "http://test.example.com",
+		URLs:         model.ChannelURLs{{URL: "http://test.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "test-model", RedirectModel: ""}},
 		Enabled:      true,

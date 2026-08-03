@@ -14,6 +14,24 @@
   // ─── 常量 ───────────────────────────────────────────────────────────────
   const DEFAULT_ITERATIONS  = 100;
   const DEFAULT_CONCURRENCY = 5;
+  const STREAM_FIELD_IDS = { calibrate: 'fpCalibrateStream', test: 'fpTestStream' };
+  const STREAM_STORAGE_KEYS = {
+    calibrate: 'ccload_model_fingerprint_calibrate_stream',
+    test: 'ccload_model_fingerprint_test_stream'
+  };
+  const CLIENT_PROTOCOLS = new Set(['anthropic', 'codex', 'openai', 'gemini']);
+  const CLIENT_PROTOCOL_FIELDS = Object.freeze({
+    calibrate: {
+      containerId: 'fpCalibrateClientProtocolContainer',
+      hiddenId: 'fpCalibrateClientProtocol',
+      storageKey: 'ccload_model_fingerprint_calibrate_protocol'
+    },
+    test: {
+      containerId: 'fpTestClientProtocolContainer',
+      hiddenId: 'fpTestClientProtocol',
+      storageKey: 'ccload_model_fingerprint_test_protocol'
+    }
+  });
 
   // ─── 状态 ───────────────────────────────────────────────────────────────
   let fingerprints  = [];   // GET /admin/fingerprints 返回列表
@@ -33,9 +51,87 @@
   let calModelCombo   = null;
   let tstChannelCombo = null;
   let tstModelCombo   = null;
+  const clientProtocolCombos = { calibrate: null, test: null };
 
   // ─── DOM 引用（延迟获取）────────────────────────────────────────────────
   function el(id) { return document.getElementById(id); }
+
+  function getClientProtocol(scope) {
+    const field = CLIENT_PROTOCOL_FIELDS[scope];
+    if (!field) return '';
+    const value = el(field.hiddenId)?.value || clientProtocolCombos[scope]?.getValue();
+    return CLIENT_PROTOCOLS.has(value) ? value : '';
+  }
+
+  function restoreClientProtocol(scope) {
+    const field = CLIENT_PROTOCOL_FIELDS[scope];
+    if (!field) return;
+    let protocol = '';
+    try {
+      protocol = localStorage.getItem(field.storageKey) || '';
+    } catch (_) { /* ignore */ }
+    if (!CLIENT_PROTOCOLS.has(protocol)) protocol = 'anthropic';
+    const hidden = el(field.hiddenId);
+    if (hidden) hidden.value = protocol;
+  }
+
+  function saveClientProtocol(scope, protocol) {
+    const field = CLIENT_PROTOCOL_FIELDS[scope];
+    if (!field || !CLIENT_PROTOCOLS.has(protocol)) return;
+    try {
+      localStorage.setItem(field.storageKey, protocol);
+    } catch (_) { /* ignore */ }
+  }
+
+  function inferClientProtocolForModel(modelName) {
+    const normalized = String(modelName || '').trim().toLowerCase();
+    if (normalized.startsWith('gpt-5')) return 'codex';
+    if (normalized.startsWith('claude-')) return 'anthropic';
+    if (normalized.startsWith('gemini-')) return 'gemini';
+    return 'openai';
+  }
+
+  // ─── 流式开关状态 ────────────────────────────────────────────────────────
+  function restoreStream(scope) {
+    const checkbox = el(STREAM_FIELD_IDS[scope]);
+    if (!checkbox) return;
+    let checked = false;
+    try {
+      checked = localStorage.getItem(STREAM_STORAGE_KEYS[scope]) === '1';
+    } catch (_) { /* ignore */ }
+    checkbox.checked = checked;
+  }
+
+  function getStream(scope) {
+    return Boolean(el(STREAM_FIELD_IDS[scope])?.checked);
+  }
+
+  function bindStream(scope) {
+    const checkbox = el(STREAM_FIELD_IDS[scope]);
+    if (!checkbox) return;
+    checkbox.addEventListener('change', () => {
+      try {
+        localStorage.setItem(STREAM_STORAGE_KEYS[scope], checkbox.checked ? '1' : '0');
+      } catch (_) { /* ignore */ }
+    });
+  }
+
+  function setStreamDisabled(scope, disabled) {
+    const checkbox = el(STREAM_FIELD_IDS[scope]);
+    if (checkbox) checkbox.disabled = disabled;
+  }
+
+
+  function selectClientProtocolForModel(scope, modelName) {
+    const field = CLIENT_PROTOCOL_FIELDS[scope];
+    if (!field) return;
+
+    const protocol = inferClientProtocolForModel(modelName);
+    const hidden = el(field.hiddenId);
+    if (hidden) hidden.value = protocol;
+    clientProtocolCombos[scope]?.setValue(protocol, getClientProtocolLabel(protocol));
+    saveClientProtocol(scope, protocol);
+  }
 
   // ─── i18n 辅助 ──────────────────────────────────────────────────────────
   function t(key, fallback) {
@@ -119,6 +215,53 @@
 
   // ─── combobox 创建 ─────────────────────────────────────────────────────
 
+  function getClientProtocolOptions() {
+    return [
+      { value: 'anthropic', label: t('modelTest.clientProtocolAnthropic', 'Claude Code') },
+      { value: 'codex', label: t('modelTest.clientProtocolCodex', 'Codex') },
+      { value: 'openai', label: t('modelTest.clientProtocolOpenAI', 'OpenAI') },
+      { value: 'gemini', label: t('modelTest.clientProtocolGemini', 'Gemini') }
+    ];
+  }
+
+  function getClientProtocolLabel(value) {
+    return getClientProtocolOptions().find(option => option.value === value)?.label || value;
+  }
+
+  function createClientProtocolCombo(scope) {
+    const field = CLIENT_PROTOCOL_FIELDS[scope];
+    if (!field || typeof window.createSearchableCombobox !== 'function') return null;
+
+    const hidden = el(field.hiddenId);
+    const initialValue = CLIENT_PROTOCOLS.has(hidden?.value) ? hidden.value : 'anthropic';
+    if (hidden) hidden.value = initialValue;
+
+    return window.createSearchableCombobox({
+      container: field.containerId,
+      inputId: field.hiddenId + '_input',
+      dropdownId: field.hiddenId + '_dropdown',
+      placeholder: t('modelTest.fingerprint.selectProtocol', '选择协议'),
+      minWidth: 120,
+      getOptions: getClientProtocolOptions,
+      initialValue,
+      initialLabel: getClientProtocolLabel(initialValue),
+      onSelect: (value) => {
+        if (hidden) hidden.value = value;
+        saveClientProtocol(scope, value);
+      }
+    });
+  }
+
+  function refreshClientProtocolComboboxes() {
+    Object.keys(CLIENT_PROTOCOL_FIELDS).forEach(scope => {
+      const combo = clientProtocolCombos[scope];
+      if (!combo) return;
+      const value = getClientProtocol(scope) || 'anthropic';
+      combo.setValue(value, getClientProtocolLabel(value));
+      combo.refresh();
+    });
+  }
+
   /** 创建模型 combobox（全量模型）。 */
   function createAllModelCombo(containerId, hiddenId, onModelChange) {
     if (typeof window.createSearchableCombobox !== 'function') return null;
@@ -191,6 +334,7 @@
 
   // ─── 标定：模型→渠道联动 ──────────────────────────────────────────────
   function onCalModelChange(modelName) {
+    selectClientProtocolForModel('calibrate', modelName);
     if (calChannelCombo) calChannelCombo.destroy();
     const hidden = el('fpCalibrateChannel');
     if (hidden) hidden.value = '';
@@ -199,6 +343,7 @@
 
   // ─── 对比：模型→渠道联动 + 基准自动选择 ────────────────────────────────
   function onTstModelChange(modelName) {
+    selectClientProtocolForModel('test', modelName);
     // 重建渠道 combobox（按模型过滤）
     if (tstChannelCombo) tstChannelCombo.destroy();
     const hidden = el('fpTestChannel');
@@ -682,13 +827,21 @@
       cancelRequested = false;
     }
 
-    const calibrateBtn       = el('fpCalibrateBtn');
-    const calibrateCancelBtn = el('fpCalibrateCancelBtn');
-    const testBtn            = el('fpTestBtn');
-    if (calibrateBtn)       calibrateBtn.disabled = running;
-    if (calibrateCancelBtn) {
-      calibrateCancelBtn.disabled = false;
-      calibrateCancelBtn.classList.toggle('hidden', !running || jobType !== 'calibrate');
+    const calibrateBtn = el('fpCalibrateBtn');
+    const testBtn = el('fpTestBtn');
+    Object.keys(CLIENT_PROTOCOL_FIELDS).forEach(scope => {
+      const protocolInput = clientProtocolCombos[scope]?.getInput();
+      if (protocolInput) protocolInput.disabled = running;
+    });
+    Object.keys(STREAM_FIELD_IDS).forEach(scope => setStreamDisabled(scope, running));
+    if (calibrateBtn) {
+      const calibrating = running && jobType === 'calibrate';
+      const textKey = calibrating ? 'common.cancel' : 'modelTest.fingerprint.calibrate';
+      calibrateBtn.disabled = running && !calibrating;
+      calibrateBtn.setAttribute('data-i18n', textKey);
+      calibrateBtn.textContent = t(textKey, calibrating ? '取消' : '标定基准');
+      calibrateBtn.classList.toggle('btn-primary', !calibrating);
+      calibrateBtn.classList.toggle('btn-danger', calibrating);
     }
     if (testBtn) {
       const testing = running && jobType === 'test';
@@ -936,8 +1089,8 @@
       const testBtn = el('fpTestBtn');
       if (testBtn) testBtn.disabled = true;
     } else {
-      const cancelBtn = el('fpCalibrateCancelBtn');
-      if (cancelBtn) cancelBtn.disabled = true;
+      const calibrateBtn = el('fpCalibrateBtn');
+      if (calibrateBtn) calibrateBtn.disabled = true;
     }
     if (activeJobId) requestJobCancellation(activeJobId);
   }
@@ -947,12 +1100,19 @@
     const name        = (el('fpCalibrateName')?.value || '').trim();
     const channelId   = parseInt(el('fpCalibrateChannel')?.value || '0', 10);
     const model       = (el('fpCalibrateModel')?.value || '').trim();
+    const clientProtocol = getClientProtocol('calibrate');
+    const stream      = getStream('calibrate');
     const iterations  = parseInt(el('fpCalibrateIterations')?.value || DEFAULT_ITERATIONS, 10);
     const concurrency = parseInt(el('fpCalibrateConcurrency')?.value || DEFAULT_CONCURRENCY, 10);
 
     if (!name)      { alert(t('modelTest.fingerprint.needName', '请输入基准名称')); return; }
+    if (fingerprints.some(fp => String(fp.name || '').trim() === name)) {
+      alert(t('modelTest.fingerprint.duplicateName', '已存在同名基准，请使用其他名称'));
+      return;
+    }
     if (!channelId) { alert(t('modelTest.fingerprint.needChannel', '请选择渠道')); return; }
     if (!model)     { alert(t('modelTest.fingerprint.needModel', '请选择模型')); return; }
+    if (!clientProtocol) { alert(t('modelTest.fingerprint.needProtocol', '请选择请求协议')); return; }
 
     const confirmMsg = t('modelTest.fingerprint.costConfirm', '将向渠道发起约 {n} 次请求，产生实际上游费用。是否继续？')
       .replace('{n}', iterations);
@@ -967,7 +1127,7 @@
       const data = await apiData('/admin/fingerprints/calibrate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, channel_id: channelId, model, iterations, concurrency })
+        body: JSON.stringify({ name, channel_id: channelId, model, client_protocol: clientProtocol, stream, iterations, concurrency })
       });
       const jobId = data && data.job_id;
       if (!jobId) throw new Error(t('modelTest.fingerprint.startFailed', '启动失败: ') + 'empty job_id');
@@ -987,12 +1147,15 @@
   async function onTestSubmit() {
     const channelId    = parseInt(el('fpTestChannel')?.value || '0', 10);
     const model        = (el('fpTestModel')?.value || '').trim();
+    const clientProtocol = getClientProtocol('test');
+    const stream      = getStream('test');
     const fingerprintId = el('fpTestBaselineSelect')?.value || '';
     const iterations   = parseInt(el('fpTestIterations')?.value || DEFAULT_ITERATIONS, 10);
     const concurrency  = parseInt(el('fpTestConcurrency')?.value || DEFAULT_CONCURRENCY, 10);
 
     if (!channelId) { alert(t('modelTest.fingerprint.needChannel', '请选择渠道')); return; }
     if (!model)     { alert(t('modelTest.fingerprint.needModel', '请选择模型')); return; }
+    if (!clientProtocol) { alert(t('modelTest.fingerprint.needProtocol', '请选择请求协议')); return; }
 
     const confirmMsg = t('modelTest.fingerprint.costConfirm', '将向渠道发起约 {n} 次请求，产生实际上游费用。是否继续？')
       .replace('{n}', iterations);
@@ -1003,7 +1166,7 @@
     const resultsDiv = el('fpResults');
     if (resultsDiv) resultsDiv.innerHTML = '';
 
-    const body = { channel_id: channelId, model, iterations, concurrency };
+    const body = { channel_id: channelId, model, client_protocol: clientProtocol, stream, iterations, concurrency };
     if (fingerprintId) body.fingerprint_id = parseInt(fingerprintId, 10);
 
     try {
@@ -1030,6 +1193,11 @@
   function init() {
     if (!initialized) {
       initialized = true;
+      Object.keys(CLIENT_PROTOCOL_FIELDS).forEach(restoreClientProtocol);
+      Object.keys(STREAM_FIELD_IDS).forEach(scope => {
+        restoreStream(scope);
+        bindStream(scope);
+      });
       _bindEvents();
     }
     _initComboboxes();
@@ -1039,6 +1207,14 @@
 
   async function _initComboboxes() {
     await ensureChannels();
+
+    Object.keys(CLIENT_PROTOCOL_FIELDS).forEach(scope => {
+      if (!clientProtocolCombos[scope]) {
+        clientProtocolCombos[scope] = createClientProtocolCombo(scope);
+      } else {
+        clientProtocolCombos[scope].refresh();
+      }
+    });
 
     // 标定：模型 combobox（全量模型）
     if (!calModelCombo) {
@@ -1071,8 +1247,14 @@
   }
 
   function _bindEvents() {
-    el('fpCalibrateBtn')?.addEventListener('click', onCalibrateSubmit);
-    el('fpCalibrateCancelBtn')?.addEventListener('click', cancelJob);
+    window.addEventListener('localechange', refreshClientProtocolComboboxes);
+    el('fpCalibrateBtn')?.addEventListener('click', () => {
+      if (activeJobType === 'calibrate') {
+        cancelJob();
+        return;
+      }
+      if (!activeJobType) onCalibrateSubmit();
+    });
     el('fpTestBtn')?.addEventListener('click', () => {
       if (activeJobType === 'test') {
         cancelJob();
@@ -1102,4 +1284,7 @@
 
   // ─── 导出 ───────────────────────────────────────────────────────────────
   window.ModelFingerprint = { init, stopPoll };
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { inferClientProtocolForModel };
+  }
 })();

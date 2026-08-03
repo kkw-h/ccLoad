@@ -142,6 +142,7 @@ type ForwardObserver struct {
 type proxyRequestContext struct {
 	originalModel    string
 	clientProtocol   protocol.Protocol
+	upstreamProtocol protocol.Protocol
 	requestMethod    string
 	requestPath      string
 	rawQuery         string
@@ -169,19 +170,19 @@ type proxyRequestContext struct {
 
 // proxyResult 代理请求结果
 type proxyResult struct {
-	status                 int
-	header                 http.Header
-	body                   []byte
-	channelID              *int64
-	duration               float64
-	firstByteTime          float64
-	succeeded              bool
-	isClientCanceled       bool            // 客户端主动取消请求（context.Canceled）
-	nextAction             cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
-	deferredCooldown       *cooldown.ErrorInput
-	alphaSearchUnsupported bool
-	responsesTurn          responsesWebsocketTurnResult
-	hasResponsesTurn       bool
+	status                    int
+	header                    http.Header
+	body                      []byte
+	channelID                 *int64
+	duration                  float64
+	firstByteTime             float64
+	succeeded                 bool
+	isClientCanceled          bool            // 客户端主动取消请求（context.Canceled）
+	nextAction                cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
+	deferredCooldown          *cooldown.ErrorInput
+	protocolCapabilityMissing bool
+	responsesTurn             responsesWebsocketTurnResult
+	hasResponsesTurn          bool
 }
 
 // ErrorAction 已迁移到 cooldown.Action (internal/cooldown/manager.go)
@@ -338,7 +339,7 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 // 参数简化：直接接受API Key字符串，由调用方从KeySelector获取
 func injectAPIKeyHeaders(req *http.Request, apiKey string, upstreamProtocol string) {
 	switch strings.TrimSpace(strings.ToLower(upstreamProtocol)) {
-	case util.ChannelTypeGemini:
+	case util.ProtocolGemini:
 		// Gemini API: 仅使用 x-goog-api-key
 		req.Header.Set("x-goog-api-key", apiKey)
 	default:
@@ -362,7 +363,7 @@ var anthropicProtocolHeaders = []string{
 
 // stripAnthropicProtocolHeaders 当上游非 Anthropic 时，移除客户端携带的 Anthropic 专属头。
 func stripAnthropicProtocolHeaders(req *http.Request, upstreamType string) {
-	if upstreamType == util.ChannelTypeAnthropic {
+	if upstreamType == util.ProtocolAnthropic {
 		return
 	}
 	for _, h := range anthropicProtocolHeaders {
@@ -384,7 +385,7 @@ func injectAnthropicBetaFlag(req *http.Request, flag string) {
 }
 
 func ensureAnthropicVersionHeader(req *http.Request, upstreamType string) {
-	if upstreamType != util.ChannelTypeAnthropic {
+	if upstreamType != util.ProtocolAnthropic {
 		return
 	}
 	if req.Header.Get("anthropic-version") == "" {
@@ -394,11 +395,11 @@ func ensureAnthropicVersionHeader(req *http.Request, upstreamType string) {
 
 // normalizeAnyrouterAdaptiveThinking 为 anyrouter 的 Anthropic /v1/messages 请求补齐 adaptive thinking。
 // 自动注入只针对 anyrouter；普通 Anthropic 渠道不做兜底改写。
-func normalizeAnyrouterAdaptiveThinking(cfg *model.Config, requestPath string, body []byte) []byte {
+func normalizeAnyrouterAdaptiveThinking(cfg *model.Config, upstreamProtocol, requestPath string, body []byte) []byte {
 	if len(body) == 0 || cfg == nil {
 		return body
 	}
-	if cfg.GetChannelType() != util.ChannelTypeAnthropic {
+	if upstreamProtocol != util.ProtocolAnthropic {
 		return body
 	}
 	if !isAnyrouterChannel(cfg) {
@@ -442,7 +443,7 @@ func isAnyrouterChannel(cfg *model.Config) bool {
 	if cfg == nil {
 		return false
 	}
-	haystack := strings.ToLower(cfg.Name + "\n" + cfg.URL)
+	haystack := strings.ToLower(cfg.Name + "\n" + strings.Join(cfg.GetURLs(), "\n"))
 	return strings.Contains(haystack, "anyrouter")
 }
 
@@ -609,15 +610,14 @@ func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) str
 // Gemini 的模型位于 URL 路径，body 规则不改变其路由模型。
 func (s *Server) resolveFinalUpstreamModel(cfg *model.Config, originalModel string, upstreamProtocol string) string {
 	actualModel := s.resolveActualModel(cfg, originalModel)
-	if protocol.Protocol(util.NormalizeChannelType(upstreamProtocol)) == protocol.Gemini {
+	if protocol.Protocol(util.NormalizeProtocol(upstreamProtocol)) == protocol.Gemini {
 		return actualModel
 	}
 	return resolveModelAfterBodyRules(actualModel, cfg.BodyRules())
 }
 
-func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestContext) (actualModel string, bodyToSend []byte) {
-	upstreamProtocol := cfg.ResolveUpstreamProtocol(string(reqCtx.clientProtocol))
-	actualModel = s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, upstreamProtocol)
+func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestContext, upstreamProtocol protocol.Protocol) (actualModel string, bodyToSend []byte) {
+	actualModel = s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, string(upstreamProtocol))
 
 	bodyToSend = reqCtx.body
 	bodyToSend = replaceJSONRequestModel(bodyToSend, reqCtx.originalModel, actualModel)
@@ -853,6 +853,8 @@ type logEntryParams struct {
 	IsStreaming      bool
 	APIKeyUsed       string
 	AuthTokenID      int64
+	ClientProtocol   protocol.Protocol
+	UpstreamProtocol protocol.Protocol
 	ClientIP         string
 	BaseURL          string // 请求使用的上游URL
 	Result           *fwResult
@@ -899,6 +901,8 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		UpstreamWebsocket: p.Result != nil && p.Result.UpstreamWebsocket,
 		APIKeyUsed:        p.APIKeyUsed,
 		AuthTokenID:       p.AuthTokenID,
+		ClientProtocol:    string(p.ClientProtocol),
+		UpstreamProtocol:  string(p.UpstreamProtocol),
 		ClientIP:          p.ClientIP,
 		BaseURL:           p.BaseURL,
 	}
