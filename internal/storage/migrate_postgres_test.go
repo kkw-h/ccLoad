@@ -326,6 +326,7 @@ func TestPostgres(t *testing.T) {
 			Enabled:  true,
 			ModelEntries: []model.ModelEntry{
 				{Model: "gpt-4o"},
+				{Model: "gpt-4o-disabled", Disabled: true},
 			},
 		})
 		if err != nil {
@@ -333,6 +334,13 @@ func TestPostgres(t *testing.T) {
 		}
 		if ch.ID <= 0 {
 			t.Fatalf("CreateConfig 未返回 id: %+v", ch)
+		}
+		persisted, err := store.GetConfig(ctx, ch.ID)
+		if err != nil {
+			t.Fatalf("GetConfig: %v", err)
+		}
+		if len(persisted.ModelEntries) != 2 || persisted.ModelEntries[0].Disabled || !persisted.ModelEntries[1].Disabled {
+			t.Fatalf("PostgreSQL 模型 disabled 状态未正确持久化: %#v", persisted.ModelEntries)
 		}
 		t.Logf("CreateConfig id=%d", ch.ID)
 
@@ -940,7 +948,7 @@ func TestPostgres(t *testing.T) {
 			if err := store.UpdateTokenLastUsed(ctx, tokenValue, time.Now()); err != nil {
 				t.Fatalf("UpdateTokenLastUsed: %v", err)
 			}
-			if err := store.UpdateTokenStats(ctx, tokenValue, true, 0.5, false, 0, 10, 20, 3, 4, 0.01, 0.02); err != nil {
+			if err := store.UpdateTokenStats(ctx, tokenValue, model.TokenStatSuccess(), 0.5, false, 0, 10, 20, 3, 4, 0.01, 0.02); err != nil {
 				t.Fatalf("UpdateTokenStats: %v", err)
 			}
 

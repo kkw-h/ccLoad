@@ -579,7 +579,7 @@ func (s *SQLStore) saveModelEntriesImpl(ctx context.Context, exec dbExecutor, ch
 				b.WriteByte(',')
 			}
 			b.WriteString("(?, ?, ?, ?, ?)")
-			args = append(args, channelID, entry.Model, entry.RedirectModel, entry.Disabled, baseCreatedAt+int64(offset+i))
+			args = append(args, channelID, entry.Model, entry.RedirectModel, boolToInt(entry.Disabled), baseCreatedAt+int64(offset+i))
 		}
 		if _, err := exec.ExecContext(ctx, s.q(b.String()), args...); err != nil {
 			return fmt.Errorf("save model entries (offset %d): %w", offset, err)
