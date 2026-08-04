@@ -519,6 +519,7 @@ After service starts, access:
 - Admin Interface: `http://localhost:8080/web/`
 - API Proxy: `POST http://localhost:8080/v1/messages`
 - **API Token Management**: `http://localhost:8080/web/tokens.html` - Configure API access tokens via Web interface
+- **Management API Docs**: `http://localhost:8080/docs/` - Swagger UI backed by `GET /docs/openapi.yaml`
 
 ## 📖 Usage Guide
 

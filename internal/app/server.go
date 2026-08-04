@@ -1112,6 +1112,9 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 	dashboardProxy.Any("/v1/*path", s.HandleProxyRequest)
 	dashboardProxy.Any("/v1beta/*path", s.HandleProxyRequest)
 
+	// 管理后台 OpenAPI 文档（公开读取；调用 /admin API 仍需管理员 Bearer Token）。
+	setupDocsRoutes(r)
+
 	// 静态文件服务（带版本号和缓存控制）
 	// - HTML：不缓存，动态替换 __VERSION__ 占位符
 	// - CSS/JS：长缓存（1年），通过版本号查询参数刷新
