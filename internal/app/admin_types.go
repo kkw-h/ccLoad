@@ -17,25 +17,27 @@ import (
 
 // ChannelRequest 渠道创建/更新请求结构
 type ChannelRequest struct {
-	Name                   string                        `json:"name" binding:"required"`
-	APIKey                 string                        `json:"api_key"`
-	APIKeys                []ChannelAPIKeyRequest        `json:"api_keys,omitempty"`
-	Websockets             bool                          `json:"websockets,omitempty"`
-	ProtocolTransformMode  string                        `json:"protocol_transform_mode,omitempty"`
-	KeyStrategy            string                        `json:"key_strategy,omitempty"` // Key使用策略:sequential, round_robin
-	URLs                   model.ChannelURLs             `json:"urls" binding:"required,min=1"`
-	Priority               int                           `json:"priority"`
-	RPMLimit               int                           `json:"rpm_limit"`                       // 每分钟请求数限制，0表示无限制
-	MaxConcurrency         int                           `json:"max_concurrency"`                 // 最大并发请求数，0表示无限制
-	Models                 []model.ModelEntry            `json:"models" binding:"required,min=1"` // 模型配置（包含重定向）
-	Enabled                bool                          `json:"enabled"`
-	ScheduledCheckEnabled  bool                          `json:"scheduled_check_enabled"`
-	ScheduledCheckModel    string                        `json:"scheduled_check_model"`
-	DailyCostLimit         float64                       `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
-	CostMultiplier         float64                       `json:"cost_multiplier"`  // 成本倍率（默认1，0=免费，>=0）
-	CustomRequestRules     *model.CustomRequestRules     `json:"custom_request_rules,omitempty"`
-	CooldownDetectionRules *model.CooldownDetectionRules `json:"cooldown_detection_rules,omitempty"`
-	ProxyURL               string                        `json:"proxy_url,omitempty"` // 渠道级代理（http/https/socks5/socks5h）
+	Name                    string                        `json:"name" binding:"required"`
+	AuthType                string                        `json:"auth_type,omitempty"`
+	APIKey                  string                        `json:"api_key"`
+	APIKeys                 []ChannelAPIKeyRequest        `json:"api_keys,omitempty"`
+	Websockets              bool                          `json:"websockets,omitempty"`
+	ProtocolTransformMode   string                        `json:"protocol_transform_mode,omitempty"`
+	KeyStrategy             string                        `json:"key_strategy,omitempty"` // Key使用策略:sequential, round_robin
+	URLs                    model.ChannelURLs             `json:"urls" binding:"required,min=1"`
+	Priority                int                           `json:"priority"`
+	RPMLimit                int                           `json:"rpm_limit"`                       // 每分钟请求数限制，0表示无限制
+	MaxConcurrency          int                           `json:"max_concurrency"`                 // 最大并发请求数，0表示无限制
+	Models                  []model.ModelEntry            `json:"models" binding:"required,min=1"` // 模型配置（包含重定向）
+	Enabled                 bool                          `json:"enabled"`
+	ScheduledCheckEnabled   bool                          `json:"scheduled_check_enabled"`
+	ScheduledCheckModel     string                        `json:"scheduled_check_model"`
+	DailyCostLimit          float64                       `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
+	CostMultiplier          float64                       `json:"cost_multiplier"`  // 成本倍率（默认1，0=免费，>=0）
+	CustomRequestRules      *model.CustomRequestRules     `json:"custom_request_rules,omitempty"`
+	CooldownDetectionRules  *model.CooldownDetectionRules `json:"cooldown_detection_rules,omitempty"`
+	ProxyURL                string                        `json:"proxy_url,omitempty"` // 渠道级代理（http/https/socks5/socks5h）
+	RetryOtherKeysOnFailure bool                          `json:"retry_other_keys_on_failure"`
 }
 
 // ChannelAPIKeyRequest describes one submitted API key and its admin-only note.
@@ -170,9 +172,17 @@ func (cr *ChannelRequest) Validate() error {
 	if strings.TrimSpace(cr.Name) == "" {
 		return fmt.Errorf("name cannot be empty")
 	}
+	authType := model.NormalizeAuthType(cr.AuthType)
+	if authType == "" {
+		return fmt.Errorf("invalid auth_type %q", cr.AuthType)
+	}
+	cr.AuthType = authType
 	apiKeys := cr.normalizeAPIKeys()
-	if len(apiKeys) == 0 {
+	if authType == model.AuthTypeAPIKey && len(apiKeys) == 0 {
 		return fmt.Errorf("api_key cannot be empty")
+	}
+	if authType != model.AuthTypeAPIKey && len(apiKeys) != 0 {
+		return fmt.Errorf("OAuth channel cannot contain API keys")
 	}
 	for i, key := range apiKeys {
 		if strings.ContainsAny(key.APIKey, "\x00\r\n") {
@@ -287,22 +297,24 @@ func (cr *ChannelRequest) ToConfig() *model.Config {
 	}
 
 	return &model.Config{
-		Name:                   strings.TrimSpace(cr.Name),
-		Websockets:             cr.Websockets,
-		ProtocolTransformMode:  cr.ProtocolTransformMode,
-		URLs:                   cr.URLs.Clone(),
-		Priority:               cr.Priority,
-		RPMLimit:               cr.RPMLimit,
-		MaxConcurrency:         cr.MaxConcurrency,
-		ModelEntries:           normalizedModels,
-		Enabled:                cr.Enabled,
-		ScheduledCheckEnabled:  cr.ScheduledCheckEnabled,
-		ScheduledCheckModel:    cr.ScheduledCheckModel,
-		DailyCostLimit:         cr.DailyCostLimit,
-		CostMultiplier:         cr.CostMultiplier,
-		CustomRequestRules:     cr.CustomRequestRules.Clone(),
-		CooldownDetectionRules: cr.CooldownDetectionRules.Clone(),
-		ProxyURL:               cr.ProxyURL,
+		Name:                    strings.TrimSpace(cr.Name),
+		AuthType:                cr.AuthType,
+		Websockets:              cr.Websockets,
+		ProtocolTransformMode:   cr.ProtocolTransformMode,
+		URLs:                    cr.URLs.Clone(),
+		Priority:                cr.Priority,
+		RPMLimit:                cr.RPMLimit,
+		MaxConcurrency:          cr.MaxConcurrency,
+		ModelEntries:            normalizedModels,
+		Enabled:                 cr.Enabled,
+		ScheduledCheckEnabled:   cr.ScheduledCheckEnabled,
+		ScheduledCheckModel:     cr.ScheduledCheckModel,
+		DailyCostLimit:          cr.DailyCostLimit,
+		CostMultiplier:          cr.CostMultiplier,
+		CustomRequestRules:      cr.CustomRequestRules.Clone(),
+		CooldownDetectionRules:  cr.CooldownDetectionRules.Clone(),
+		ProxyURL:                cr.ProxyURL,
+		RetryOtherKeysOnFailure: cr.RetryOtherKeysOnFailure,
 	}
 }
 
@@ -433,13 +445,19 @@ type ChannelModelStats struct {
 // ChannelWithCooldown 带冷却状态的渠道响应结构
 type ChannelWithCooldown struct {
 	*model.Config
-	KeyStrategy         string              `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
-	CooldownUntil       *time.Time          `json:"cooldown_until,omitempty"`
-	CooldownRemainingMS int64               `json:"cooldown_remaining_ms,omitempty"`
-	KeyCooldowns        []KeyCooldownInfo   `json:"key_cooldowns,omitempty"`
-	ModelCooldowns      []ModelCooldownInfo `json:"model_cooldowns,omitempty"`
-	EffectivePriority   *float64            `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
-	SuccessRate         *float64            `json:"success_rate,omitempty"`       // 成功率(0-1)
+	CodexPlanType                string              `json:"codex_plan_type,omitempty"`
+	CodexSubscriptionActiveUntil *time.Time          `json:"codex_subscription_active_until,omitempty"`
+	AntigravityPaidTier          string              `json:"antigravity_paid_tier,omitempty"`
+	XAIEmail                     string              `json:"xai_email,omitempty"`
+	XAISubscriptionTier          string              `json:"xai_subscription_tier,omitempty"`
+	XAIEntitlementStatus         string              `json:"xai_entitlement_status,omitempty"`
+	KeyStrategy                  string              `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
+	CooldownUntil                *time.Time          `json:"cooldown_until,omitempty"`
+	CooldownRemainingMS          int64               `json:"cooldown_remaining_ms,omitempty"`
+	KeyCooldowns                 []KeyCooldownInfo   `json:"key_cooldowns,omitempty"`
+	ModelCooldowns               []ModelCooldownInfo `json:"model_cooldowns,omitempty"`
+	EffectivePriority            *float64            `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
+	SuccessRate                  *float64            `json:"success_rate,omitempty"`       // 成功率(0-1)
 }
 
 // ChannelImportSummary 导入结果统计

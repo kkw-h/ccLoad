@@ -141,7 +141,7 @@ func cleanupMySQLTables(t *testing.T, db *sql.DB) {
 	_, _ = db.Exec("SET FOREIGN_KEY_CHECKS = 0")
 	defer func() { _, _ = db.Exec("SET FOREIGN_KEY_CHECKS = 1") }()
 
-	tables := []string{"fingerprint_test_results", "model_fingerprints", "logs", "web_sessions", "admin_sessions", "system_settings", "auth_tokens", "channel_models", "channel_protocol_transforms", "api_keys", "channels", "schema_migrations"}
+	tables := []string{"fingerprint_test_results", "model_fingerprints", "debug_logs", "logs", "web_sessions", "admin_sessions", "system_settings", "auth_tokens", "channel_models", "channel_protocol_transforms", "api_keys", "channels", "schema_migrations"}
 	for _, table := range tables {
 		_, _ = db.Exec("DROP TABLE IF EXISTS " + table)
 	}
@@ -174,6 +174,42 @@ func TestMySQL(t *testing.T) {
 				t.Fatalf("表 %s 查询失败: %v", table, err)
 			}
 			t.Logf("表 %s 存在（行数: %d）", table, count)
+		}
+	})
+
+	t.Run("DebugLogCleanup", func(t *testing.T) {
+		cleanupMySQLTables(t, env.db)
+
+		store, err := CreateMySQLStoreForTest(env.dsn)
+		if err != nil {
+			t.Fatalf("CreateMySQLStore: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+
+		ctx := t.Context()
+		cutoff := time.Now()
+		for i := 1; i <= 3; i++ {
+			if err := store.AddDebugLog(ctx, &model.DebugLogEntry{
+				LogID:       int64(i),
+				CreatedAt:   cutoff.Add(-time.Duration(i) * time.Minute).Unix(),
+				ReqURL:      "https://upstream.example.com",
+				ReqHeaders:  "{}",
+				ReqBody:     []byte("request"),
+				RespHeaders: "{}",
+			}); err != nil {
+				t.Fatalf("AddDebugLog(%d): %v", i, err)
+			}
+		}
+		if deleted, err := store.CleanupDebugLogsBatch(ctx, cutoff, 1); err != nil || deleted != 1 {
+			t.Fatalf("CleanupDebugLogsBatch: deleted=%d err=%v", deleted, err)
+		}
+		if err := store.TruncateDebugLogs(ctx); err != nil {
+			t.Fatalf("TruncateDebugLogs: %v", err)
+		}
+		for i := 1; i <= 3; i++ {
+			if entry, err := store.GetDebugLogByLogID(ctx, int64(i)); err != nil || entry != nil {
+				t.Fatalf("debug log %d after truncate: entry=%v err=%v", i, entry, err)
+			}
 		}
 	})
 
@@ -333,6 +369,86 @@ func TestMySQL(t *testing.T) {
 		_ = store2.Close()
 
 		t.Log("已存在列验证通过：不报错")
+	})
+
+	t.Run("LegacyChannelsOAuthCredential", func(t *testing.T) {
+		cleanupMySQLTables(t, env.db)
+
+		if _, err := env.db.Exec(`
+			CREATE TABLE channels (
+				id INT PRIMARY KEY AUTO_INCREMENT,
+				name VARCHAR(191) NOT NULL UNIQUE,
+				url VARCHAR(191) NOT NULL,
+				priority INT NOT NULL DEFAULT 0,
+				channel_type VARCHAR(64) NOT NULL DEFAULT 'anthropic',
+				codex_credential TEXT NULL,
+				enabled TINYINT NOT NULL DEFAULT 1,
+				cooldown_until BIGINT NOT NULL DEFAULT 0,
+				cooldown_duration_ms BIGINT NOT NULL DEFAULT 0,
+				created_at BIGINT NOT NULL,
+				updated_at BIGINT NOT NULL
+			)
+		`); err != nil {
+			t.Fatalf("创建旧版 channels: %v", err)
+		}
+		if _, err := env.db.Exec(`
+			INSERT INTO channels(name, url, channel_type, created_at, updated_at)
+			VALUES('legacy-codex-column', 'https://legacy.example.com', 'codex', 1, 1)
+		`); err != nil {
+			t.Fatalf("写入旧版渠道: %v", err)
+		}
+
+		store, err := CreateMySQLStoreForTest(env.dsn)
+		if err != nil {
+			t.Fatalf("迁移旧版 channels: %v", err)
+		}
+
+		var channelID int64
+		var channelType, authType string
+		var credential sql.NullString
+		if err := env.db.QueryRow(`
+			SELECT id, channel_type, auth_type, oauth_credential
+			FROM channels WHERE name = 'legacy-codex-column'
+		`).Scan(&channelID, &channelType, &authType, &credential); err != nil {
+			t.Fatalf("读取迁移后渠道: %v", err)
+		}
+		if channelType != "codex" || authType != model.AuthTypeAPIKey || credential.Valid {
+			t.Fatalf("迁移后认证字段=(%q, %q, %v)", channelType, authType, credential)
+		}
+
+		var isNullable string
+		var defaultValue sql.NullString
+		if err := env.db.QueryRow(`
+			SELECT IS_NULLABLE, COLUMN_DEFAULT
+			FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channels' AND COLUMN_NAME='oauth_credential'
+		`).Scan(&isNullable, &defaultValue); err != nil {
+			t.Fatalf("读取 oauth_credential 列定义: %v", err)
+		}
+		if !strings.EqualFold(isNullable, "YES") || defaultValue.Valid {
+			t.Fatalf("oauth_credential nullable=%q default=%v, want nullable without default", isNullable, defaultValue)
+		}
+		var legacyColumnCount int
+		if err := env.db.QueryRow(`
+			SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channels' AND COLUMN_NAME='codex_credential'
+		`).Scan(&legacyColumnCount); err != nil {
+			t.Fatalf("检查旧凭证列: %v", err)
+		}
+		if legacyColumnCount != 0 {
+			t.Fatalf("codex_credential column still exists")
+		}
+		loaded, err := store.GetConfig(context.Background(), channelID)
+		if err != nil {
+			t.Fatalf("通过存储读取迁移渠道: %v", err)
+		}
+		if loaded.OAuthCredential != "" {
+			t.Fatalf("存储读取 OAuthCredential=%q, want empty", loaded.OAuthCredential)
+		}
+		_ = store.Close()
+		if err := migrateMySQL(context.Background(), env.db); err != nil {
+			t.Fatalf("重复迁移旧版 channels: %v", err)
+		}
 	})
 
 	t.Run("EnsureColumns_APIKeyLengthDrift", func(t *testing.T) {

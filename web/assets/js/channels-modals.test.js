@@ -1,10 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { selectFirstEnabledInlineKey } = require('./channels-keys.js');
-const { fetchURLStats } = require('./channels-urls.js');
+const { selectAvailableInlineKeys, selectModelFetchKeys, selectFirstEnabledInlineKey } = require('./channels-keys.js');
+const { applyURLStats, fetchURLStats } = require('./channels-urls.js');
+const ModelEntryParser = require('./model-entry-parser.js');
 
-function installFetchModelsGlobals({ rows, states, onFetch, onError, onWarning }) {
+function installFetchModelsGlobals({ rows, states, onFetch, onError, onWarning, channelId = null, authType = 'api_key' }) {
 	const globals = {
 		window: {
 			t: key => key,
@@ -15,6 +16,10 @@ function installFetchModelsGlobals({ rows, states, onFetch, onError, onWarning }
     getValidInlineURLConfigs: () => [{ url: 'https://upstream.test', exact: false, protocols: ['openai'] }],
     getInlineKeyRows: () => rows,
     currentChannelKeyCooldowns: states,
+    editingChannelId: channelId,
+    editingChannelAuthType: authType,
+    selectAvailableInlineKeys,
+    selectModelFetchKeys,
     selectFirstEnabledInlineKey,
     fetchAPIWithAuth: onFetch,
     alert: onError,
@@ -48,9 +53,41 @@ function installBatchProtocolModeGlobals(response) {
   const notifications = [];
   let filterSaves = 0;
   let reloads = 0;
+  const makeClassList = (initial = []) => {
+    const classes = new Set(initial);
+    return {
+      add: (...names) => names.forEach(name => classes.add(name)),
+      remove: (...names) => names.forEach(name => classes.delete(name)),
+      contains: name => classes.has(name),
+      toggle(name, force) {
+        if (force === undefined ? !classes.has(name) : force) classes.add(name);
+        else classes.delete(name);
+      }
+    };
+  };
+  const appContainer = {
+    inert: false,
+    setAttribute(name) { if (name === 'inert') this.inert = true; },
+    removeAttribute(name) { if (name === 'inert') this.inert = false; }
+  };
+  const modelImportModeAppend = { value: 'append', checked: true };
+  const modelImportModeReplace = { value: 'replace', checked: false };
+  const modelImportFormatText = { value: 'text', checked: true };
   const elements = {
     batchProtocolTransformMode: { value: 'local', disabled: false },
     batchApplyProtocolBtn: { disabled: false },
+    batchCostMultiplier: {
+      value: '0.5',
+      disabled: false,
+      attributes: new Map(),
+      setAttribute(name, value) { this.attributes.set(name, value); },
+      focus() {}
+    },
+    batchApplyCostMultiplierBtn: { disabled: false },
+    batchCostMultiplierError: { textContent: '', hidden: true },
+    batchImportModelsBtn: { disabled: false },
+    batchAdvancedOptions: { open: true },
+    batchRefreshOptions: { open: false },
     batchFloatingMenu: {
       inert: false,
       classList: { toggle() {} },
@@ -58,16 +95,55 @@ function installBatchProtocolModeGlobals(response) {
     },
     selectedChannelsSummary: { textContent: '' },
     selectedChannelsCountBadge: { textContent: '' },
-    batchFloatingMenuCloseBtn: { disabled: false }
+    batchFloatingMenuCloseBtn: { disabled: false },
+    modelImportTextarea: {
+      value: '',
+      disabled: false,
+      dataset: {},
+      placeholder: '',
+      attributes: new Map(),
+      setAttribute(name, value) { this.attributes.set(name, value); },
+      focus() {}
+    },
+    modelImportError: { textContent: '', hidden: true },
+    modelImportPreviewContent: { classList: makeClassList(['hidden']) },
+    modelImportCount: { textContent: '' },
+    modelImportModeFieldset: { hidden: true },
+    modelImportTitle: { textContent: '', setAttribute() {} },
+    modelImportPreviewLabel: { textContent: '', setAttribute() {} },
+    modelImportConfirmBtn: { textContent: '', disabled: false, setAttribute() {} },
+    modelImportInputLabel: { textContent: '', setAttribute() {} },
+    modelImportInputHint: { textContent: '', setAttribute() {} },
+    modelImportTextHelp: { hidden: false },
+    modelImportJSONHelp: { hidden: true },
+    modelImportModal: {
+      classList: makeClassList(),
+      dataset: {},
+      setAttribute() {}
+    },
+    channelModal: { setAttribute() {}, removeAttribute() {} },
+    visibleSelectionCheckbox: { focus() {} }
   };
   const globals = {
     window: {
       t: (key, params) => params ? { key, params } : key,
       showSuccess: message => notifications.push({ type: 'success', message }),
       showError: message => notifications.push({ type: 'error', message }),
-      showWarning: message => notifications.push({ type: 'warning', message })
+      showWarning: message => notifications.push({ type: 'warning', message }),
+      ModelEntryParser,
+      localStorage: { getItem: () => null, setItem() {} }
     },
-    document: { getElementById: id => elements[id] || null },
+    document: {
+      activeElement: elements.batchImportModelsBtn,
+      getElementById: id => elements[id] || null,
+      querySelector: selector => ({
+        '.app-container': appContainer,
+        'input[name="modelImportMode"][value="append"]': modelImportModeAppend,
+        'input[name="modelImportMode"]:checked': modelImportModeReplace.checked ? modelImportModeReplace : modelImportModeAppend,
+        'input[name="modelImportFormat"][value="text"]': modelImportFormatText,
+        'input[name="modelImportFormat"]:checked': modelImportFormatText
+      })[selector] || null
+    },
     selectedChannelIds: new Set(['11', '22']),
     filteredChannels: [],
     channels: [],
@@ -77,6 +153,8 @@ function installBatchProtocolModeGlobals(response) {
     },
     saveChannelsFilters: () => { filterSaves++; },
     reloadChannelsList: async () => { reloads++; },
+    setTimeout: callback => { callback(); return 1; },
+    confirm: () => true,
     console: { ...console, error: () => {} }
   };
   const previous = new Map();
@@ -89,6 +167,9 @@ function installBatchProtocolModeGlobals(response) {
     notifications,
     requests,
     selectedChannelIds: globals.selectedChannelIds,
+    appContainer,
+    modelImportModeAppend,
+    modelImportModeReplace,
     get filterSaves() { return filterSaves; },
     get reloads() { return reloads; },
     restore() {
@@ -155,22 +236,37 @@ function installFetchSub2APIRateGlobals({ response, rows, states }) {
   };
 }
 
-function installEditChannelGlobals(channel) {
+function installEditChannelGlobals(channel, {
+  editorError = null,
+  editorKeys = [],
+  codexCredential = null,
+  codexCredentialInfo = null
+} = {}) {
   const requests = [];
+  const errors = [];
+  const authEditorCalls = [];
+  let loadedKeys = [];
   const elements = new Map();
-  const makeElement = () => ({
-    value: '',
-    checked: false,
-    disabled: false,
-    hidden: false,
-    style: {},
-    dataset: {},
-    classList: { add() {}, remove() {}, contains() { return false; } },
-    setAttribute() {},
-    addEventListener() {},
-    appendChild() {},
-    querySelector: () => null
-  });
+  const makeElement = () => {
+    const classes = new Set();
+    return {
+      value: '',
+      checked: false,
+      disabled: false,
+      hidden: false,
+      style: {},
+      dataset: {},
+      classList: {
+        add: (...names) => names.forEach(name => classes.add(name)),
+        remove: (...names) => names.forEach(name => classes.delete(name)),
+        contains: name => classes.has(name)
+      },
+      setAttribute() {},
+      addEventListener() {},
+      appendChild() {},
+      querySelector: () => null
+    };
+  };
   const getElement = id => {
     if (id === 'channelScheduledCheckEnabledWrapper' || id === 'channelScheduledCheckModelWrapper') {
       return null;
@@ -181,6 +277,7 @@ function installEditChannelGlobals(channel) {
   const globals = {
     window: {
       t: key => key,
+      showError: message => errors.push(message),
       addEventListener() {}
     },
     document: {
@@ -192,6 +289,7 @@ function installEditChannelGlobals(channel) {
     },
     channels: [],
     editingChannelId: null,
+    editingChannelAuthType: 'api_key',
     currentChannelKeyCooldowns: [],
     inlineKeyTableData: [{ api_key: '' }],
     inlineKeyVisible: false,
@@ -203,11 +301,20 @@ function installEditChannelGlobals(channel) {
     currentModelFilter: '',
     fetchDataWithAuth: async url => {
       requests.push(url);
-      if (url === `/admin/channels/${channel.id}`) return channel;
-      if (url === `/admin/channels/${channel.id}/keys`) return [];
-      if (url === `/admin/channels/${channel.id}/model-stats`) return [];
-      if (url === `/admin/channels/${channel.id}/url-stats`) {
-        return [{ url: channel.urls[0].url, latency_ms: 125, requests: 1, failures: 0 }];
+      if (url === `/admin/channels/${channel.id}/editor`) {
+        if (editorError) throw editorError;
+        return {
+          channel,
+          keys: editorKeys,
+          oauth_credential: codexCredential,
+          oauth_credential_info: codexCredentialInfo,
+          model_stats: { available: true, items: [] },
+          url_stats: {
+            available: true,
+            items: [{ url: channel.urls[0].url, latency_ms: 125, requests: 1, failures: 0 }]
+          },
+          features: { scheduled_check_enabled: true }
+        };
       }
       throw new Error(`unexpected fetch: ${url}`);
     },
@@ -220,15 +327,20 @@ function installEditChannelGlobals(channel) {
     TemplateEngine: { render: () => null },
     clearChannelDuplicateHint() {},
     setInlineURLTableData() {},
+    applyURLStats,
     fetchURLStats,
     urlStatsMap: {},
     renderInlineURLTable() {},
-    setInlineKeyTableDataFromAPI() {},
+    setInlineKeyTableDataFromAPI(keys) { loadedKeys = keys; },
     renderInlineKeyTable() {},
+    applyChannelAuthEditorMode(authType, credential, channel, credentialInfo) {
+      authEditorCalls.push({ authType, credential, channel, credentialInfo });
+    },
     renderRedirectTable() {},
     resetChannelFormDirty() {},
     syncChannelEditorTableSizing() {},
-    scheduleChannelEditorTableSizingSync() {}
+    scheduleChannelEditorTableSizingSync() {},
+    console: { ...console, error() {} }
   };
   const previous = new Map();
   for (const [name, value] of Object.entries(globals)) {
@@ -236,7 +348,10 @@ function installEditChannelGlobals(channel) {
     Object.defineProperty(global, name, { configurable: true, writable: true, value });
   }
   return {
+    errors,
     requests,
+    authEditorCalls,
+    get loadedKeys() { return loadedKeys; },
     getElement,
     restore() {
       for (const [name, descriptor] of previous) {
@@ -299,6 +414,7 @@ function installModelRequestTestGlobals({ dirty = false } = {}) {
     },
     redirectTableData: [{ model: 'requested-model', redirect_model: 'upstream-model', disabled: false }],
     editingChannelId: 7,
+    editingChannelAuthType: 'api_key',
     channelFormDirty: dirty,
     channels: [{ id: 7, name: 'test-channel' }],
     testChannel: async (...args) => {
@@ -437,7 +553,7 @@ test('WebSocket probe skips disabled URLs and keys and checks every enabled URL'
   }
 });
 
-test('editing a single-URL channel loads its URL statistics', async () => {
+test('editing a channel loads the complete editor state with one request', async () => {
   const channel = {
     id: 73,
     name: 'single-url',
@@ -452,8 +568,157 @@ test('editing a single-URL channel loads its URL statistics', async () => {
   try {
     const { editChannel } = loadChannelsModals();
     await editChannel(channel.id);
-    assert.ok(fixture.requests.includes(`/admin/channels/${channel.id}/url-stats`));
-    assert.equal(fixture.getElement('quickAddChannelBtn').hidden, true);
+    assert.deepEqual(fixture.requests, [`/admin/channels/${channel.id}/editor`]);
+    assert.equal(fixture.getElement('quickAddChannelBtn').hidden, false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('editing a Codex channel loads its AT row and full credential into read-only mode', async () => {
+  const channel = {
+    id: 75,
+    name: 'codex-oauth',
+    auth_type: 'codex_oauth',
+    urls: [{ url: 'https://chatgpt.com/backend-api/codex/responses', exact: true, protocols: ['codex'] }],
+    models: [],
+    priority: 0,
+    enabled: true,
+    protocol_transform_mode: 'upstream'
+  };
+  const credential = { type: 'codex', access_token: 'at-editor', refresh_token: 'rt-editor' };
+  const credentialInfo = { chatgpt_account_id: 'account-editor', plan_type: 'plus' };
+  const keys = [{ key_index: 0, api_key: 'at-editor', note: 'Codex OAuth AT' }];
+  const fixture = installEditChannelGlobals(channel, {
+    editorKeys: keys,
+    codexCredential: credential,
+    codexCredentialInfo: credentialInfo
+  });
+
+  try {
+    const { editChannel } = loadChannelsModals();
+    await editChannel(channel.id);
+
+    assert.deepEqual(fixture.loadedKeys, keys);
+    assert.deepEqual(fixture.authEditorCalls.at(-1), {
+      authType: 'codex_oauth',
+      credential,
+      channel,
+      credentialInfo
+    });
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('editing an xAI channel loads its full credential into read-only mode and keeps keys empty', async () => {
+  const channel = {
+    id: 76,
+    name: 'xai-oauth',
+    auth_type: 'xai_oauth',
+    xai_email: 'safe@example.com',
+    xai_subscription_tier: 'pro',
+    urls: [{ url: 'https://cli-chat-proxy.grok.com/v1', exact: false, protocols: ['codex'] }],
+    models: [],
+    priority: 0,
+    enabled: true,
+    protocol_transform_mode: 'local'
+  };
+  const credential = {
+    type: 'xai', auth_kind: 'oauth', access_token: 'xai-at', refresh_token: 'xai-rt', id_token: 'xai-id'
+  };
+  const fixture = installEditChannelGlobals(channel, {
+    editorKeys: [],
+    codexCredential: credential,
+    codexCredentialInfo: null
+  });
+
+  try {
+    const { editChannel } = loadChannelsModals();
+    await editChannel(channel.id);
+
+    assert.deepEqual(fixture.loadedKeys, []);
+    assert.deepEqual(fixture.authEditorCalls.at(-1), {
+      authType: 'xai_oauth',
+      credential,
+      channel,
+      credentialInfo: null
+    });
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('saving an xAI editor preserves xai_oauth and submits no key material', async () => {
+  const channel = {
+    id: 77,
+    name: 'xai-save',
+    auth_type: 'xai_oauth',
+    urls: [{ url: 'https://cli-chat-proxy.grok.com/v1', exact: false, protocols: ['codex'] }],
+    models: [],
+    enabled: true,
+    protocol_transform_mode: 'local'
+  };
+  const fixture = installEditChannelGlobals(channel, { editorKeys: [] });
+  const extraGlobals = new Map();
+  const setGlobal = (key, value) => {
+    extraGlobals.set(key, Object.getOwnPropertyDescriptor(global, key));
+    Object.defineProperty(global, key, { configurable: true, writable: true, value });
+  };
+  let submitted;
+
+  try {
+    const { editChannel, saveChannel } = loadChannelsModals();
+    await editChannel(channel.id);
+    global.redirectTableData.push({ model: 'grok-4', redirect_model: '' });
+    fixture.getElement('channelName').value = channel.name;
+    fixture.getElement('channelApiKey').value = 'must-be-cleared';
+    fixture.getElement('protocolTransformModeValue').value = 'local';
+    fixture.getElement('channelEnabled').checked = true;
+    for (const id of [
+      'channelPriority', 'channelRPMLimit', 'channelMaxConcurrency', 'channelDailyCostLimit',
+      'channelCostMultiplier', 'channelScheduledCheckModel', 'channelProxyURL'
+    ]) fixture.getElement(id).value = '0';
+    setGlobal('getValidInlineURLConfigs', () => channel.urls);
+    setGlobal('getValidInlineKeyRows', () => [{ api_key: 'must-not-submit', note: 'secret' }]);
+    setGlobal('fetchAPIWithAuth', async (_url, options) => {
+      submitted = JSON.parse(options.body);
+      return { success: false, error: 'captured' };
+    });
+
+    await saveChannel({ preventDefault() {} });
+    assert.equal(submitted.auth_type, 'xai_oauth');
+    assert.equal(submitted.api_key, '');
+    assert.deepEqual(submitted.api_keys, []);
+    assert.equal(submitted.key_strategy, undefined);
+    assert.equal(submitted.oauth_credential, undefined);
+    assert.equal(submitted.credential, undefined);
+    assert.equal(submitted.access_token, undefined);
+    assert.equal(submitted.refresh_token, undefined);
+    assert.equal(submitted.id_token, undefined);
+  } finally {
+    for (const [key, descriptor] of extraGlobals) {
+      if (descriptor === undefined) delete global[key];
+      else Object.defineProperty(global, key, descriptor);
+    }
+    fixture.restore();
+  }
+});
+
+test('editing a channel does not open a partial editor when bootstrap fails', async () => {
+  const channel = {
+    id: 74,
+    urls: [{ url: 'https://failed-bootstrap.test', exact: false, protocols: [] }]
+  };
+  const fixture = installEditChannelGlobals(channel, { editorError: new Error('database unavailable') });
+
+  try {
+    const { editChannel } = loadChannelsModals();
+    await editChannel(channel.id);
+
+    assert.deepEqual(fixture.requests, [`/admin/channels/${channel.id}/editor`]);
+    assert.deepEqual(fixture.errors, ['channels.loadChannelsFailed']);
+    assert.equal(fixture.getElement('channelModal').classList.contains('show'), false);
   } finally {
     fixture.restore();
   }
@@ -515,11 +780,13 @@ test('common models add every selected type and ignore existing names case-insen
     const { addCommonModelsToRows } = loadChannelsModals();
     const result = addCommonModelsToRows(rows, ['anthropic', 'codex', 'anthropic']);
 
-    assert.deepEqual(result, { addedCount: 11, hasSupportedTypes: true });
-    assert.equal(rows.length, 12);
+    assert.deepEqual(result, { addedCount: 13, hasSupportedTypes: true });
+    assert.equal(rows.length, 14);
     assert.equal(rows.filter(row => row.model.toLowerCase() === 'gpt-5.4').length, 1);
     assert.ok(rows.some(row => row.model === 'claude-opus-4-8'));
     assert.ok(rows.some(row => row.model === 'gpt-5.6-terra'));
+    assert.ok(rows.some(row => row.model === 'gpt-5.3-codex-spark'));
+    assert.ok(rows.some(row => row.model === 'codex-auto-review'));
   } finally {
     restore.restore();
   }
@@ -618,13 +885,20 @@ test('model submit payload includes disabled state', () => {
   ]);
 });
 
-test('fetchModelsFromAPI sends the first enabled API key', async () => {
+test('fetchModelsFromAPI sends every available API key', async () => {
   let requestBody;
   const restore = installFetchModelsGlobals({
-    rows: [{ api_key: 'disabled-key' }, { api_key: 'enabled-key' }],
+    rows: [
+      { api_key: 'disabled-key' },
+      { api_key: 'cooling-key' },
+      { api_key: 'enabled-key-1' },
+      { api_key: 'enabled-key-2' }
+    ],
     states: [
       { key_index: 0, disabled: true },
-      { key_index: 1, disabled: false }
+      { key_index: 1, disabled: false, cooldown_remaining_ms: 60_000 },
+      { key_index: 2, disabled: false },
+      { key_index: 3, disabled: false }
     ],
     onFetch: async (_url, options) => {
       requestBody = JSON.parse(options.body);
@@ -639,8 +913,93 @@ test('fetchModelsFromAPI sends the first enabled API key', async () => {
     restore();
   }
 
-  assert.equal(requestBody.api_key, 'enabled-key');
+  assert.deepEqual(requestBody.api_keys, ['enabled-key-1', 'enabled-key-2']);
+  assert.equal(requestBody.api_key, undefined);
   assert.deepEqual(requestBody.urls, [{ url: 'https://upstream.test', exact: false, protocols: ['openai'] }]);
+});
+
+test('fetchModelsFromAPI uses the earliest recovery key when all enabled keys are cooling', async () => {
+  let requestBody;
+  const restore = installFetchModelsGlobals({
+    rows: [
+      { api_key: 'disabled-key' },
+      { api_key: 'cooling-late' },
+      { api_key: 'cooling-soon' },
+      { api_key: 'cooling-soon-higher-index' }
+    ],
+    states: [
+      { key_index: 0, disabled: true },
+      { key_index: 1, disabled: false, cooldown_remaining_ms: 60_000 },
+      { key_index: 2, disabled: false, cooldown_remaining_ms: 10_000 },
+      { key_index: 3, disabled: false, cooldown_remaining_ms: 10_000 }
+    ],
+    onFetch: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return { success: false, error: 'stop after request capture' };
+    },
+    onError: () => {}
+  });
+
+  try {
+    await loadFetchModelsFromAPI()();
+  } finally {
+    restore();
+  }
+
+  assert.deepEqual(requestBody.api_keys, ['cooling-soon']);
+  assert.deepEqual(requestBody.urls, [{ url: 'https://upstream.test', exact: false, protocols: ['openai'] }]);
+});
+
+test('fetchModelsFromAPI uses the saved Antigravity channel without submitting its OAuth token', async () => {
+  const requests = [];
+  const restore = installFetchModelsGlobals({
+    rows: [{ api_key: 'oauth-access-token-that-must-not-be-submitted' }],
+    states: [{ key_index: 0, disabled: false }],
+    channelId: 42,
+    authType: 'antigravity_oauth',
+    onFetch: async (url, options) => {
+      requests.push({ url, options });
+      return { success: false, error: 'stop after request capture' };
+    },
+    onError: () => {}
+  });
+
+  try {
+    await loadFetchModelsFromAPI()();
+  } finally {
+    restore();
+  }
+
+  assert.deepEqual(requests, [{
+    url: '/admin/channels/42/models/fetch',
+    options: undefined
+  }]);
+});
+
+test('fetchModelsFromAPI uses the saved Codex channel without submitting its OAuth token', async () => {
+  const requests = [];
+  const restore = installFetchModelsGlobals({
+    rows: [{ api_key: 'codex-access-token-that-must-not-be-submitted' }],
+    states: [{ key_index: 0, disabled: false }],
+    channelId: 43,
+    authType: 'codex_oauth',
+    onFetch: async (url, options) => {
+      requests.push({ url, options });
+      return { success: false, error: 'stop after request capture' };
+    },
+    onError: () => {}
+  });
+
+  try {
+    await loadFetchModelsFromAPI()();
+  } finally {
+    restore();
+  }
+
+  assert.deepEqual(requests, [{
+    url: '/admin/channels/43/models/fetch',
+    options: undefined
+  }]);
 });
 
 test('fetchModelsFromAPI rejects a channel whose keys are all disabled', async () => {
@@ -731,7 +1090,7 @@ test('batch protocol mode submits selected channel IDs and refreshes the list', 
     await batchSetSelectedChannelsProtocolMode();
 
     assert.equal(fixture.requests.length, 1);
-    assert.equal(fixture.requests[0].url, '/admin/channels/batch-protocol-mode');
+    assert.equal(fixture.requests[0].url, '/admin/channels/batch-advanced');
     assert.equal(fixture.requests[0].options.method, 'POST');
     assert.deepEqual(JSON.parse(fixture.requests[0].options.body), {
       channel_ids: [11, 22],
@@ -752,6 +1111,147 @@ test('batch protocol mode submits selected channel IDs and refreshes the list', 
         }
       }
     }]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch cost multiplier submits a numeric patch and refreshes the list', async () => {
+  const fixture = installBatchProtocolModeGlobals({
+    success: true,
+    data: { updated: 2, unchanged: 0, not_found_count: 0 }
+  });
+
+  try {
+    const { batchSetSelectedChannelsCostMultiplier } = loadChannelsModals();
+    await batchSetSelectedChannelsCostMultiplier();
+
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].url, '/admin/channels/batch-advanced');
+    assert.deepEqual(JSON.parse(fixture.requests[0].options.body), {
+      channel_ids: [11, 22],
+      cost_multiplier: 0.5
+    });
+    assert.equal(fixture.selectedChannelIds.size, 0);
+    assert.equal(fixture.filterSaves, 1);
+    assert.equal(fixture.reloads, 1);
+    assert.deepEqual(fixture.notifications, [{
+      type: 'success',
+      message: {
+        key: 'channels.batchCostMultiplierSummary',
+        params: {
+          multiplier: 0.5,
+          updated: 2,
+          unchanged: 0,
+          notFound: 0
+        }
+      }
+    }]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch cost multiplier rejects negative values without sending a request', async () => {
+  const fixture = installBatchProtocolModeGlobals({ success: true, data: {} });
+  fixture.elements.batchCostMultiplier.value = '-1';
+
+  try {
+    const { batchSetSelectedChannelsCostMultiplier } = loadChannelsModals();
+    await batchSetSelectedChannelsCostMultiplier();
+
+    assert.equal(fixture.requests.length, 0);
+    assert.equal(fixture.selectedChannelIds.size, 2);
+    assert.equal(fixture.elements.batchCostMultiplier.attributes.get('aria-invalid'), 'true');
+    assert.equal(fixture.elements.batchCostMultiplierError.hidden, false);
+    assert.deepEqual(fixture.notifications, []);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch cost multiplier rejects an empty value instead of treating it as zero', async () => {
+  const fixture = installBatchProtocolModeGlobals({ success: true, data: {} });
+  fixture.elements.batchCostMultiplier.value = '';
+
+  try {
+    const { batchSetSelectedChannelsCostMultiplier } = loadChannelsModals();
+    await batchSetSelectedChannelsCostMultiplier();
+
+    assert.equal(fixture.requests.length, 0);
+    assert.equal(fixture.selectedChannelIds.size, 2);
+    assert.equal(fixture.elements.batchCostMultiplier.attributes.get('aria-invalid'), 'true');
+    assert.equal(fixture.elements.batchCostMultiplierError.hidden, false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch model import parses mappings and submits append mode for selected channels', async () => {
+  const fixture = installBatchProtocolModeGlobals({
+    success: true,
+    data: { updated: 2, unchanged: 0, not_found_count: 0 }
+  });
+
+  try {
+    const { confirmModelImport, openBatchModelImportModal } = loadChannelsModals();
+    openBatchModelImportModal();
+    fixture.elements.modelImportTextarea.value = 'request-a|upstream-a\npassthrough';
+    await confirmModelImport();
+
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].url, '/admin/channels/batch-advanced');
+    assert.deepEqual(JSON.parse(fixture.requests[0].options.body), {
+      channel_ids: [11, 22],
+      model_import_mode: 'append',
+      models: [
+        { model: 'request-a', redirect_model: 'upstream-a' },
+        { model: 'passthrough', redirect_model: '' }
+      ]
+    });
+    assert.equal(fixture.selectedChannelIds.size, 0);
+    assert.equal(fixture.filterSaves, 1);
+    assert.equal(fixture.reloads, 1);
+    assert.equal(fixture.appContainer.inert, false);
+    assert.equal(fixture.elements.modelImportModal.classList.contains('show'), false);
+    assert.deepEqual(fixture.notifications, [{
+      type: 'success',
+      message: {
+        key: 'channels.batchModelImportSummary',
+        params: {
+          mode: 'channels.batchModelImportModeValue.append',
+          updated: 2,
+          unchanged: 0,
+          notFound: 0
+        }
+      }
+    }]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('batch model import submits replace mode after confirmation', async () => {
+  const fixture = installBatchProtocolModeGlobals({
+    success: true,
+    data: { updated: 2, unchanged: 0, not_found_count: 0 }
+  });
+
+  try {
+    const { confirmModelImport, openBatchModelImportModal } = loadChannelsModals();
+    openBatchModelImportModal();
+    fixture.modelImportModeAppend.checked = false;
+    fixture.modelImportModeReplace.checked = true;
+    fixture.elements.modelImportTextarea.value = 'replacement|replacement-upstream';
+    await confirmModelImport();
+
+    assert.equal(fixture.requests.length, 1);
+    assert.deepEqual(JSON.parse(fixture.requests[0].options.body), {
+      channel_ids: [11, 22],
+      model_import_mode: 'replace',
+      models: [{ model: 'replacement', redirect_model: 'replacement-upstream' }]
+    });
+    assert.equal(fixture.selectedChannelIds.size, 0);
   } finally {
     fixture.restore();
   }
@@ -781,7 +1281,7 @@ test('batch protocol mode keeps the selection when the request fails', async () 
   }
 });
 
-test('batch refresh options persist and restore across page initialization', () => {
+test('model normalization options synchronize across workflows and persist', () => {
   const storageData = new Map();
   const storage = {
     getItem: key => storageData.get(key) ?? null,
@@ -796,10 +1296,20 @@ test('batch refresh options persist and restore across page initialization', () 
       dispatchChange() { listeners.get('change')?.(); }
     };
   };
-  let inputs = {
-    batchRefreshLowercaseModels: createCheckbox(),
-    batchRefreshStripModelSourcePrefix: createCheckbox()
-  };
+  const lowercaseIDs = [
+    'batchRefreshLowercaseModels',
+    'quickAddLowercaseModels',
+    'modelImportLowercaseModels'
+  ];
+  const stripPrefixIDs = [
+    'batchRefreshStripModelSourcePrefix',
+    'quickAddStripModelSourcePrefix',
+    'modelImportStripModelSourcePrefix'
+  ];
+  const createInputs = () => Object.fromEntries(
+    [...lowercaseIDs, ...stripPrefixIDs].map(id => [id, createCheckbox()])
+  );
+  let inputs = createInputs();
   const previousDocument = Object.getOwnPropertyDescriptor(global, 'document');
   Object.defineProperty(global, 'document', {
     configurable: true,
@@ -808,36 +1318,33 @@ test('batch refresh options persist and restore across page initialization', () 
   });
 
   try {
-    const { initBatchRefreshOptions } = loadChannelsModals();
-    initBatchRefreshOptions(storage);
-    assert.equal(inputs.batchRefreshLowercaseModels.checked, false);
-    assert.equal(inputs.batchRefreshStripModelSourcePrefix.checked, false);
+    const { initModelNormalizationOptions } = loadChannelsModals();
+    initModelNormalizationOptions(storage);
+    assert.equal(lowercaseIDs.every(id => inputs[id].checked === false), true);
+    assert.equal(stripPrefixIDs.every(id => inputs[id].checked === false), true);
 
-    inputs.batchRefreshLowercaseModels.checked = true;
-    inputs.batchRefreshLowercaseModels.dispatchChange();
-    inputs.batchRefreshStripModelSourcePrefix.checked = true;
-    inputs.batchRefreshStripModelSourcePrefix.dispatchChange();
-    assert.deepEqual(JSON.parse(storageData.get('channels.batchRefreshOptions')), {
+    inputs.quickAddLowercaseModels.checked = true;
+    inputs.quickAddLowercaseModels.dispatchChange();
+    assert.equal(lowercaseIDs.every(id => inputs[id].checked === true), true);
+
+    inputs.modelImportStripModelSourcePrefix.checked = true;
+    inputs.modelImportStripModelSourcePrefix.dispatchChange();
+    assert.equal(stripPrefixIDs.every(id => inputs[id].checked === true), true);
+    assert.deepEqual(JSON.parse(storageData.get('channels.modelNormalizationOptions')), {
       lowercase_models: true,
       strip_model_source_prefix: true
     });
 
-    inputs = {
-      batchRefreshLowercaseModels: createCheckbox(),
-      batchRefreshStripModelSourcePrefix: createCheckbox()
-    };
-    initBatchRefreshOptions(storage);
-    assert.equal(inputs.batchRefreshLowercaseModels.checked, true);
-    assert.equal(inputs.batchRefreshStripModelSourcePrefix.checked, true);
+    inputs = createInputs();
+    initModelNormalizationOptions(storage);
+    assert.equal(lowercaseIDs.every(id => inputs[id].checked === true), true);
+    assert.equal(stripPrefixIDs.every(id => inputs[id].checked === true), true);
 
-    storageData.set('channels.batchRefreshOptions', '{');
-    inputs = {
-      batchRefreshLowercaseModels: createCheckbox(),
-      batchRefreshStripModelSourcePrefix: createCheckbox()
-    };
-    initBatchRefreshOptions(storage);
-    assert.equal(inputs.batchRefreshLowercaseModels.checked, false);
-    assert.equal(inputs.batchRefreshStripModelSourcePrefix.checked, false);
+    storageData.set('channels.modelNormalizationOptions', '{');
+    inputs = createInputs();
+    initModelNormalizationOptions(storage);
+    assert.equal(lowercaseIDs.every(id => inputs[id].checked === false), true);
+    assert.equal(stripPrefixIDs.every(id => inputs[id].checked === false), true);
   } finally {
     if (previousDocument) Object.defineProperty(global, 'document', previousDocument);
     else delete global.document;
@@ -863,6 +1370,9 @@ test('quick add parses connection text and only returns setup after model discov
         ]
       }
     };
+  }, {
+    lowercaseModels: true,
+    stripModelSourcePrefix: true
   });
 
   assert.deepEqual(request, {
@@ -870,7 +1380,9 @@ test('quick add parses connection text and only returns setup after model discov
     body: {
       urls: [{ url: 'https://gateway.example.com/api', exact: false, protocols: [] }],
       protocol: 'openai',
-      api_key: 'sk-test-secret'
+      api_keys: ['sk-test-secret'],
+      lowercase_models: true,
+      strip_model_source_prefix: true
     }
   });
   assert.deepEqual(setup, {

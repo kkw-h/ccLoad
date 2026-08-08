@@ -10,6 +10,8 @@ func DefineChannelsTable() *TableBuilder {
 		Column("rpm_limit INT NOT NULL DEFAULT 0").
 		Column("max_concurrency INT NOT NULL DEFAULT 0").
 		Column("channel_type VARCHAR(64) NOT NULL DEFAULT 'anthropic'").
+		Column("auth_type VARCHAR(32) NOT NULL DEFAULT 'api_key'").
+		Column("oauth_credential TEXT").
 		Column("websockets TINYINT NOT NULL DEFAULT 0").
 		Column("protocol_transform_mode VARCHAR(32) NOT NULL DEFAULT 'auto'").
 		Column("enabled TINYINT NOT NULL DEFAULT 1").
@@ -22,6 +24,7 @@ func DefineChannelsTable() *TableBuilder {
 		Column("custom_request_rules TEXT").
 		Column("cooldown_detection_rules TEXT").
 		Column("proxy_url VARCHAR(255) NOT NULL DEFAULT ''").
+		Column("retry_other_keys_on_failure TINYINT NOT NULL DEFAULT 0").
 		Column("created_at BIGINT NOT NULL").
 		Column("updated_at BIGINT NOT NULL").
 		Index("idx_channels_enabled", "enabled").

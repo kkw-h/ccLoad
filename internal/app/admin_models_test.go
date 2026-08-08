@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
 
@@ -44,7 +47,7 @@ func TestAdminModels_FetchModelsPreview(t *testing.T) {
 		payload := map[string]any{
 			"protocol": " openai ",
 			"urls":     []map[string]any{{"url": upstream.URL}},
-			"api_key":  "sk-test",
+			"api_keys": []string{"sk-test"},
 		}
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
 
@@ -66,6 +69,80 @@ func TestAdminModels_FetchModelsPreview(t *testing.T) {
 		}
 		if gotAuth != "Bearer sk-test" {
 			t.Fatalf("Authorization=%q, want %q", gotAuth, "Bearer sk-test")
+		}
+	})
+
+	t.Run("multiple keys fall back after key error", func(t *testing.T) {
+		var authSequence []string
+		multiKeyUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			auth := r.Header.Get("Authorization")
+			authSequence = append(authSequence, auth)
+			if auth == "Bearer sk-bad" {
+				http.Error(w, "rate limit", http.StatusTooManyRequests)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.4"}]}`))
+		}))
+		t.Cleanup(multiKeyUpstream.Close)
+
+		payload := map[string]any{
+			"protocol": "openai",
+			"urls":     []map[string]any{{"url": multiKeyUpstream.URL, "protocols": []string{"openai"}}},
+			"api_keys": []string{"sk-bad", "sk-good"},
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
+		server.HandleFetchModelsPreview(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+		if !resp.Success || len(resp.Data.Models) != 1 || resp.Data.Models[0].Model != "gpt-5.4" {
+			t.Fatalf("unexpected response: %s", w.Body.String())
+		}
+		wantAuth := []string{"Bearer sk-bad", "Bearer sk-good"}
+		if !reflect.DeepEqual(authSequence, wantAuth) {
+			t.Fatalf("Authorization sequence=%v, want %v", authSequence, wantAuth)
+		}
+	})
+
+	t.Run("normalization options preserve upstream model names", func(t *testing.T) {
+		normalizationUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"source/OpenAI/GPT-4O"},{"id":"vendor/Claude-SONNET"}]}`))
+		}))
+		t.Cleanup(normalizationUpstream.Close)
+
+		payload := map[string]any{
+			"protocol":                  "openai",
+			"urls":                      []map[string]any{{"url": normalizationUpstream.URL}},
+			"api_keys":                  []string{"sk-test"},
+			"lowercase_models":          true,
+			"strip_model_source_prefix": true,
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
+
+		server.HandleFetchModelsPreview(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		var resp struct {
+			Success bool                `json:"success"`
+			Data    FetchModelsResponse `json:"data"`
+		}
+		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+		want := []model.ModelEntry{
+			{Model: "gpt-4o", RedirectModel: "source/OpenAI/GPT-4O"},
+			{Model: "claude-sonnet", RedirectModel: "vendor/Claude-SONNET"},
+		}
+		if !resp.Success || !reflect.DeepEqual(resp.Data.Models, want) {
+			t.Fatalf("models=%#v, want %#v, body=%s", resp.Data.Models, want, w.Body.String())
 		}
 	})
 
@@ -365,6 +442,391 @@ func TestAdminModels_HandleFetchModels(t *testing.T) {
 	})
 }
 
+func TestAdminModels_HandleFetchModels_AntigravityOAuth(t *testing.T) {
+	const accessToken = "antigravity-access-token-that-must-not-leak"
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1internal:fetchAvailableModels" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.String())
+		}
+		if r.URL.RawQuery != "" || strings.Contains(r.URL.String(), accessToken) {
+			t.Fatalf("模型发现 URL 泄漏凭证: %s", r.URL.String())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+accessToken {
+			t.Fatalf("Authorization = %q", got)
+		}
+		var request struct {
+			Project string `json:"project"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if request.Project != "project-models" {
+			t.Fatalf("project = %q", request.Project)
+		}
+		_, _ = w.Write([]byte(`{"models":{
+			"claude-opus-4-6-thinking":{},
+			"claude-sonnet-4-6":{},
+			"gemini-3.6-flash-high":{},
+			"gemini-3-flash":{},
+			"gemini-3-flash-agent":{},
+			"gemini-3.1-flash-image":{},
+			"gemini-pro-agent":{},
+			"gemini-3.1-pro-low":{},
+			"gpt-oss-120b-medium":{},
+			"gemini-3.1-flash-lite":{},
+			"gemini-3.5-flash-low":{},
+			"gemini-3.5-flash-extra-low":{},
+			"gemini-2.5-flash":{}
+		}}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.channelCache = storage.NewChannelCache(store, time.Minute)
+	server.antigravityService = antigravityauth.NewService(upstream.Client())
+	server.antigravityCredentials = newAntigravityCredentialManager(server.antigravityService, store, nil, nil)
+
+	credential := &antigravityauth.Credential{
+		Type: antigravityauth.ChannelType, AccessToken: accessToken, RefreshToken: "refresh-token",
+		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Email: "models@example.com", ProjectID: "project-models",
+	}
+	payload, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "Antigravity models", AuthType: model.AuthTypeAntigravityOAuth, OAuthCredential: payload,
+		URLs:         model.ChannelURLs{{URL: upstream.URL, Protocols: []string{"gemini"}}},
+		ModelEntries: []model.ModelEntry{{Model: "existing-model"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, fmt.Sprintf("/admin/channels/%d/models/fetch", cfg.ID), nil))
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", cfg.ID)}}
+	server.HandleFetchModels(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), accessToken) {
+		t.Fatalf("response leaked OAuth token: %s", w.Body.String())
+	}
+	resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+	want := []model.ModelEntry{
+		{Model: "claude-opus-4-6-thinking", RedirectModel: "claude-opus-4-6-thinking"},
+		{Model: "claude-sonnet-4-6", RedirectModel: "claude-sonnet-4-6"},
+		{Model: "gemini-3.6-flash-high", RedirectModel: "gemini-3.6-flash-high"},
+		{Model: "gemini-3-flash", RedirectModel: "gemini-3-flash"},
+		{Model: "gemini-3-flash-agent", RedirectModel: "gemini-3-flash-agent"},
+		{Model: "gemini-3.1-flash-image", RedirectModel: "gemini-3.1-flash-image"},
+		{Model: "gemini-pro-agent", RedirectModel: "gemini-pro-agent"},
+		{Model: "gemini-3.1-pro-low", RedirectModel: "gemini-3.1-pro-low"},
+		{Model: "gpt-oss-120b-medium", RedirectModel: "gpt-oss-120b-medium"},
+		{Model: "gemini-3.1-flash-lite", RedirectModel: "gemini-3.1-flash-lite"},
+		{Model: "gemini-3.5-flash-low", RedirectModel: "gemini-3.5-flash-low"},
+		{Model: "gemini-3.5-flash-extra-low", RedirectModel: "gemini-3.5-flash-extra-low"},
+	}
+	if !resp.Success || !reflect.DeepEqual(resp.Data.Models, want) || resp.Data.Protocol != "gemini" {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+
+	batchRequest := map[string]any{"channel_ids": []int64{cfg.ID}, "mode": "replace"}
+	batchContext, batchResponse := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/refresh-batch", batchRequest))
+	server.HandleBatchRefreshModels(batchContext)
+	var batchResult struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Updated int `json:"updated"`
+			Failed  int `json:"failed"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, batchResponse.Body.Bytes(), &batchResult)
+	if batchResponse.Code != http.StatusOK || !batchResult.Success || batchResult.Data.Updated != 1 || batchResult.Data.Failed != 0 {
+		t.Fatalf("unexpected batch response: %s", batchResponse.Body.String())
+	}
+	persisted, err := store.GetConfig(context.Background(), cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPersisted := make([]string, len(want))
+	for i, entry := range want {
+		wantPersisted[i] = entry.Model
+	}
+	if !reflect.DeepEqual(persisted.GetModels(), wantPersisted) {
+		t.Fatalf("persisted models = %#v, want %#v", persisted.GetModels(), wantPersisted)
+	}
+}
+
+func TestAdminModels_HandleFetchModels_CodexOAuth(t *testing.T) {
+	const accessToken = "codex-access-token-that-must-not-leak"
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.channelCache = storage.NewChannelCache(store, time.Minute)
+	server.codexCredentials = newCodexCredentialManager(codexauth.NewService(server.client), store, nil, nil)
+
+	credential := &codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: accessToken, RefreshToken: "refresh-token",
+		Expired: time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339), AccountID: "account-models", PlanType: "free",
+	}
+	payload, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "Codex models", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: payload,
+		URLs:         model.ChannelURLs{{URL: codexUpstreamURL, Exact: true, Protocols: []string{"codex"}}},
+		ModelEntries: []model.ModelEntry{{Model: "existing-model"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, fmt.Sprintf("/admin/channels/%d/models/fetch", cfg.ID), nil))
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", cfg.ID)}}
+	server.HandleFetchModels(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), accessToken) {
+		t.Fatalf("response leaked OAuth token: %s", w.Body.String())
+	}
+	want := []model.ModelEntry{
+		{Model: "gpt-5.6-terra", RedirectModel: "gpt-5.6-terra"},
+		{Model: "gpt-5.6-luna", RedirectModel: "gpt-5.6-luna"},
+		{Model: "gpt-5.5", RedirectModel: "gpt-5.5"},
+		{Model: "gpt-5.4-mini", RedirectModel: "gpt-5.4-mini"},
+		{Model: "codex-auto-review", RedirectModel: "codex-auto-review"},
+	}
+	resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+	if !resp.Success || !reflect.DeepEqual(resp.Data.Models, want) || resp.Data.Protocol != "codex" || resp.Data.Source != "predefined" {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+
+	batchRequest := map[string]any{"channel_ids": []int64{cfg.ID}, "mode": "replace"}
+	batchContext, batchResponse := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/refresh-batch", batchRequest))
+	server.HandleBatchRefreshModels(batchContext)
+	var batchResult struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Updated int `json:"updated"`
+			Failed  int `json:"failed"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, batchResponse.Body.Bytes(), &batchResult)
+	if batchResponse.Code != http.StatusOK || !batchResult.Success || batchResult.Data.Updated != 1 || batchResult.Data.Failed != 0 {
+		t.Fatalf("unexpected batch response: %s", batchResponse.Body.String())
+	}
+	persisted, err := store.GetConfig(context.Background(), cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPersisted := make([]string, len(want))
+	for i, entry := range want {
+		wantPersisted[i] = entry.Model
+	}
+	if !reflect.DeepEqual(persisted.GetModels(), wantPersisted) {
+		t.Fatalf("persisted models = %#v, want %#v", persisted.GetModels(), wantPersisted)
+	}
+}
+
+func TestAdminModels_HandleFetchModels_XAIOAuthUsesFixedCatalog(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.channelCache = storage.NewChannelCache(store, time.Minute)
+
+	cfg, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "xAI models", AuthType: model.AuthTypeXAIOAuth, OAuthCredential: "deliberately-not-json",
+		URLs:         model.ChannelURLs{{URL: "https://unreachable.invalid", Protocols: []string{"codex"}}},
+		ModelEntries: []model.ModelEntry{{Model: "old-model"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, fmt.Sprintf("/admin/channels/%d/models/fetch?protocol=codex", cfg.ID), nil))
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", cfg.ID)}}
+	server.HandleFetchModels(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	wantNames := []string{
+		"grok-build-0.1",
+		"grok-4.5",
+		"grok-4.3",
+		"grok-4.20-0309-reasoning",
+		"grok-4.20-0309-non-reasoning",
+		"grok-4.20-multi-agent-0309",
+		"grok-3-mini",
+		"grok-3-mini-fast",
+		"grok-composer-2.5-fast",
+	}
+	response := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+	if !response.Success || response.Data.Protocol != "codex" || response.Data.Source != "predefined" {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+	gotNames := make([]string, len(response.Data.Models))
+	for i, entry := range response.Data.Models {
+		gotNames[i] = entry.Model
+		if entry.RedirectModel != entry.Model {
+			t.Fatalf("model[%d]=%+v, want identity redirect", i, entry)
+		}
+	}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("models=%v, want=%v", gotNames, wantNames)
+	}
+}
+
+func TestAdminModels_HandleFetchModels_MultiKeyFallback(t *testing.T) {
+	var gotAuth []string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		gotAuth = append(gotAuth, auth)
+		if auth == "Bearer sk-bad" {
+			http.Error(w, "invalid api key", http.StatusUnauthorized)
+			return
+		}
+		if auth != "Bearer sk-good" {
+			http.Error(w, "unexpected api key", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.4"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.channelCache = storage.NewChannelCache(store, time.Minute)
+
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "multi-key-channel",
+		URLs:         model.ChannelURLs{{URL: upstream.URL, Protocols: []string{"openai"}}},
+		Priority:     1,
+		ModelEntries: []model.ModelEntry{{Model: "existing-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "sk-cooling", KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-bad", KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: cfg.ID, KeyIndex: 2, APIKey: "sk-good", KeyStrategy: model.KeyStrategySequential},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+	if err := store.SetKeyCooldown(ctx, cfg.ID, 0, time.Now().Add(10*time.Minute)); err != nil {
+		t.Fatalf("SetKeyCooldown failed: %v", err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/1/models/fetch", nil))
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", cfg.ID)}}
+	server.HandleFetchModels(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+	if !resp.Success || len(resp.Data.Models) != 1 || resp.Data.Models[0].Model != "gpt-5.4" {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+	wantAuth := []string{"Bearer sk-bad", "Bearer sk-good"}
+	if !reflect.DeepEqual(gotAuth, wantAuth) {
+		t.Fatalf("Authorization sequence=%v, want %v", gotAuth, wantAuth)
+	}
+}
+
+func TestAdminModels_HandleFetchModels_AllKeysCoolingUsesEarliestRecovery(t *testing.T) {
+	var gotAuth []string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.4"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.channelCache = storage.NewChannelCache(store, time.Minute)
+
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "all-keys-cooling-channel",
+		URLs:         model.ChannelURLs{{URL: upstream.URL, Protocols: []string{"openai"}}},
+		Priority:     1,
+		ModelEntries: []model.ModelEntry{{Model: "existing-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "sk-late", KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-soon", KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: cfg.ID, KeyIndex: 2, APIKey: "sk-soon-higher-index", KeyStrategy: model.KeyStrategySequential},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+	lateRecovery := time.Now().Add(10 * time.Minute).Truncate(time.Second)
+	soonRecovery := time.Now().Add(2 * time.Minute).Truncate(time.Second)
+	if err := store.SetKeyCooldown(ctx, cfg.ID, 0, lateRecovery); err != nil {
+		t.Fatalf("SetKeyCooldown(0) failed: %v", err)
+	}
+	if err := store.SetKeyCooldown(ctx, cfg.ID, 1, soonRecovery); err != nil {
+		t.Fatalf("SetKeyCooldown(1) failed: %v", err)
+	}
+	if err := store.SetKeyCooldown(ctx, cfg.ID, 2, soonRecovery); err != nil {
+		t.Fatalf("SetKeyCooldown(2) failed: %v", err)
+	}
+	before, err := store.GetAPIKeys(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys before fetch failed: %v", err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/1/models/fetch", nil))
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", cfg.ID)}}
+	server.HandleFetchModels(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+	if !resp.Success || len(resp.Data.Models) != 1 || resp.Data.Models[0].Model != "gpt-5.4" {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+	wantAuth := []string{"Bearer sk-soon"}
+	if !reflect.DeepEqual(gotAuth, wantAuth) {
+		t.Fatalf("Authorization sequence=%v, want %v", gotAuth, wantAuth)
+	}
+
+	after, err := store.GetAPIKeys(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys after fetch failed: %v", err)
+	}
+	if len(before) != len(after) {
+		t.Fatalf("key count changed after model fetch: before=%d after=%d", len(before), len(after))
+	}
+	for i := range before {
+		if after[i].CooldownUntil != before[i].CooldownUntil {
+			t.Fatalf("key %d cooldown changed after model fetch: before=%d after=%d", before[i].KeyIndex, before[i].CooldownUntil, after[i].CooldownUntil)
+		}
+	}
+}
+
 func TestAdminModels_HandleFetchModels_MultiURL(t *testing.T) {
 	failCalls := 0
 	failUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -514,13 +976,18 @@ func TestAdminModels_HandleFetchModels_MultiURL_KeyErrorDoesNotCooldownURL(t *te
 func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 	t.Run("merge mode partial success", func(t *testing.T) {
 		// channel1: 返回 m1,m2（新增1个）
-		var upstream1Auth string
+		var upstream1Auth []string
 		upstream1 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/v1/models" {
 				http.NotFound(w, r)
 				return
 			}
-			upstream1Auth = r.Header.Get("Authorization")
+			auth := r.Header.Get("Authorization")
+			upstream1Auth = append(upstream1Auth, auth)
+			if auth == "Bearer bad-k1" {
+				http.Error(w, "invalid api key", http.StatusUnauthorized)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"data":[{"id":"m1"},{"id":"m2"}]}`))
 		}))
@@ -543,7 +1010,7 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		ctx := context.Background()
 		c1, err := store.CreateConfig(ctx, &model.Config{
 			Name:         "c1",
-			URLs:         model.ChannelURLs{{URL: upstream1.URL}},
+			URLs:         model.ChannelURLs{{URL: upstream1.URL, Protocols: []string{"openai"}}},
 			Priority:     1,
 			ModelEntries: []model.ModelEntry{{Model: "m1"}},
 			Enabled:      true,
@@ -574,7 +1041,8 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 
 		if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
 			{ChannelID: c1.ID, KeyIndex: 0, APIKey: "disabled-k1", KeyStrategy: model.KeyStrategySequential, Disabled: true},
-			{ChannelID: c1.ID, KeyIndex: 1, APIKey: "k1", KeyStrategy: model.KeyStrategySequential},
+			{ChannelID: c1.ID, KeyIndex: 1, APIKey: "bad-k1", KeyStrategy: model.KeyStrategySequential},
+			{ChannelID: c1.ID, KeyIndex: 2, APIKey: "k1", KeyStrategy: model.KeyStrategySequential},
 			{ChannelID: c2.ID, KeyIndex: 0, APIKey: "k2", KeyStrategy: model.KeyStrategySequential},
 		}); err != nil {
 			t.Fatalf("CreateAPIKeysBatch failed: %v", err)
@@ -605,8 +1073,9 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		if resp.Data.Updated != 1 || resp.Data.Unchanged != 1 || resp.Data.Failed != 1 {
 			t.Fatalf("unexpected summary: %+v", resp.Data)
 		}
-		if upstream1Auth != "Bearer k1" {
-			t.Fatalf("Authorization=%q, want %q", upstream1Auth, "Bearer k1")
+		wantAuth := []string{"Bearer bad-k1", "Bearer k1"}
+		if !reflect.DeepEqual(upstream1Auth, wantAuth) {
+			t.Fatalf("Authorization sequence=%v, want %v", upstream1Auth, wantAuth)
 		}
 
 		got1, err := store.GetConfig(ctx, c1.ID)

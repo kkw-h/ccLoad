@@ -74,6 +74,8 @@ const (
 	// WebsocketConnectionLimitCooldown 是上游 WebSocket 并发连接槽耗尽时的渠道冷却时长。
 	// 连接槽是瞬时资源：冷却只需覆盖“切走再回来”的窗口，绝不能走指数退避。
 	WebsocketConnectionLimitCooldown = 5 * time.Second
+	// xaiFreeUsageExhaustedCooldown 是 xAI 免费额度声明的滚动窗口上限。
+	xaiFreeUsageExhaustedCooldown = 24 * time.Hour
 	// RateLimitScope 常量
 	RateLimitScopeGlobal  = "global"
 	RateLimitScopeIP      = "ip"
@@ -118,49 +120,69 @@ type HTTPResponseClassification struct {
 	ChannelCooldownReason   string
 }
 
-// sseErrorResponse SSE error事件的JSON结构（Anthropic API / 88code API）
+// sseErrorResponse SSE error事件的通用JSON结构（兼容 error.type / error.code）
 // [FIX] 提取为公共结构体，消除 classifySSEError 和 ParseResetTimeFrom1308Error 的重复定义
 type sseErrorResponse struct {
-	Type  string `json:"type"`
-	Error struct {
-		Type    string `json:"type"` // Anthropic使用
-		Code    string `json:"code"` // 其他渠道使用
-		Message string `json:"message"`
-	} `json:"error"`
+	Type     string         `json:"type"`
+	Code     string         `json:"code"`
+	Message  string         `json:"message"`
+	Error    sseErrorDetail `json:"error"`
+	Response struct {
+		Error sseErrorDetail `json:"error"`
+	} `json:"response"`
+}
+
+type sseErrorDetail struct {
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type structuredQuotaErrorResponse struct {
-	Code            any             `json:"code"`
-	Message         string          `json:"message"`
-	Model           string          `json:"model"`
-	ResetSeconds    int64           `json:"reset_seconds"`
-	ResetsInSeconds int64           `json:"resets_in_seconds"` // 部分上游使用复数形式
-	ResetsAt        int64           `json:"resets_at"`         // unix 时间戳
-	ResetTime       string          `json:"reset_time"`
-	Status          string          `json:"status"`
-	Error           json.RawMessage `json:"error"`
+	Code            any                          `json:"code"`
+	Message         string                       `json:"message"`
+	Model           string                       `json:"model"`
+	ResetSeconds    int64                        `json:"reset_seconds"`
+	ResetsInSeconds int64                        `json:"resets_in_seconds"` // 部分上游使用复数形式
+	ResetsAt        int64                        `json:"resets_at"`         // unix 时间戳
+	ResetTime       string                       `json:"reset_time"`
+	Status          string                       `json:"status"`
+	Details         []structuredQuotaErrorDetail `json:"details"`
+	Error           json.RawMessage              `json:"error"`
 }
 
 type structuredQuotaErrorObject struct {
-	Type            any    `json:"type"`
-	Code            any    `json:"code"`
-	Message         string `json:"message"`
-	Model           string `json:"model"`
-	ResetSeconds    int64  `json:"reset_seconds"`
-	ResetsInSeconds int64  `json:"resets_in_seconds"` // 部分上游使用复数形式
-	ResetsAt        int64  `json:"resets_at"`         // unix 时间戳
-	ResetTime       string `json:"reset_time"`
-	Status          string `json:"status"`
+	Type            any                          `json:"type"`
+	Code            any                          `json:"code"`
+	Message         string                       `json:"message"`
+	Model           string                       `json:"model"`
+	ResetSeconds    int64                        `json:"reset_seconds"`
+	ResetsInSeconds int64                        `json:"resets_in_seconds"` // 部分上游使用复数形式
+	ResetsAt        int64                        `json:"resets_at"`         // unix 时间戳
+	ResetTime       string                       `json:"reset_time"`
+	Status          string                       `json:"status"`
+	Details         []structuredQuotaErrorDetail `json:"details"`
+}
+
+type structuredQuotaErrorDetail struct {
+	Reason   string `json:"reason"`
+	Metadata struct {
+		Model               string `json:"model"`
+		QuotaResetDelay     string `json:"quotaResetDelay"`
+		QuotaResetTimeStamp string `json:"quotaResetTimeStamp"`
+	} `json:"metadata"`
 }
 
 type structuredQuotaError struct {
-	code         string
-	message      string
-	model        string
-	resetSeconds int64
-	resetsAt     int64 // unix 时间戳（秒）
-	resetTime    string
-	status       string
+	code                string
+	message             string
+	model               string
+	resetSeconds        int64
+	resetsAt            int64 // unix 时间戳（秒）
+	resetTime           string
+	status              string
+	quotaResetDelay     string
+	quotaResetTimeStamp string
 }
 
 // ErrorType 返回错误类型（优先使用type字段，如果为空则使用code字段）
@@ -170,6 +192,48 @@ func (r *sseErrorResponse) ErrorType() string {
 		return r.Error.Type
 	}
 	return r.Error.Code
+}
+
+// IsContextLengthExceededError reports whether an upstream error says that the
+// current request exceeds the model context window. Codex can emit the error as
+// error, response.error, or a top-level streaming error object.
+func IsContextLengthExceededError(responseBody []byte) bool {
+	if len(responseBody) == 0 {
+		return false
+	}
+
+	var payload sseErrorResponse
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return false
+	}
+
+	details := [...]sseErrorDetail{
+		payload.Error,
+		payload.Response.Error,
+		{Type: payload.Type, Code: payload.Code, Message: payload.Message},
+	}
+	for _, detail := range details {
+		code := strings.ToLower(strings.TrimSpace(detail.Code))
+		if code == "context_length_exceeded" || code == "context_too_large" {
+			return true
+		}
+		if code != "" && code != "invalid_request_error" && code != "bad_request_error" {
+			continue
+		}
+
+		errorType := strings.ToLower(strings.TrimSpace(detail.Type))
+		if errorType != "" && errorType != "error" && errorType != "invalid_request_error" && errorType != "bad_request_error" {
+			continue
+		}
+		message := strings.ToLower(strings.TrimSpace(detail.Message))
+		if strings.Contains(message, "context window") ||
+			strings.Contains(message, "context length") ||
+			strings.Contains(message, "maximum context") ||
+			strings.Contains(message, "too many tokens") {
+			return true
+		}
+	}
+	return false
 }
 
 // statusCodeMetaMap 状态码元数据映射表
@@ -210,7 +274,7 @@ var statusCodeMetaMap = map[int]StatusCodeMeta{
 	// 作为渠道级故障处理：触发渠道冷却。
 	405: {ErrorLevelChannel}, // Method Not Allowed
 	406: {ErrorLevelClient},  // Not Acceptable
-	410: {ErrorLevelClient},  // Gone
+	410: {ErrorLevelClient},  // Gone（模型退役由响应语义收窄为模型级故障）
 	413: {ErrorLevelClient},  // Payload Too Large
 	414: {ErrorLevelClient},  // URI Too Long
 	415: {ErrorLevelClient},  // Unsupported Media Type
@@ -360,6 +424,13 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 		return classification
 	}
 
+	// 上下文超限由当前请求体决定，切换 Key、模型或渠道都不会改变结果。
+	// SSE 路径使用 597 承载 HTTP 200 中的错误事件；普通 Codex 错误使用 400/413。
+	if (statusCode == StatusSSEError || statusCode == http.StatusBadRequest || statusCode == http.StatusRequestEntityTooLarge) &&
+		IsContextLengthExceededError(responseBody) {
+		return HTTPResponseClassification{Level: ErrorLevelClient}
+	}
+
 	// [INFO] 597 SSE error事件：解析实际错误类型动态判断级别
 	// SSE error JSON格式: {"type":"error","error":{"type":"api_error","message":"上游API返回错误: 500"}}
 	// 服务类错误切换渠道但只冷却当前模型；认证/限流类错误仍冷却 Key。
@@ -398,11 +469,20 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 		}
 	}
 
+	// 410 Gone 通常表示资源已永久移除。只有响应明确指向模型退役时才切换渠道并
+	// 冷却当前实际模型；其他资源的 410 仍由客户端处理，避免盲目重放请求。
+	if statusCode == http.StatusGone && isModelUnavailableResponse(responseBody) {
+		return HTTPResponseClassification{
+			Level:       ErrorLevelChannel,
+			ModelScoped: true,
+		}
+	}
+
 	// 404错误：根据响应体智能分类
 	if statusCode == 404 {
 		return HTTPResponseClassification{
 			Level:       classify404Error(responseBody),
-			ModelScoped: isModelUnavailable404(responseBody),
+			ModelScoped: isModelUnavailableResponse(responseBody),
 		}
 	}
 
@@ -619,10 +699,19 @@ func parseStructuredQuotaCooldown(responseBody []byte, now time.Time) (time.Time
 		}
 		return time.Time{}, "model_cooldown", ErrorLevelKey, true
 	case quotaErr.status == "RESOURCE_EXHAUSTED" || strings.Contains(messageUpper, "RESOURCE_EXHAUSTED"):
+		if until, ok := parseStructuredCooldownUntil(quotaErr, now); ok {
+			return until, "RESOURCE_EXHAUSTED", ErrorLevelKey, true
+		}
 		if until, ok := parseRetryInCooldownUntil(message, now); ok {
 			return until, "RESOURCE_EXHAUSTED_RETRY_IN", ErrorLevelKey, true
 		}
 		return time.Time{}, "", ErrorLevelNone, false
+	case strings.Contains(code, "FREE-USAGE-EXHAUSTED") ||
+		strings.Contains(messageUpper, "FREE-USAGE-EXHAUSTED") ||
+		strings.Contains(messageUpper, "INCLUDED FREE USAGE"):
+		// xAI 不提供精确 reset 时间，只承诺滚动 24 小时窗口。账户级
+		// 429 在分类出口会收窄为当前模型，避免误伤同渠道其他模型。
+		return now.Add(xaiFreeUsageExhaustedCooldown), "XAI_FREE_USAGE_EXHAUSTED", ErrorLevelChannel, true
 	case code == "API_KEY_QUOTA_EXHAUSTED":
 		return now.Add(30 * time.Minute), "API_KEY_QUOTA_EXHAUSTED", ErrorLevelKey, true
 	case code == "FREE_TIER_BUDGET_EXCEEDED" || strings.Contains(messageUpper, "FREE_TIER_BUDGET_EXCEEDED"):
@@ -672,6 +761,7 @@ func parseStructuredQuotaError(responseBody []byte) (structuredQuotaError, bool)
 		resetTime:    errResp.ResetTime,
 		status:       strings.ToUpper(strings.TrimSpace(errResp.Status)),
 	}
+	mergeStructuredQuotaDetails(&parsed, errResp.Details)
 
 	if len(errResp.Error) > 0 {
 		var errorText string
@@ -706,11 +796,32 @@ func parseStructuredQuotaError(responseBody []byte) (structuredQuotaError, bool)
 				if parsed.status == "" {
 					parsed.status = strings.ToUpper(strings.TrimSpace(errorObj.Status))
 				}
+				mergeStructuredQuotaDetails(&parsed, errorObj.Details)
 			}
 		}
 	}
 
 	return parsed, parsed.code != "" || parsed.message != "" || parsed.status != ""
+}
+
+func mergeStructuredQuotaDetails(parsed *structuredQuotaError, details []structuredQuotaErrorDetail) {
+	if parsed == nil {
+		return
+	}
+	for _, detail := range details {
+		if parsed.model == "" {
+			parsed.model = strings.TrimSpace(detail.Metadata.Model)
+		}
+		if parsed.quotaResetTimeStamp == "" {
+			parsed.quotaResetTimeStamp = strings.TrimSpace(detail.Metadata.QuotaResetTimeStamp)
+		}
+		if parsed.quotaResetDelay == "" {
+			parsed.quotaResetDelay = strings.TrimSpace(detail.Metadata.QuotaResetDelay)
+		}
+		if parsed.quotaResetTimeStamp != "" && parsed.quotaResetDelay != "" && parsed.model != "" {
+			return
+		}
+	}
 }
 
 // ExtractUpstreamErrorCodeAndMessage returns the canonical error code and message
@@ -768,15 +879,28 @@ func parseStructuredCooldownUntil(quotaErr structuredQuotaError, now time.Time) 
 		}
 	}
 
-	if quotaErr.resetTime == "" {
-		return time.Time{}, false
+	if quotaErr.quotaResetTimeStamp != "" {
+		until, err := time.Parse(time.RFC3339, quotaErr.quotaResetTimeStamp)
+		if err == nil && until.After(now) {
+			return until, true
+		}
 	}
 
-	duration, err := time.ParseDuration(quotaErr.resetTime)
-	if err != nil || duration <= 0 {
-		return time.Time{}, false
+	if quotaErr.resetTime != "" {
+		duration, err := time.ParseDuration(quotaErr.resetTime)
+		if err == nil && duration > 0 {
+			return now.Add(duration), true
+		}
 	}
-	return now.Add(duration), true
+
+	if quotaErr.quotaResetDelay != "" {
+		duration, err := time.ParseDuration(quotaErr.quotaResetDelay)
+		if err == nil && duration > 0 {
+			return now.Add(duration), true
+		}
+	}
+
+	return time.Time{}, false
 }
 
 func parseRetryInCooldownUntil(message string, now time.Time) (time.Time, bool) {
@@ -880,7 +1004,7 @@ func parseBeijingTomorrowResetTime(message string, now time.Time) (time.Time, bo
 //   - 其他情况（渠道级）：空响应、HTML、异常 JSON 等都应切换渠道
 func classify404Error(responseBody []byte) ErrorLevel {
 	// 仅当明确是"模型不存在"时才视为客户端错误
-	if isModelUnavailable404(responseBody) {
+	if isModelUnavailableResponse(responseBody) {
 		return ErrorLevelClient
 	}
 
@@ -889,9 +1013,9 @@ func classify404Error(responseBody []byte) ErrorLevel {
 	return ErrorLevelChannel
 }
 
-// isModelUnavailable404 只识别模型作用域的 404。
-// 普通 endpoint/BaseURL 404 必须继续按渠道故障处理，不能因为请求里带了模型名就误伤模型。
-func isModelUnavailable404(responseBody []byte) bool {
+// isModelUnavailableResponse 只识别明确的模型不可用语义。
+// 普通 endpoint/BaseURL 错误必须继续按资源自身的故障级别处理，不能因为请求里带了模型名就误伤模型。
+func isModelUnavailableResponse(responseBody []byte) bool {
 	if len(responseBody) == 0 {
 		return false
 	}
@@ -904,7 +1028,9 @@ func isModelUnavailable404(responseBody []byte) bool {
 			strings.Contains(bodyLower, "不存在") ||
 			strings.Contains(bodyLower, "未找到") ||
 			strings.Contains(bodyLower, "找不到") ||
-			strings.Contains(bodyLower, "不可用")
+			strings.Contains(bodyLower, "不可用") ||
+			strings.Contains(bodyLower, "已下线") ||
+			strings.Contains(bodyLower, "停止服务")
 	}
 	if !strings.Contains(bodyLower, "model") {
 		return false
@@ -913,7 +1039,9 @@ func isModelUnavailable404(responseBody []byte) bool {
 		strings.Contains(bodyLower, "not supported") ||
 		strings.Contains(bodyLower, "not found") ||
 		strings.Contains(bodyLower, "does not exist") ||
-		strings.Contains(bodyLower, "not available")
+		strings.Contains(bodyLower, "not available") ||
+		strings.Contains(bodyLower, "no longer available") ||
+		strings.Contains(bodyLower, "end of life")
 }
 
 // ShouldFallbackProtocol reports whether automatic protocol negotiation may
@@ -933,7 +1061,7 @@ func ShouldFallbackProtocol(statusCode int, responseBody []byte) bool {
 	case 405:
 		return true
 	case 404:
-		return !isModelUnavailable404(responseBody)
+		return !isModelUnavailableResponse(responseBody)
 	case 500:
 		return isProtocolConversionNotImplemented(responseBody)
 	default:

@@ -5,13 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
+// Channel authentication mechanisms and protocol transformation modes.
 const (
+	AuthTypeAPIKey           = "api_key"
+	AuthTypeCodexOAuth       = "codex_oauth"
+	AuthTypeAntigravityOAuth = "antigravity_oauth"
+	AuthTypeXAIOAuth         = "xai_oauth"
+
 	// ProtocolTransformModeAuto tries the client protocol first, then falls back through
 	// Anthropic, OpenAI, Codex, Gemini while skipping the native protocol already attempted.
 	ProtocolTransformModeAuto = "auto"
@@ -22,6 +29,23 @@ const (
 	// ExactUpstreamURLMarker marks a configured channel URL as the exact upstream request URL.
 	ExactUpstreamURLMarker = "#"
 )
+
+// NormalizeAuthType normalizes the channel credential mechanism. Empty is the
+// database migration default for every pre-existing channel.
+func NormalizeAuthType(value string) string {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "", AuthTypeAPIKey:
+		return AuthTypeAPIKey
+	case AuthTypeCodexOAuth:
+		return AuthTypeCodexOAuth
+	case AuthTypeAntigravityOAuth:
+		return AuthTypeAntigravityOAuth
+	case AuthTypeXAIOAuth:
+		return AuthTypeXAIOAuth
+	default:
+		return ""
+	}
+}
 
 // NormalizeProtocolTransformMode normalizes persisted/admin values.
 // Empty means the current default policy: automatic negotiation.
@@ -190,6 +214,84 @@ type ModelEntry struct {
 	Disabled      bool   `json:"disabled,omitempty"`       // 是否停用该渠道的此模型
 }
 
+const (
+	// ModelImportModeAppend 保留原有模型并追加新模型。
+	ModelImportModeAppend = "append"
+	// ModelImportModeReplace 用导入模型完全替换原有模型。
+	ModelImportModeReplace = "replace"
+)
+
+// BatchConfigPatch 只修改显式提供的渠道字段。
+// ModelImportMode 为空时不修改模型；非空时 ModelEntries 必须至少包含一个条目。
+type BatchConfigPatch struct {
+	CostMultiplier        *float64
+	ProtocolTransformMode *string
+	ModelEntries          []ModelEntry
+	ModelImportMode       string
+}
+
+// BatchConfigPatchResult 汇总一次原子批量更新的结果。
+type BatchConfigPatchResult struct {
+	Updated   int
+	Unchanged int
+	NotFound  []int64
+}
+
+// Normalize validates a batch patch and returns an independent normalized copy.
+func (p BatchConfigPatch) Normalize() (BatchConfigPatch, error) {
+	if p.CostMultiplier == nil && p.ProtocolTransformMode == nil && p.ModelImportMode == "" && p.ModelEntries == nil {
+		return BatchConfigPatch{}, errors.New("batch config patch cannot be empty")
+	}
+	if p.CostMultiplier != nil {
+		value := *p.CostMultiplier
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return BatchConfigPatch{}, fmt.Errorf("cost_multiplier must be a finite number >= 0 (got %v)", value)
+		}
+		p.CostMultiplier = &value
+	}
+	if p.ProtocolTransformMode != nil {
+		rawMode := strings.TrimSpace(*p.ProtocolTransformMode)
+		mode := NormalizeProtocolTransformMode(rawMode)
+		if rawMode == "" || mode == "" {
+			return BatchConfigPatch{}, fmt.Errorf("invalid protocol_transform_mode %q", *p.ProtocolTransformMode)
+		}
+		p.ProtocolTransformMode = &mode
+	}
+
+	p.ModelImportMode = strings.ToLower(strings.TrimSpace(p.ModelImportMode))
+	if p.ModelImportMode == "" {
+		if p.ModelEntries != nil {
+			return BatchConfigPatch{}, errors.New("model_import_mode is required when models are provided")
+		}
+		return p, nil
+	}
+	if p.ModelImportMode != ModelImportModeAppend && p.ModelImportMode != ModelImportModeReplace {
+		return BatchConfigPatch{}, fmt.Errorf("invalid model_import_mode %q", p.ModelImportMode)
+	}
+	if len(p.ModelEntries) == 0 {
+		return BatchConfigPatch{}, errors.New("models cannot be empty")
+	}
+
+	seenModels := make(map[string]struct{}, len(p.ModelEntries))
+	normalizedModels := make([]ModelEntry, len(p.ModelEntries))
+	for i, entry := range p.ModelEntries {
+		if err := entry.Validate(); err != nil {
+			return BatchConfigPatch{}, fmt.Errorf("models[%d]: %w", i, err)
+		}
+		if entry.RedirectModel == entry.Model {
+			entry.RedirectModel = ""
+		}
+		key := strings.ToLower(entry.Model)
+		if _, ok := seenModels[key]; ok {
+			return BatchConfigPatch{}, fmt.Errorf("duplicate model %q", entry.Model)
+		}
+		seenModels[key] = struct{}{}
+		normalizedModels[i] = entry
+	}
+	p.ModelEntries = normalizedModels
+	return p, nil
+}
+
 // Validate 验证并规范化模型条目
 // 返回 error 如果验证失败，否则返回 nil
 // 副作用：会 trim 空白字符并写回 Model 和 RedirectModel 字段
@@ -331,6 +433,7 @@ func (r *CooldownDetectionRules) Clone() *CooldownDetectionRules {
 type Config struct {
 	ID                    int64       `json:"id"`
 	Name                  string      `json:"name"`
+	AuthType              string      `json:"auth_type"`
 	Websockets            bool        `json:"websockets,omitempty"`
 	ProtocolTransformMode string      `json:"protocol_transform_mode"`
 	URLs                  ChannelURLs `json:"urls"`
@@ -363,6 +466,18 @@ type Config struct {
 	// 渠道级代理（http/https/socks5/socks5h），空串=环境变量代理
 	ProxyURL string `json:"proxy_url,omitempty"`
 
+	// 渠道故障时先将当前 Key 冷却并尝试同渠道其他 Key。
+	// 用于一个中转站下的 Key 实际对应不同上游服务商的场景；默认关闭，保持原有渠道/模型级切换语义。
+	RetryOtherKeysOnFailure bool `json:"retry_other_keys_on_failure"`
+
+	// OAuthCredential is the private CLIProxy-compatible OAuth JSON stored in
+	// the channels table. It must never be serialized by an API response.
+	OAuthCredential        string `json:"-"`
+	CodexAccessToken       string `json:"-"`
+	CodexAccountID         string `json:"-"`
+	AntigravityAccessToken string `json:"-"`
+	AntigravityProjectID   string `json:"-"`
+
 	CreatedAt JSONTime `json:"created_at"` // 使用JSONTime确保序列化格式一致（RFC3339）
 	UpdatedAt JSONTime `json:"updated_at"` // 使用JSONTime确保序列化格式一致（RFC3339）
 
@@ -385,34 +500,73 @@ func (c *Config) Clone() *Config {
 		return nil
 	}
 	dst := &Config{
-		ID:                     c.ID,
-		Name:                   c.Name,
-		Websockets:             c.Websockets,
-		ProtocolTransformMode:  c.ProtocolTransformMode,
-		URLs:                   c.URLs.Clone(),
-		Priority:               c.Priority,
-		RPMLimit:               c.RPMLimit,
-		MaxConcurrency:         c.MaxConcurrency,
-		Enabled:                c.Enabled,
-		ScheduledCheckEnabled:  c.ScheduledCheckEnabled,
-		ScheduledCheckModel:    c.ScheduledCheckModel,
-		CooldownUntil:          c.CooldownUntil,
-		CooldownDurationMs:     c.CooldownDurationMs,
-		DailyCostLimit:         c.DailyCostLimit,
-		CostMultiplier:         c.CostMultiplier,
-		CustomRequestRules:     c.CustomRequestRules.Clone(),
-		CooldownDetectionRules: c.CooldownDetectionRules.Clone(),
-		ProxyURL:               c.ProxyURL,
-		CreatedAt:              c.CreatedAt,
-		UpdatedAt:              c.UpdatedAt,
-		KeyCount:               c.KeyCount,
-		CooldownFallback:       c.CooldownFallback,
+		ID:                      c.ID,
+		Name:                    c.Name,
+		AuthType:                c.AuthType,
+		Websockets:              c.Websockets,
+		ProtocolTransformMode:   c.ProtocolTransformMode,
+		URLs:                    c.URLs.Clone(),
+		Priority:                c.Priority,
+		RPMLimit:                c.RPMLimit,
+		MaxConcurrency:          c.MaxConcurrency,
+		Enabled:                 c.Enabled,
+		ScheduledCheckEnabled:   c.ScheduledCheckEnabled,
+		ScheduledCheckModel:     c.ScheduledCheckModel,
+		CooldownUntil:           c.CooldownUntil,
+		CooldownDurationMs:      c.CooldownDurationMs,
+		DailyCostLimit:          c.DailyCostLimit,
+		CostMultiplier:          c.CostMultiplier,
+		CustomRequestRules:      c.CustomRequestRules.Clone(),
+		CooldownDetectionRules:  c.CooldownDetectionRules.Clone(),
+		ProxyURL:                c.ProxyURL,
+		RetryOtherKeysOnFailure: c.RetryOtherKeysOnFailure,
+		OAuthCredential:         c.OAuthCredential,
+		CodexAccessToken:        c.CodexAccessToken,
+		CodexAccountID:          c.CodexAccountID,
+		AntigravityAccessToken:  c.AntigravityAccessToken,
+		AntigravityProjectID:    c.AntigravityProjectID,
+		CreatedAt:               c.CreatedAt,
+		UpdatedAt:               c.UpdatedAt,
+		KeyCount:                c.KeyCount,
+		CooldownFallback:        c.CooldownFallback,
 	}
 	if c.ModelEntries != nil {
 		dst.ModelEntries = make([]ModelEntry, len(c.ModelEntries))
 		copy(dst.ModelEntries, c.ModelEntries)
 	}
 	return dst
+}
+
+// GetAuthType returns the normalized credential mechanism.
+func (c *Config) GetAuthType() string {
+	if c == nil {
+		return AuthTypeAPIKey
+	}
+	authType := NormalizeAuthType(c.AuthType)
+	if authType == "" {
+		return AuthTypeAPIKey
+	}
+	return authType
+}
+
+// UsesCodexOAuth reports whether this channel is backed by a dynamic Codex credential.
+func (c *Config) UsesCodexOAuth() bool {
+	return c != nil && c.GetAuthType() == AuthTypeCodexOAuth
+}
+
+// UsesAntigravityOAuth reports whether this channel is backed by an Antigravity credential.
+func (c *Config) UsesAntigravityOAuth() bool {
+	return c != nil && c.GetAuthType() == AuthTypeAntigravityOAuth
+}
+
+// UsesXAIOAuth reports whether this channel is backed by an xAI credential.
+func (c *Config) UsesXAIOAuth() bool {
+	return c != nil && c.GetAuthType() == AuthTypeXAIOAuth
+}
+
+// UsesOAuth reports whether API keys are replaced by a private OAuth credential.
+func (c *Config) UsesOAuth() bool {
+	return c != nil && c.GetAuthType() != AuthTypeAPIKey
 }
 
 // GetModels 获取所有已启用的模型名称列表
@@ -489,8 +643,11 @@ func (c *Config) SupportsModel(model string) bool {
 	c.buildIndexIfNeeded()
 	c.indexMu.RLock()
 	defer c.indexMu.RUnlock()
-	_, exists := c.modelIndex[model]
-	return exists
+	if _, exists := c.modelIndex[model]; exists {
+		return true
+	}
+	_, wildcard := c.modelIndex["*"]
+	return wildcard
 }
 
 // IsCoolingDown 检查渠道是否处于冷却状态

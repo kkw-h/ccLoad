@@ -102,6 +102,64 @@ func TestHandleListChannels(t *testing.T) {
 	}
 }
 
+func TestHandleListChannelsIncludesActiveModelCooldowns(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "model-cooldown-list",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority:     100,
+		ModelEntries: []model.ModelEntry{{Model: "external-model", RedirectModel: "upstream-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+
+	until := time.Now().Add(10 * time.Minute).Truncate(time.Second)
+	if err := store.SetModelCooldown(ctx, created.ID, "upstream-model", until); err != nil {
+		t.Fatalf("设置模型冷却失败: %v", err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+	server.handleListChannels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			ID             int64               `json:"id"`
+			ModelCooldowns []ModelCooldownInfo `json:"model_cooldowns"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !resp.Success || len(resp.Data) != 1 {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+	if resp.Data[0].ID != created.ID {
+		t.Fatalf("id=%d, want %d", resp.Data[0].ID, created.ID)
+	}
+	if len(resp.Data[0].ModelCooldowns) != 1 {
+		t.Fatalf("model_cooldowns=%v, want one active cooldown", resp.Data[0].ModelCooldowns)
+	}
+	got := resp.Data[0].ModelCooldowns[0]
+	if got.Model != "upstream-model" {
+		t.Fatalf("model=%q, want upstream-model", got.Model)
+	}
+	if got.CooldownUntil == nil || !got.CooldownUntil.Equal(until) {
+		t.Fatalf("cooldown_until=%v, want %v", got.CooldownUntil, until)
+	}
+	if got.CooldownRemainingMS <= 0 {
+		t.Fatalf("cooldown_remaining_ms=%d, want > 0", got.CooldownRemainingMS)
+	}
+}
+
 func TestHandleListChannelsExactAndFuzzyFilters(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -185,6 +243,134 @@ func TestHandleListChannelsExactAndFuzzyFilters(t *testing.T) {
 				t.Fatalf("names=%v, want %v", gotNames, tt.wantNames)
 			}
 		})
+	}
+}
+
+func TestHandleListChannelsFiltersByAuthenticationType(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	fixtures := []*model.Config{
+		{
+			Name: "api-auth", URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+			AuthType: model.AuthTypeAPIKey, Enabled: true,
+		},
+		{
+			Name: "codex-auth", URLs: model.ChannelURLs{{URL: "https://chatgpt.com/backend-api/codex/responses"}},
+			AuthType: model.AuthTypeCodexOAuth, OAuthCredential: `{}`, Enabled: true,
+		},
+		{
+			Name: "antigravity-auth", URLs: model.ChannelURLs{{URL: "https://cloudcode-pa.googleapis.com"}},
+			AuthType: model.AuthTypeAntigravityOAuth, OAuthCredential: `{}`, Enabled: true,
+		},
+	}
+	for _, fixture := range fixtures {
+		if _, err := store.CreateConfig(ctx, fixture); err != nil {
+			t.Fatalf("CreateConfig(%s) failed: %v", fixture.Name, err)
+		}
+	}
+
+	for _, tt := range []struct {
+		authType string
+		wantName string
+	}{
+		{authType: model.AuthTypeAPIKey, wantName: "api-auth"},
+		{authType: model.AuthTypeCodexOAuth, wantName: "codex-auth"},
+		{authType: model.AuthTypeAntigravityOAuth, wantName: "antigravity-auth"},
+	} {
+		t.Run(tt.authType, func(t *testing.T) {
+			path := "/admin/channels?auth_type=" + tt.authType + "&limit=20&offset=0"
+			c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+			server.handleListChannels(c)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			resp := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
+			if resp.Count != 1 || len(resp.Data) != 1 || resp.Data[0].Name != tt.wantName {
+				t.Fatalf("response=%s, want only %q", w.Body.String(), tt.wantName)
+			}
+		})
+	}
+}
+
+func TestChannelCooldownFilterIncludesChannelKeyAndModelCooldowns(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	channelIDs := make(map[string]int64)
+	for _, fixture := range []struct {
+		name  string
+		model string
+	}{
+		{name: "channel-cooldown", model: "channel-model"},
+		{name: "key-cooldown", model: "key-model"},
+		{name: "model-cooldown", model: "model-target"},
+		{name: "healthy", model: "healthy-model"},
+	} {
+		created, err := store.CreateConfig(ctx, &model.Config{
+			Name:         fixture.name,
+			URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+			Priority:     1,
+			ModelEntries: []model.ModelEntry{{Model: fixture.model}},
+			Enabled:      true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig(%s) failed: %v", fixture.name, err)
+		}
+		channelIDs[fixture.name] = created.ID
+	}
+
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID:   channelIDs["key-cooldown"],
+		KeyIndex:    0,
+		APIKey:      "sk-key-cooldown",
+		KeyStrategy: model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	until := time.Now().Add(10 * time.Minute)
+	if err := store.SetChannelCooldown(ctx, channelIDs["channel-cooldown"], until); err != nil {
+		t.Fatalf("SetChannelCooldown failed: %v", err)
+	}
+	if err := store.SetKeyCooldown(ctx, channelIDs["key-cooldown"], 0, until); err != nil {
+		t.Fatalf("SetKeyCooldown failed: %v", err)
+	}
+	if err := store.SetModelCooldown(ctx, channelIDs["model-cooldown"], "model-target", until); err != nil {
+		t.Fatalf("SetModelCooldown failed: %v", err)
+	}
+
+	wantNames := []string{"channel-cooldown", "key-cooldown", "model-cooldown"}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels?status=cooldown&limit=20&offset=0", nil))
+	server.handleListChannels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	resp := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
+	gotNames := make([]string, 0, len(resp.Data))
+	for _, item := range resp.Data {
+		gotNames = append(gotNames, item.Name)
+	}
+	sort.Strings(gotNames)
+	if resp.Count != len(wantNames) || !slices.Equal(gotNames, wantNames) {
+		t.Fatalf("cooldown list count=%d names=%v, want count=%d names=%v", resp.Count, gotNames, len(wantNames), wantNames)
+	}
+
+	optionsContext, optionsWriter := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/filter-options?status=cooldown", nil))
+	server.HandleChannelsFilterOptions(optionsContext)
+	if optionsWriter.Code != http.StatusOK {
+		t.Fatalf("filter options status=%d, want %d body=%s", optionsWriter.Code, http.StatusOK, optionsWriter.Body.String())
+	}
+	var options struct {
+		ChannelNames []string `json:"channel_names"`
+	}
+	mustUnmarshalAPIResponseData(t, optionsWriter.Body.Bytes(), &options)
+	if !slices.Equal(options.ChannelNames, wantNames) {
+		t.Fatalf("cooldown filter option names=%v, want %v", options.ChannelNames, wantNames)
 	}
 }
 
@@ -779,6 +965,87 @@ func TestHandleChannelModelStatsReturnsTodayStatsForRequestedChannel(t *testing.
 	}
 	if got.AvgDurationSeconds == nil || math.Abs(*got.AvgDurationSeconds-3) > 1e-9 {
 		t.Fatalf("avg_duration_seconds=%v, want 3", got.AvgDurationSeconds)
+	}
+}
+
+func TestHandleChannelEditorAggregatesInitialState(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	server.urlSelector = NewURLSelector()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(ctx); err != nil {
+		t.Fatalf("加载系统设置失败: %v", err)
+	}
+
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "channel-editor-bootstrap",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		ModelEntries: []model.ModelEntry{{Model: "external-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建渠道失败: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID,
+		KeyIndex:  0,
+		APIKey:    "sk-editor-test",
+		Note:      "primary",
+	}}); err != nil {
+		t.Fatalf("创建 API Key 失败: %v", err)
+	}
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time:       model.JSONTime{Time: time.Now()},
+		ChannelID:  created.ID,
+		Model:      "external-model",
+		StatusCode: http.StatusOK,
+		BaseURL:    "https://api.example.com",
+	}); err != nil {
+		t.Fatalf("写入模型统计日志失败: %v", err)
+	}
+	server.urlSelector.RecordLatency(created.ID, "https://api.example.com", 50*time.Millisecond)
+	server.urlSelector.RecordRequestResult(created.ID, "https://api.example.com", http.StatusOK)
+
+	path := "/admin/channels/" + strconv.FormatInt(created.ID, 10) + "/editor"
+	c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.HandleChannelEditor(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	resp := mustParseAPIResponse[struct {
+		Channel    ChannelWithCooldown `json:"channel"`
+		Keys       []*model.APIKey     `json:"keys"`
+		ModelStats struct {
+			Available bool                `json:"available"`
+			Items     []ChannelModelStats `json:"items"`
+		} `json:"model_stats"`
+		URLStats struct {
+			Available bool      `json:"available"`
+			Items     []URLStat `json:"items"`
+		} `json:"url_stats"`
+		Features struct {
+			ScheduledCheckEnabled bool `json:"scheduled_check_enabled"`
+		} `json:"features"`
+	}](t, w.Body.Bytes())
+
+	if resp.Data.Channel.ID != created.ID || resp.Data.Channel.Name != created.Name {
+		t.Fatalf("channel=%+v, want id=%d name=%q", resp.Data.Channel, created.ID, created.Name)
+	}
+	if len(resp.Data.Keys) != 1 || resp.Data.Keys[0].APIKey != "sk-editor-test" {
+		t.Fatalf("keys=%+v, want configured key", resp.Data.Keys)
+	}
+	if !resp.Data.ModelStats.Available || len(resp.Data.ModelStats.Items) != 1 {
+		t.Fatalf("model_stats=%+v, want available stats", resp.Data.ModelStats)
+	}
+	if !resp.Data.URLStats.Available || len(resp.Data.URLStats.Items) != 1 || resp.Data.URLStats.Items[0].Requests != 1 {
+		t.Fatalf("url_stats=%+v, want available runtime stats", resp.Data.URLStats)
+	}
+	if !resp.Data.Features.ScheduledCheckEnabled {
+		t.Fatalf("features=%+v, want scheduled check enabled", resp.Data.Features)
 	}
 }
 

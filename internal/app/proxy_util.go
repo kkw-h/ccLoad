@@ -79,11 +79,12 @@ func looksLikeJSON(body []byte) bool {
 
 // fwResult 转发结果
 type fwResult struct {
-	Status         int
-	UpstreamStatus int // 原始上游 HTTP 状态码；Status 可被改写为 596-599 等内部分类码
-	Header         http.Header
-	Body           []byte  // filled for non-2xx or when needed
-	FirstByteTime  float64 // 首字节响应时间（秒）
+	Status              int
+	UpstreamStatus      int // 原始上游 HTTP 状态码；Status 可被改写为 596-599 等内部分类码
+	Header              http.Header
+	Body                []byte  // filled for non-2xx or when needed
+	upstreamRequestBody []byte  // 实际发送的 provider wire body，仅用于同请求内安全降级重试
+	FirstByteTime       float64 // 首字节响应时间（秒）
 
 	// Token统计（2025-11新增，从SSE响应中提取）
 	InputTokens              int
@@ -161,6 +162,7 @@ type proxyRequestContext struct {
 	baseURL          string               // 当前尝试使用的上游URL（多URL场景）
 	debugData        *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 	thinkingEffort   string
+	routingSession   *responsesExecutionSession // 当前 Responses execution session 的首选渠道
 	nativeCodexWS    *codexUpstreamWebsocketSession
 	nativeCodexBody  []byte
 }
@@ -174,7 +176,8 @@ type proxyResult struct {
 	duration                  float64
 	firstByteTime             float64
 	succeeded                 bool
-	isClientCanceled          bool            // 客户端主动取消请求（context.Canceled）
+	isClientCanceled          bool // 客户端主动取消请求（context.Canceled）
+	isNetworkError            bool
 	nextAction                cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
 	deferredCooldown          *cooldown.ErrorInput
 	protocolCapabilityMissing bool

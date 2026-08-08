@@ -3,6 +3,13 @@ package config
 
 import "time"
 
+// OAuth 上游地址设置键。键名是用户可见配置契约，保持既有大小写。
+const (
+	CodexBaseURLSettingKey   = "CODEX_BASE_URL"
+	XAIBaseURLSettingKey     = "XAI_BASE_URL"
+	AntigravityURLSettingKey = "ANTIGRAVITY_URL"
+)
+
 // HTTP服务器配置常量
 const (
 	// DefaultMaxConcurrency 默认最大并发请求数
@@ -134,7 +141,7 @@ const (
 const (
 	// LogCleanupInterval 日志清理间隔
 	LogCleanupInterval = 1 * time.Hour
-	// DebugLogCleanupInterval 调试日志清理初始间隔（首次触发后按实际保留时长动态调整）
+	// DebugLogCleanupInterval 调试日志固定清理间隔
 	DebugLogCleanupInterval = 2 * time.Minute
 )
 

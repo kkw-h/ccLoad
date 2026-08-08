@@ -22,7 +22,7 @@ ccLoad 用一个 Go 服务接住多上游 AI API 的复杂度：Claude Code、Co
 在 OpenAI Build Week 期间，项目把由 GPT-5.6 驱动的 Codex 作为主要工程代理，用于：
 
 - 追踪 Go 后端和内嵌 Web UI 中的请求路由、故障切换、冷却、协议转换和后台页面流程。
-- 实现并审查上游 `5xx`、Key 级 `429` 和模型不可用 `404` 的模型级冷却，避免无必要地冷却整个渠道。
+- 实现并审查上游 `5xx`、Key 级 `429`、模型不可用 `404` 和明确表示模型退役的 `410` 的模型级冷却，避免无必要地冷却整个渠道。
 - 改进模型状态与调用统计界面，更新中英文文档，并通过聚焦的 Go 测试、构建和浏览器走查验证结果。
 - 准备可复现的演示和 Devpost 参赛材料；架构、安全和最终审查决策仍由人负责。
 
@@ -44,7 +44,7 @@ ccLoad 直接处理这些问题：
 
 - 🎯 **智能路由**：高优先级渠道优先使用，同级渠道按平滑加权轮询分流。
 - 🔀 **自动故障切换**：按错误作用域跳过故障 Key、模型、渠道或 URL。
-- ⏰ **模型感知冷却**：结构化 `model_cooldown`、上游 HTTP 5xx、Key 级 429 限流和模型不可用 404 都先只冷却当前实际模型，同渠道其他模型仍可用；只有所有配置模型或所有启用 Key 都在冷却时才升级为渠道冷却。
+- ⏰ **模型感知冷却**：结构化 `model_cooldown`、上游 HTTP 5xx、Key 级 429 限流、模型不可用 404 和明确表示模型退役的 410 都先只冷却当前实际模型，同渠道其他模型仍可用；只有所有配置模型或所有启用 Key 都在冷却时才升级为渠道冷却。
 - 🌐 **多 URL 调度**：一个渠道可配置多个上游 URL，按延迟和健康度分配流量。
 - 🔄 **逐 URL 协议路由**：每个 URL 可声明实际支持的线协议；显式声明直接选路，留空则原生协议优先探测并缓存成功协议。
 - 🔌 **Responses WebSocket 桥接**：认证后的 Codex 客户端可保持下游 WebSocket，各候选渠道按配置使用原生 Codex WebSocket 或现有 HTTP/SSE 传输。
@@ -85,7 +85,7 @@ ccLoad 直接处理这些问题：
 | 💬 **对话式模型测试** | 按渠道/按模型/对话三种模式 | 支持图片上传、思考等级、内置搜索与对话导出 |
 | 🔍 **调试日志** | 上游请求/响应原始数据捕获 | 敏感头脱敏，排障利器 |
 | 🕐 **定时检测** | 渠道可用性后台定时探测 | 自动发现故障渠道 |
-| 🔄 **自动更新** | 默认每 12 小时检查新版本 | 可在设置页调整检测间隔 |
+| 🔄 **更新渠道** | 默认稳定版，可选择包含测试版 | 可在设置页调整渠道和检测间隔 |
 | 🧩 **自定义请求规则** | 渠道级请求头/JSON 请求体改写（remove/override/append） | 认证头保护 + CRLF 防护 + 容量上限 |
 | 🎛️ **日志列自定义** | 表格列显隐可配置，设置持久化到浏览器 | 按需查看，减少信息噪音 |
 
@@ -705,6 +705,8 @@ curl -X POST http://localhost:8080/admin/channels \
 
 > **模型条目说明**：`models` 的每个元素是 `{model, redirect_model, disabled}`。`redirect_model` 只改写发往上游的模型名，客户端仍按原名请求。`disabled: true` 表示该渠道彻底不提供这个模型——不再对外暴露、不参与精确/模糊匹配、也不再写入模型冷却，但条目本身保留。用 `replace` 模式刷新模型列表时，已有的停用标记会按原名、归一化别名和重定向目标三种方式回填到新拉取的条目上，因此刷新不会把手动停用的模型悄悄改回启用。
 
+> **独立 Key 中转回退**：当同一中转站下的不同 Key 实际对应不同服务商时，可在渠道编辑器的 **高级设置 → 其他** 中启用 **渠道故障优先换 Key**。遇到可重试的模型级或渠道级上游故障（如 5xx、连接错误、首字节超时）时，ccLoad 会先冷却当前 Key 并尝试本渠道的其他 Key，全部 Key 都不可用后才切换其他渠道。该选项默认关闭，保持原有的模型/渠道冷却行为。
+
 > **RPM限制说明**：`rpm_limit` 是渠道级请求数上限，按滚动 60 秒窗口统计；`0` 表示不限制。代理转发、手动测试、单 URL 测试和定时检测都会计入，达到上限后该渠道会被跳过；多 URL 故障重试按实际发出的上游 HTTP 请求计数。计数保存在当前进程内，服务重启会清空，多实例部署时各实例独立统计。
 
 > **并发限制说明**：`max_concurrency` 是渠道级同时在飞请求上限；`0` 表示不限制。槽位从发起上游请求前占用，到响应体关闭后释放，流式请求会占用到流结束；达到上限后该渠道会被跳过，不触发冷却。计数保存在当前进程内，多实例部署时各实例独立统计。
@@ -874,7 +876,7 @@ ccLoad 使用的核心技术栈：
   - 消除重复代码，冷却逻辑统一管理
   - 区分网络错误和HTTP错误的分类策略
   - Key/模型/渠道使用独立动作；`ActionRetryModel` 不再尝试同渠道其他 Key 或 URL
-  - 结构化 `model_cooldown`、上游 HTTP 5xx、Key 级 429 限流和模型不可用 404 按 `(channel_id, 实际上游模型)` 持久化，同渠道其他模型仍可选
+  - 结构化 `model_cooldown`、上游 HTTP 5xx、Key 级 429 限流、模型不可用 404 和明确表示模型退役的 410 按 `(channel_id, 实际上游模型)` 持久化，同渠道其他模型仍可选
   - 所有配置模型或所有启用 Key 均冷却时，自动升级为渠道冷却
 - **多URL选择器**（URLSelector）：
   - `url_selector.go`：单渠道多URL智能调度
@@ -1020,7 +1022,8 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 | `ttfb_min_confident_sample` | `10` | 首字置信样本量阈值 |
 | `channel_check_interval_hours` | `5` | 渠道定时检测间隔（小时，支持小数，0=禁用） |
 | `model_catalog_sync_interval_hours` | `6` | 每 6 小时从 models.dev 同步模型目录；`0` 禁用网络同步。启动时使用最近一次成功的缓存，失败时回退内嵌目录；渠道 `cost_multiplier` 仍然适用。 |
-| `auto_update_interval_hours` | `12` | 自动更新检测间隔（小时，0=禁用，启用时最低 1 小时） |
+| `auto_update_interval_hours` | `12` | 非容器部署的版本检查间隔（小时，0=禁用，启用时最低 1 小时）；容器中不可用 |
+| `auto_update_channel` | `stable` | 非容器部署的发布渠道：`stable` 只接收稳定版；`preview` 同时接收稳定版和测试版，并选择语义版本最高者；容器中不可用 |
 | `model_fuzzy_match` | `false` | 模型名精确匹配未命中时，回退到子串匹配 + 版本排序 |
 | `responses_ws_max_connections` | `64` | 下游 Responses WebSocket 全局最大并发连接数 |
 | `responses_ws_max_connections_per_token` | `16` | 单个认证 Token 的下游 Responses WebSocket 最大并发连接数 |
@@ -1031,9 +1034,13 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 
 #### 自动更新
 
-ccLoad 支持程序内自动更新，默认每 12 小时检查一次发布版本，依次尝试 `gh.monlor.com`、`fastgit.cc`、`ghfast.top`，全部失败后再直连 GitHub。版本检测、二进制下载、校验文件下载和 SHA256 校验必须在同一来源全部成功；发现新版本后会等待服务空闲再重启生效。可以在 Web 管理后台的设置页修改 `auto_update_interval_hours`；设置为 `0` 可关闭自动更新检测。
+非容器部署由单一更新管理器负责版本检查、前端版本提示和可选的进程内自动更新。默认启动时检查一次，此后每 12 小时检查一次。`auto_update_channel=stable` 只接收稳定版；`preview` 同时考虑稳定版和测试版，按 SemVer 选择最高有效版本，不会把当前版本或待重启版本降级。两个设置都可以在 Web 管理后台修改；将 `auto_update_interval_hours` 设为 `0` 可关闭全部版本检查。
 
-如需只使用私有镜像，可将 `CCLOAD_RELEASE_BASE_URL` 设置为完整的 latest-download 地址，例如 `https://mirror.example/caidaoli/ccLoad/releases/latest/download`。显式设置后不会再追加内置回退源。该变量只影响发布文件下载，不会设置 `HTTP_PROXY` 或 `HTTPS_PROXY`，因此不会让业务渠道请求经过下载代理。
+稳定版元数据通过配置的发布源解析。测试版发现读取 GitHub Releases Atom feed，其中包含稳定版和测试版，无需使用受速率限制的 REST API。解析出精确 Tag 后，ccLoad 会从配置的下载源获取该 Tag 的二进制及校验文件；默认顺序是 `gh.monlor.com`、`fastgit.cc`、`ghfast.top` 和 GitHub，SHA256 匹配后才替换。
+
+官方容器不运行版本检查或进程内更新循环。每个稳定版和 Beta 镜像都直接包含对应 GitHub Release 生成的同版本二进制。稳定版发布精确版本 Tag 和 `latest`，Beta 发布精确测试版 Tag 和滚动 `beta` 别名。修改 Compose 中的镜像标签后，重新拉取并启动容器即可切换版本。
+
+如需使用私有发布镜像，可将 `CCLOAD_RELEASE_BASE_URL` 设置为完整的 latest-download 地址，例如 `https://mirror.example/caidaoli/ccLoad/releases/latest/download`。显式设置后，稳定版元数据和全部发布文件下载都不会追加内置回退源；测试版元数据仍从 GitHub Releases Atom feed 获取。该变量不会设置 `HTTP_PROXY` 或 `HTTPS_PROXY`，因此不会让业务渠道请求经过下载代理。
 
 #### 渠道动态排序说明
 
@@ -1115,9 +1122,11 @@ ccLoad 支持程序内自动更新，默认每 12 小时检查一次发布版本
 - **镜像仓库**：`ghcr.io/caidaoli/ccload`
 - **可用标签**：
   - `latest` - 最新稳定版本
-  - `v2.44.1` - 具体发布版本，和 GitHub Release Tag 保持一致
+  - `beta` - 最新 Beta 版本
+  - `v2.44.1` - 精确稳定版本，和 GitHub Release Tag 保持一致
+  - `vX.Y.Z-beta.N` - 精确 Beta 版本，和 GitHub Prerelease Tag 保持一致
 
-官方 GHCR 镜像基于 Alpine。容器启动时会下载并校验最新 Linux 二进制，默认依次尝试 `v4.gh-proxy.org`、`gh-proxy.com`、`ghp.keleyaa.com`，全部失败后再直连 GitHub。程序内自动更新必须通过 `/releases/latest` 解析版本标签，因此使用上文单独列出的来源顺序。将 `CCLOAD_RELEASE_BASE_URL` 设置为完整的 `.../releases/latest/download` 地址可只使用自定义镜像。程序内默认检测间隔为 12 小时，可在 Web 管理后台通过 `auto_update_interval_hours` 修改。
+官方 GHCR 镜像基于 Alpine，并保持不可变：每次发布都将已经通过测试的 `ccload-linux-amd64` 和 `ccload-linux-arm64` GitHub Release 二进制直接打进同版本多架构镜像。精确版本 Tag 是不可变发布引用；`latest` 和 `beta` 分别滚动指向最新稳定版和 Beta。容器不检查发布版本，也不在进程内替换二进制；拉取精确版本 Tag 或所需滚动别名后重建容器即可更新。
 
 ### 镜像标签说明
 
@@ -1127,6 +1136,13 @@ docker pull ghcr.io/caidaoli/ccload:latest
 
 # 拉取指定版本
 docker pull ghcr.io/caidaoli/ccload:v2.44.1
+
+# 拉取最新 Beta；要锁定版本时将 beta 替换为已发布的 vX.Y.Z-beta.N Tag
+docker pull ghcr.io/caidaoli/ccload:beta
+
+# 使用 Compose 时，将 image 改为 :latest 或 :beta 后应用变更
+docker compose pull
+docker compose up -d
 
 # 指定架构（Docker 通常自动选择）
 docker pull --platform linux/amd64 ghcr.io/caidaoli/ccload:latest

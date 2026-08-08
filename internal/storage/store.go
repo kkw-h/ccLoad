@@ -20,8 +20,10 @@ type Store interface {
 	GetConfig(ctx context.Context, id int64) (*model.Config, error)
 	CreateConfig(ctx context.Context, c *model.Config) (*model.Config, error)
 	UpdateConfig(ctx context.Context, id int64, upd *model.Config) (*model.Config, error)
+	CompareAndSwapOAuthCredential(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, error)
+	UpdateOAuthModelStateIfCredentialMatches(ctx context.Context, channelID int64, expectedAuthType, expectedCredential string, modelEntries []model.ModelEntry, scheduledCheckModel string) (bool, error)
 	UpdateChannelEnabled(ctx context.Context, id int64, enabled bool) (*model.Config, error)
-	BatchUpdateProtocolTransformMode(ctx context.Context, channelIDs []int64, mode string) (int64, error)
+	BatchPatchConfigs(ctx context.Context, channelIDs []int64, patch model.BatchConfigPatch) (model.BatchConfigPatchResult, error)
 	DeleteConfig(ctx context.Context, id int64) error
 	GetEnabledChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error)
 	BatchUpdatePriority(ctx context.Context, updates []struct {
@@ -80,7 +82,7 @@ type Store interface {
 	// === Debug Log Management ===
 	AddDebugLog(ctx context.Context, e *model.DebugLogEntry) error
 	GetDebugLogByLogID(ctx context.Context, logID int64) (*model.DebugLogEntry, error)
-	CleanupDebugLogsBefore(ctx context.Context, cutoff time.Time) error
+	CleanupDebugLogsBatch(ctx context.Context, cutoff time.Time, limit int) (int64, error)
 	TruncateDebugLogs(ctx context.Context) error
 
 	// === Metrics & Statistics ===

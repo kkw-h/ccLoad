@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"ccLoad/internal/config"
 	"ccLoad/internal/storage/schema"
 )
 
@@ -15,6 +16,8 @@ const (
 	structuredChannelURLsMigrationVersion  = "v4_structured_channel_urls"
 	clientProtocolBackfillMigrationVersion = "v5_logs_client_protocol_backfill"
 	modelFingerprintNameMaxRunes           = 191
+	defaultAntigravitySensitiveWords       = `["API","proxy","Claude","Anthropic"]`
+	previousAntigravitySensitiveWords      = `["API","proxy"]`
 )
 
 // Dialect 数据库方言
@@ -163,11 +166,20 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureChannelsProxyURL(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels proxy_url: %w", err)
 			}
+			if err := ensureChannelsRetryOtherKeysOnFailure(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels retry_other_keys_on_failure: %w", err)
+			}
 			if err := ensureChannelsWebsockets(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels websockets: %w", err)
 			}
 			if err := ensureChannelsProtocolTransformMode(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels protocol_transform_mode: %w", err)
+			}
+			if err := ensureChannelsAuthType(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels auth_type: %w", err)
+			}
+			if err := ensureChannelsOAuthCredential(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels oauth_credential: %w", err)
 			}
 			// 增量迁移：将url字段从VARCHAR(191)扩展为TEXT（支持多URL存储）
 			if err := migrateChannelsURLToText(ctx, db, dialect); err != nil {
@@ -524,6 +536,9 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 	settings := []struct {
 		key, value, valueType, desc, defaultVal string
 	}{
+		{config.CodexBaseURLSettingKey, "", "string", "Codex OAuth 完整 Responses URL(留空使用渠道URL；填写后覆盖渠道URL)", ""},
+		{config.XAIBaseURLSettingKey, "", "string", "xAI OAuth API根地址(通常以/v1结尾；留空使用渠道URL；填写后覆盖渠道URL)", ""},
+		{config.AntigravityURLSettingKey, "", "string", "Antigravity OAuth API根地址(留空使用渠道URL；填写后覆盖渠道URL)", ""},
 		{"log_retention_days", "7", "int", "日志保留天数(-1永久保留,1-365天)", "7"},
 		{"max_key_retries", "3", "int", "单渠道最大Key重试次数", "3"},
 		{"max_concurrency", "1000", "int", "最大并发请求数(限制同时处理的代理请求数量)", "1000"},
@@ -536,6 +551,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"cooldown_max_seconds", "1800", "int", "指数退避冷却上限(秒)", "1800"},
 		{"cooldown_min_seconds", "10", "int", "指数退避冷却下限(秒)", "10"},
 		{"global_cooldown_detection_rules", "{}", "json", "未配置渠道专属规则时继承的全局冷却探测规则", "{}"},
+		{"antigravity_sensitive_words", defaultAntigravitySensitiveWords, "json", "Antigravity systemInstruction 中使用零宽字符替换的敏感词", defaultAntigravitySensitiveWords},
 		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
 		{"upstream_connection_reuse_limit_seconds", "0", "duration", "上游连接最长复用时间(秒,0=不限制;达到时限后不接收新请求,在途请求完成后关闭)", "0"},
 		{"stream_timeout", "0", "duration", "流式请求总超时(秒,0=禁用)", "0"},
@@ -551,10 +567,11 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"model_fuzzy_match", "false", "bool", "模型匹配失败时，使用子串模糊匹配(多匹配时选最新版本)", "false"},
 		{"channel_test_content", "sonnet 4.0的发布日期是什么", "string", "渠道测试默认内容", "sonnet 4.0的发布日期是什么"},
 		{"channel_check_interval_hours", "5", "float", "渠道定时检测间隔(小时,支持小数如0.5=30分钟,0=关闭)", "5"},
-		{"model_catalog_sync_interval_hours", "6", "float", "模型目录同步间隔(小时,支持小数,0=关闭网络同步)", "6"},
-		{"auto_update_interval_hours", "12", "int", "自动更新检测间隔(小时整数,0=关闭,启用时最低1小时)", "12"},
-		{"log_channel_click_action", "edit", "string", "日志页点击渠道名行为(edit=打开编辑器,navigate=跳转到渠道管理定位)", "edit"},
-		{"channel_stats_range", "today", "string", "渠道管理费用统计范围", "today"},
+		{"model_catalog_sync_interval_hours", "6", "float", "从 models.dev 同步官方模型定价目录的间隔（小时，支持小数）；0 仅关闭网络同步，继续使用最近缓存或内置定价；不影响渠道模型列表", "6"},
+		{"auto_update_interval_hours", "12", "int", "非容器部署的版本检查间隔（整数小时；0=关闭检查；启用时最低1小时）", "12"},
+		{"auto_update_channel", "stable", "string", "非容器部署的版本检查和自动更新渠道（stable=稳定版，preview=稳定版和测试版）", "stable"},
+		{"log_channel_click_action", "edit", "string", "日志页点击渠道名后的操作", "edit"},
+		{"channel_stats_range", "today", "string", "渠道管理页费用统计的时间范围", "today"},
 		// 健康度排序配置
 		{"enable_health_score", "false", "bool", "启用基于健康度的渠道动态排序", "false"},
 		{"success_rate_penalty_weight", "100", "int", "成功率惩罚权重(乘以失败率)", "100"},
@@ -596,6 +613,27 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		}
 	}
 
+	// 默认词表在 CLIProxyAPI 示例的 ["API","proxy"] 基础上加入 Claude/Anthropic。
+	// 仅迁移仍保持旧默认值的记录；其他值视为用户配置，不覆盖。
+	{
+		keyCol := quoteKeyIdent(dialect)
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		valueSQL := fmt.Sprintf("UPDATE system_settings SET value = ? WHERE %s = ? AND value = default_value AND default_value IN (?, ?)", keyCol)
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, valueSQL),
+			defaultAntigravitySensitiveWords,
+			"antigravity_sensitive_words",
+			"[]",
+			previousAntigravitySensitiveWords,
+		); err != nil {
+			return fmt.Errorf("migrate setting value antigravity_sensitive_words: %w", err)
+		}
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		metaSQL := fmt.Sprintf("UPDATE system_settings SET default_value = ?, value_type = ? WHERE %s = ?", keyCol)
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL), defaultAntigravitySensitiveWords, "json", "antigravity_sensitive_words"); err != nil {
+			return fmt.Errorf("refresh setting metadata antigravity_sensitive_words: %w", err)
+		}
+	}
+
 	// 刷新部分配置项的元信息（description/default/value_type），避免"代码语义已变但DB描述仍旧"。
 	{
 		keyCol := quoteKeyIdent(dialect)
@@ -618,12 +656,20 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 			return fmt.Errorf("refresh setting metadata debug_log_retention_minutes: %w", err)
 		}
 		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL),
-			"自动更新检测间隔(小时整数,0=关闭,启用时最低1小时)",
+			"非容器部署的版本检查间隔（整数小时；0=关闭检查；启用时最低1小时）",
 			"12",
 			"int",
 			"auto_update_interval_hours",
 		); err != nil {
 			return fmt.Errorf("refresh setting metadata auto_update_interval_hours: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL),
+			"非容器部署的版本检查和自动更新渠道（stable=稳定版，preview=稳定版和测试版）",
+			"stable",
+			"string",
+			"auto_update_channel",
+		); err != nil {
+			return fmt.Errorf("refresh setting metadata auto_update_channel: %w", err)
 		}
 		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL),
 			"Responses WebSocket idle session retention (minutes, >= 1)",
@@ -645,8 +691,6 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		}
 	}
 
-	// 清理已废弃的配置项
-
 	// 迁移 channel_check_interval_hours 类型：int → float（支持分钟级小数间隔）
 	{
 		keyCol := quoteKeyIdent(dialect)
@@ -655,13 +699,6 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, typeSQL)); err != nil {
 			return fmt.Errorf("migrate channel_check_interval_hours type: %w", err)
 		}
-	}
-
-	obsoleteKeys := []string{
-		"88code_free_only", // 2026-01移除：88code免费订阅限制功能已删除
-	}
-	for _, key := range obsoleteKeys {
-		_ = deleteSystemSetting(ctx, db, dialect, key)
 	}
 
 	// 迁移旧 migration marker 从 system_settings 到 schema_migrations

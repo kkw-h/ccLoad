@@ -272,6 +272,26 @@ func TestClassifyHTTPResponse_Upstream499IsModelScoped(t *testing.T) {
 	}
 }
 
+func TestClassifyHTTPResponse_HTTP410ModelEOLIsModelScoped(t *testing.T) {
+	classification := ClassifyHTTPResponseWithMeta(http.StatusGone, nil, []byte(`{
+		"error": {
+			"type": "bad_response_status_code",
+			"message": "The model 'deepseek-ai/deepseek-v4-flash' has reached its end of life and is no longer available."
+		}
+	}`))
+	if classification.Level != ErrorLevelChannel {
+		t.Fatalf("Level=%v, want ErrorLevelChannel", classification.Level)
+	}
+	if !classification.ModelScoped {
+		t.Fatal("HTTP 410 model EOL must be model-scoped")
+	}
+
+	generic := ClassifyHTTPResponseWithMeta(http.StatusGone, nil, []byte(`{"error":"resource is gone"}`))
+	if generic.Level != ErrorLevelClient || generic.ModelScoped {
+		t.Fatalf("generic HTTP 410 classification=%+v, want client-scoped", generic)
+	}
+}
+
 // 测试context.Canceled与HTTP 499的区分
 func TestClassifyError_ContextCanceled(t *testing.T) {
 	tests := []struct {
@@ -962,6 +982,60 @@ func TestClassifyHTTPResponse400IsModelScoped(t *testing.T) {
 			classification := ClassifyHTTPResponseWithMeta(400, nil, tt.responseBody)
 			if !classification.ModelScoped {
 				t.Fatalf("400 must be model-scoped, classification=%+v, body=%s", classification, tt.responseBody)
+			}
+		})
+	}
+}
+
+func TestClassifyHTTPResponseContextLengthExceededIsClientError(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "error_code_context_length_exceeded",
+			body: []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}`),
+		},
+		{
+			name: "response_failed_code_context_too_large",
+			body: []byte(`{"type":"response.failed","response":{"error":{"code":"context_too_large","message":"Your input exceeds the context window of this model."}}}`),
+		},
+		{
+			name: "invalid_request_message_fallback",
+			body: []byte(`{"error":{"type":"invalid_request_error","message":"Maximum context length exceeded."}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			classification := ClassifyHTTPResponseWithMeta(http.StatusBadRequest, nil, tt.body)
+			if classification.Level != ErrorLevelClient || classification.ModelScoped {
+				t.Fatalf("classification=%+v, want client-level without model scope", classification)
+			}
+		})
+	}
+}
+
+func TestClassifyHTTPResponseContextLengthMessageDoesNotHideServerError(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "nested_server_error",
+			body: []byte(`{"error":{"type":"server_error","code":"billing_config_error","message":"Documentation mentions too many tokens, but billing configuration failed."}}`),
+		},
+		{
+			name: "top_level_explicit_non_context_code",
+			body: []byte(`{"type":"error","code":"billing_config_error","message":"Documentation mentions too many tokens, but billing configuration failed."}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			classification := ClassifyHTTPResponseWithMeta(http.StatusBadRequest, nil, tt.body)
+			if classification.Level == ErrorLevelClient || !classification.ModelScoped {
+				t.Fatalf("classification=%+v, want existing model-scoped handling", classification)
 			}
 		})
 	}

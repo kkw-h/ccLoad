@@ -29,6 +29,25 @@ function escapeChannelRefreshText(value) {
   }[c]));
 }
 
+function buildOAuthPlanBadge(channel) {
+  let planType = '';
+  if (channel?.auth_type === 'codex_oauth') {
+    planType = String(channel.codex_plan_type || '').trim();
+  } else if (channel?.auth_type === 'antigravity_oauth') {
+    planType = String(channel.antigravity_paid_tier || '').trim();
+  } else if (channel?.auth_type === 'xai_oauth') {
+    planType = String(channel.xai_subscription_tier || '').trim();
+  }
+  if (!planType) return '';
+
+  const planTokens = planType.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (channel?.auth_type !== 'xai_oauth' && planTokens.includes('free')) return '';
+
+  const planTone = ['plus', 'pro', 'team'].find(tier => planTokens.includes(tier));
+  const toneClass = planTone ? ` ch-oauth-plan-badge--${planTone}` : '';
+  return `<span class="ch-oauth-plan-badge${toneClass}">${escapeChannelRefreshText(planType)}</span>`;
+}
+
 function normalizeBatchRefreshChannelID(channelID) {
   if (typeof normalizeSelectedChannelID === 'function') {
     return normalizeSelectedChannelID(channelID);
@@ -336,13 +355,6 @@ function flushInlineChannelPrioritySave(input) {
   return saveInlineChannelPriority(input);
 }
 
-function inlineCooldownBadge(c) {
-  const ms = c.cooldown_remaining_ms || 0;
-  if (!ms || ms <= 0) return '';
-  const text = humanizeMS(ms);
-  return `<span style="display: inline-flex; align-items: center; color: #dc2626; font-size: 0.68rem; font-weight: 600; line-height: 1; background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 1px 6px; border-radius: 4px; border: 1px solid #fca5a5; vertical-align: middle;">${window.t('channels.cooldownBadge', { time: text })}</span>`;
-}
-
 function buildInlineNameBadgeStyle({ background, color, borderColor, borderStyle = 'solid' }) {
   return [
     'display: inline-flex',
@@ -502,6 +514,285 @@ function buildChannelLastRequestFailureHtml(stats) {
   </div>`;
 }
 
+function formatCooldownRecoveryTime(remainingMS) {
+  const ms = Math.max(0, Number(remainingMS) || 0);
+  if (ms <= 5 * 60 * 1000) {
+    return window.t('channels.status.secondsUntilRecovery', { count: Math.ceil(ms / 1000) });
+  }
+  const totalMinutes = Math.ceil(ms / 60000);
+  if (ms < 60 * 60 * 1000) {
+    return window.t('channels.status.minutesUntilRecovery', { count: totalMinutes });
+  }
+  return window.t('channels.status.hoursMinutesUntilRecovery', {
+    hours: Math.floor(totalMinutes / 60),
+    minutes: totalMinutes % 60
+  });
+}
+
+function formatOAuthUsagePercent(value) {
+  const percent = Math.min(100, Math.max(0, Number(value) || 0));
+  return Number.isInteger(percent) ? String(percent) : percent.toFixed(1).replace(/\.0$/, '');
+}
+
+function formatOAuthUsageResetAt(resetAt) {
+  const timestamp = Number(resetAt);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+  const date = new Date(timestamp * 1000);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = value => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatOAuthUsageWindowDuration(seconds) {
+  const duration = Math.max(0, Number(seconds) || 0);
+  const day = 24 * 60 * 60;
+  if (duration >= 28 * day && duration <= 31 * day) return window.t('channels.oauth.usageMonthly');
+  if (duration === 7 * day) return window.t('channels.oauth.usageWeekly');
+  if (duration > 0 && duration % day === 0) {
+    return window.t('channels.oauth.usageDays', { count: duration / day });
+  }
+  if (duration > 0 && duration % (60 * 60) === 0) {
+    return window.t('channels.oauth.usageHours', { count: duration / (60 * 60) });
+  }
+  return window.t('channels.oauth.usageQuota');
+}
+
+function formatOAuthUsageLimitName(limitName) {
+  const normalized = String(limitName || '').trim().toLowerCase();
+  if (!normalized || normalized === 'codex') return '';
+  if (normalized === 'codex-spark') return 'GPT-5.3-Codex-Spark';
+  return String(limitName).trim();
+}
+
+function oauthUsageLevel(remainingPercent) {
+  if (remainingPercent >= 70) return 'high';
+  if (remainingPercent >= 30) return 'medium';
+  if (remainingPercent > 0) return 'low';
+  return 'empty';
+}
+
+function buildOAuthUsageRefreshButton(channelID, loading = false) {
+  const text = loading
+    ? window.t('channels.oauth.usageRefreshing')
+    : window.t('channels.oauth.usageRefresh');
+  return `<button type="button" class="ch-oauth-usage__refresh channel-action-btn" data-action="refresh-oauth-usage" data-channel-id="${channelID}"${loading ? ' disabled aria-busy="true"' : ''}>${escapeChannelRefreshText(text)}</button>`;
+}
+
+function formatXAIUsagePercent(value) {
+  if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) return '--';
+  const percent = Math.min(100, Math.max(0, Number(value)));
+  return `${Number.isInteger(percent) ? percent : percent.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}%`;
+}
+
+function formatXAIUsageMoney(cents) {
+  if (cents === null || cents === undefined || cents === '' || !Number.isFinite(Number(cents))) return '--';
+  return `US$${(Math.round(Number(cents)) / 100).toFixed(2)}`;
+}
+
+function formatXAIUsageReset(resetAt) {
+  const date = new Date(String(resetAt || '').trim());
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = value => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function xaiUsageNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function buildXAIUsageInlineRow(label, value) {
+  return `<div class="ch-oauth-usage__window">
+    <div class="ch-oauth-usage__meta">
+      <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+      <span class="ch-oauth-usage__details">
+        <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(value)}</span>
+      </span>
+    </div>
+  </div>`;
+}
+
+function buildXAIUsageRow(label, usedPercent, amount, resetAt) {
+  const percent = formatXAIUsagePercent(usedPercent);
+  const reset = formatXAIUsageReset(resetAt);
+  const numericUsed = xaiUsageNumber(usedPercent);
+  const remaining = numericUsed !== null ? Math.min(100, Math.max(0, 100 - numericUsed)) : 0;
+  const ariaLabel = numericUsed === null
+    ? `${label}: ${window.t('channels.oauth.usageUsed', { percent })}`
+    : window.t('channels.oauth.usageRemaining', {
+      label,
+      percent: formatOAuthUsagePercent(remaining)
+    });
+  return `<div class="ch-oauth-usage__window">
+    <div class="ch-oauth-usage__meta">
+      <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+      <span class="ch-oauth-usage__details">
+        <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(window.t('channels.oauth.usageUsed', { percent }))}</span>
+        ${amount ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(amount)}</span>` : ''}
+        ${reset ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(window.t('channels.oauth.usageReset', { time: reset }))}</span>` : ''}
+      </span>
+    </div>
+    <div class="ch-oauth-usage__track" role="progressbar" aria-label="${escapeChannelRefreshText(ariaLabel)}" aria-valuemin="0" aria-valuemax="100"${numericUsed !== null ? ` aria-valuenow="${remaining}"` : ''}>
+      <span class="ch-oauth-usage__fill ch-oauth-usage__fill--${oauthUsageLevel(remaining)}" style="width:${remaining}%"></span>
+    </div>
+  </div>`;
+}
+
+function buildXAIUsageRows(data) {
+  const billing = data?.xai_billing || {};
+  const rows = [];
+  const plan = String(data?.plan_type || data?.subscription_tier || '').trim();
+  if (plan) {
+    rows.push(buildXAIUsageInlineRow(window.t('channels.oauth.usagePlan'), plan));
+  }
+  if (billing.weekly_present === true) {
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageWeekly'),
+      billing.weekly_usage_percent,
+      '',
+      billing.weekly_reset_at
+    ));
+  }
+  const products = Array.isArray(billing.product_usage) ? billing.product_usage : [];
+  for (const product of products) {
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageProduct', { product: String(product?.product || '') }),
+      product?.usage_percent,
+      '',
+      ''
+    ));
+  }
+  const onDemandCap = xaiUsageNumber(billing.on_demand_cap_cents);
+  if (onDemandCap !== null && onDemandCap > 0) {
+    const used = xaiUsageNumber(billing.on_demand_used_cents);
+    const usedPercent = used !== null ? used * 100 / onDemandCap : null;
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageOnDemand'),
+      usedPercent,
+      `${formatXAIUsageMoney(billing.on_demand_used_cents)} / ${formatXAIUsageMoney(billing.on_demand_cap_cents)}`,
+      ''
+    ));
+  } else {
+    rows.push(buildXAIUsageInlineRow(
+      window.t('channels.oauth.usageOnDemand'),
+      window.t('channels.oauth.usageOnDemandDisabled')
+    ));
+  }
+  const monthlyLimit = xaiUsageNumber(billing.monthly_limit_cents);
+  const includedUsed = xaiUsageNumber(billing.included_used_cents);
+  const monthlyPercent = monthlyLimit !== null && monthlyLimit > 0 && includedUsed !== null
+    ? includedUsed * 100 / monthlyLimit
+    : null;
+  if (billing.monthly_present === true) {
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageMonthlyCredits'),
+      monthlyPercent,
+      `${formatXAIUsageMoney(billing.included_used_cents)} / ${formatXAIUsageMoney(billing.monthly_limit_cents)}`,
+      billing.monthly_reset_at
+    ));
+  }
+  return rows;
+}
+
+function buildOAuthUsageStatusHtml(channel) {
+  if (!['codex_oauth', 'antigravity_oauth', 'xai_oauth'].includes(channel?.auth_type) ||
+      (typeof isTokenChannelsReadOnly === 'function' && isTokenChannelsReadOnly())) {
+    return '';
+  }
+  const state = typeof getOAuthUsageState === 'function' ? getOAuthUsageState(channel.id) : null;
+  if (!state) {
+    return `<div class="ch-oauth-usage">${buildOAuthUsageRefreshButton(channel.id)}</div>`;
+  }
+  if (state.status === 'loading') {
+    return `<div class="ch-oauth-usage">${buildOAuthUsageRefreshButton(channel.id, true)}</div>`;
+  }
+  if (state.status === 'error') {
+    return `<div class="ch-oauth-usage">
+      ${buildOAuthUsageRefreshButton(channel.id)}
+      <div class="ch-oauth-usage__error" title="${escapeChannelRefreshText(state.error)}">${escapeChannelRefreshText(window.t('channels.oauth.usageFailed'))}</div>
+    </div>`;
+  }
+
+  const windows = Array.isArray(state.data?.windows) ? state.data.windows : [];
+  const isXAI = channel?.auth_type === 'xai_oauth' || state.data?.provider === 'xai';
+  const rows = isXAI ? buildXAIUsageRows(state.data) : windows.map(windowInfo => {
+    const remaining = Math.min(100, Math.max(0, Number(windowInfo?.remaining_percent) || 0));
+    const percent = formatOAuthUsagePercent(remaining);
+    const duration = formatOAuthUsageWindowDuration(windowInfo?.limit_window_seconds);
+    const limitName = formatOAuthUsageLimitName(windowInfo?.limit_name);
+    const label = limitName ? `${limitName} · ${duration}` : duration;
+    const resetAt = formatOAuthUsageResetAt(windowInfo?.reset_at);
+    const ariaLabel = window.t('channels.oauth.usageRemaining', { label, percent });
+    return `<div class="ch-oauth-usage__window">
+      <div class="ch-oauth-usage__meta">
+        <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+        <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(percent)}%</span>
+        ${isXAI ? `<span>${escapeChannelRefreshText(window.t('channels.oauth.usageAvailable'))}</span>` : ''}
+        ${resetAt ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(resetAt)}</span>` : ''}
+      </div>
+      <div class="ch-oauth-usage__track" role="progressbar" aria-label="${escapeChannelRefreshText(ariaLabel)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeChannelRefreshText(percent)}">
+        <span class="ch-oauth-usage__fill ch-oauth-usage__fill--${oauthUsageLevel(remaining)}" style="width:${remaining}%"></span>
+      </div>
+    </div>`;
+  });
+  const warnings = isXAI && Array.isArray(state.data?.warnings)
+    ? state.data.warnings.filter(Boolean).map(warning => `<li>${escapeChannelRefreshText(warning)}</li>`).join('')
+    : '';
+  return `<div class="ch-oauth-usage">
+    <div class="ch-oauth-usage__toolbar">${buildOAuthUsageRefreshButton(channel.id)}</div>
+    ${rows.join('')}
+    ${warnings ? `<div role="status"><span>${escapeChannelRefreshText(window.t('channels.oauth.usageWarnings'))}</span><ul>${warnings}</ul></div>` : ''}
+  </div>`;
+}
+
+function buildChannelRuntimeStatusHtml(channel, stats) {
+  const statuses = [];
+  const channelCooldownMS = Number(channel.cooldown_remaining_ms || 0);
+  if (channelCooldownMS > 0) {
+    const text = window.t('channels.status.channelCooldown', { time: formatCooldownRecoveryTime(channelCooldownMS) });
+    statuses.push(`<div class="ch-runtime-status ch-runtime-status--channel">${escapeChannelRefreshText(text)}</div>`);
+  }
+
+  const coolingKeys = (Array.isArray(channel.key_cooldowns) ? channel.key_cooldowns : [])
+    .map(key => Number(key?.cooldown_remaining_ms || 0))
+    .filter(remainingMS => remainingMS > 0);
+  if (coolingKeys.length > 0) {
+    const nextRecoveryMS = Math.min(...coolingKeys);
+    const text = window.t('channels.status.keyCooldowns', {
+      count: coolingKeys.length,
+      time: formatCooldownRecoveryTime(nextRecoveryMS)
+    });
+    const label = window.t('channels.status.viewKeyCooldowns', { count: coolingKeys.length });
+    statuses.push(`<button type="button" class="ch-runtime-status ch-runtime-status--keys channel-action-btn" data-action="edit-cooling-keys" data-channel-id="${channel.id}" aria-label="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(text)}</button>`);
+  }
+
+  const coolingModels = (Array.isArray(channel.model_cooldowns) ? channel.model_cooldowns : [])
+    .map(model => Number(model?.cooldown_remaining_ms || 0))
+    .filter(remainingMS => remainingMS > 0);
+  if (coolingModels.length > 0) {
+    const nextRecoveryMS = Math.min(...coolingModels);
+    const text = window.t('channels.status.modelCooldowns', {
+      count: coolingModels.length,
+      time: formatCooldownRecoveryTime(nextRecoveryMS)
+    });
+    statuses.push(`<div class="ch-runtime-status ch-runtime-status--models">${escapeChannelRefreshText(text)}</div>`);
+  }
+
+  const oauthUsageState = typeof getOAuthUsageState === 'function' ? getOAuthUsageState(channel.id) : null;
+  if (statuses.length === 0 && oauthUsageState?.status !== 'ready') {
+    const lastSuccessHtml = buildChannelLastSuccessHtml(stats);
+    if (lastSuccessHtml) statuses.push(lastSuccessHtml);
+  }
+
+  const oauthUsageHtml = buildOAuthUsageStatusHtml(channel);
+  if (oauthUsageHtml) statuses.push(oauthUsageHtml);
+
+  return statuses.length > 0
+    ? `<div class="ch-runtime-status-list">${statuses.join('')}</div>`
+    : '';
+}
+
 /**
  * 使用模板引擎创建渠道表格行
  * @param {Object} channel - 渠道数据
@@ -535,7 +826,8 @@ function createChannelCard(channel) {
     : '';
 
   const durationHtml = buildChannelTimingHtml(stats);
-  const lastSuccessHtml = buildChannelLastSuccessHtml(stats);
+  const runtimeStatusHtml = buildChannelRuntimeStatusHtml(channel, stats);
+  const lastRequestFailureHtml = buildChannelLastRequestFailureHtml(stats);
 
   // 消耗HTML：仅保留 token 相关消耗项
   let usageHtml = '';
@@ -569,7 +861,6 @@ function createChannelCard(channel) {
   // 行class
   const rowClasses = ['channel-table-row'];
   if (isCooldown) rowClasses.push('channel-card-cooldown');
-  const lastRequestFailureHtml = buildChannelLastRequestFailureHtml(stats);
   if (batchRefreshResult && batchRefreshResult.status) {
     rowClasses.push(`channel-row-refresh-${batchRefreshResult.status}`);
   }
@@ -587,16 +878,16 @@ function createChannelCard(channel) {
     id: channel.id,
 		name: channel.name,
 		nameMultiplierBadge: buildCornerMultiplierBadge(channel.cost_multiplier),
+    oauthPlanBadge: buildOAuthPlanBadge(channel),
     url: configuredURLs.join('\n'),
     batchRefreshStatusHtml: buildBatchRefreshStatusHtml(batchRefreshResult),
     modelsText: modelsText,
     priority: channel.priority,
     effectivePriorityHtml: buildEffectivePriorityHtml(channel),
-    cooldownBadge: inlineCooldownBadge(channel),
     durationHtml: durationHtml,
     usageHtml: usageHtml,
     costHtml: costHtml,
-    lastSuccessHtml: lastSuccessHtml,
+    runtimeStatusHtml: runtimeStatusHtml,
     lastRequestFailureHtml: lastRequestFailureHtml,
     healthHtml: healthHtml,
     enabled: channel.enabled,
@@ -605,19 +896,28 @@ function createChannelCard(channel) {
     durationCellClass: durationHtml ? '' : 'ch-mobile-empty',
     usageCellClass: usageHtml ? '' : 'ch-mobile-empty',
     costCellClass: costHtml ? '' : 'ch-mobile-empty',
-    lastSuccessCellClass: lastSuccessHtml ? '' : 'ch-mobile-empty',
+    lastSuccessCellClass: runtimeStatusHtml ? '' : 'ch-mobile-empty',
     mobileLabelModels: window.t('channels.table.models'),
     mobileLabelPriority: window.t('channels.table.priority'),
     mobileLabelDuration: window.t('channels.table.duration'),
     mobileLabelUsage: window.t('channels.table.usage'),
     mobileLabelCost: window.t('channels.stats.cost'),
-    mobileLabelLastSuccess: window.t('channels.table.lastSuccess'),
+    mobileLabelLastSuccess: window.t('channels.table.statusAndLastSuccess'),
     mobileLabelEnabled: window.t('channels.table.enabled'),
     mobileLabelActions: window.t('channels.table.actions')
   };
 
   const card = TemplateEngine.render('tpl-channel-card', cardData);
   return card;
+}
+
+async function editChannelCoolingKeys(channelId) {
+  await editChannel(channelId);
+  if (editingChannelId !== channelId) return;
+
+  const filter = document.getElementById('keyStatusFilter');
+  if (filter) filter.value = 'cooldown';
+  filterKeysByStatus('cooldown');
 }
 
 /**
@@ -703,7 +1003,7 @@ function initChannelEventDelegation() {
     if (!btn) return;
 
     const action = btn.dataset.action;
-    if (isTokenChannelsReadOnly() && ['edit', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
+    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'refresh-oauth-usage', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
       return;
     }
     const channelId = parseInt(btn.dataset.channelId);
@@ -713,6 +1013,16 @@ function initChannelEventDelegation() {
     switch (action) {
       case 'edit':
         editChannel(channelId);
+        break;
+      case 'edit-cooling-keys':
+        editChannelCoolingKeys(channelId);
+        break;
+      case 'refresh-oauth-usage':
+        if (typeof refreshOAuthUsage === 'function') {
+          refreshOAuthUsage(channelId).catch(error => {
+            if (window.showError) window.showError(error?.message || window.t('channels.oauth.usageFailed'));
+          });
+        }
         break;
       case 'test':
         testChannel(channelId, channelName);
@@ -764,7 +1074,7 @@ function renderChannels(channelsToRender = channels) {
       <th class="ch-col-duration">${window.t('channels.table.duration')}</th>
       <th class="ch-col-usage">${window.t('channels.table.usage')}</th>
       <th class="ch-col-cost">${window.t('channels.stats.cost')}</th>
-      <th class="ch-col-last-success">${window.t('channels.table.lastSuccess')}</th>
+      <th class="ch-col-last-success">${window.t('channels.table.statusAndLastSuccess')}</th>
       <th class="ch-col-enabled">${window.t('channels.table.enabled')}</th>
       <th class="ch-col-actions">${window.t('channels.table.actions')}</th>
     </tr>
@@ -792,4 +1102,8 @@ function renderChannels(channelsToRender = channels) {
   if (typeof updateBatchChannelSelectionUI === 'function') {
     updateBatchChannelSelectionUI();
   }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { buildChannelRuntimeStatusHtml, buildOAuthPlanBadge, buildOAuthUsageStatusHtml, formatCooldownRecoveryTime };
 }

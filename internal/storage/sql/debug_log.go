@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"ccLoad/internal/model"
@@ -19,7 +20,7 @@ func (s *SQLStore) AddDebugLog(ctx context.Context, e *model.DebugLogEntry) erro
 				translated_resp_status, translated_resp_headers, translated_resp_body)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.LogID, e.CreatedAt, e.ReqMethod, e.ReqURL, e.ReqHeaders, e.ReqBody, e.RespStatus, e.RespHeaders, e.RespBody,
-		boolToInt(e.ProtocolTransformed), e.OriginalReqURL, e.OriginalReqHeaders, e.OriginalReqBody,
+		e.ProtocolTransformed, e.OriginalReqURL, e.OriginalReqHeaders, e.OriginalReqBody,
 		e.TranslatedRespStatus, e.TranslatedRespHeaders, e.TranslatedRespBody,
 	)
 	return err
@@ -49,20 +50,43 @@ func (s *SQLStore) GetDebugLogByLogID(ctx context.Context, logID int64) (*model.
 	return &e, nil
 }
 
-// CleanupDebugLogsBefore 清理过期的调试日志
-func (s *SQLStore) CleanupDebugLogsBefore(ctx context.Context, cutoff time.Time) error {
-	result, err := s.ExecContext(ctx, `DELETE FROM debug_logs WHERE created_at < ?`, cutoff.Unix())
-	if err != nil {
-		return err
+// CleanupDebugLogsBatch 按创建时间删除有限数量的过期调试日志。
+func (s *SQLStore) CleanupDebugLogsBatch(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit < 1 {
+		return 0, fmt.Errorf("debug log cleanup limit must be positive: %d", limit)
 	}
-	affected, _ := result.RowsAffected()
-	s.runSQLiteIncrementalVacuum(ctx, affected)
-	return nil
+
+	query := `DELETE FROM debug_logs
+		WHERE log_id IN (
+			SELECT log_id FROM debug_logs
+			WHERE created_at < ?
+			ORDER BY created_at
+			LIMIT ?
+		)`
+	if s.IsMySQL() {
+		query = `DELETE FROM debug_logs WHERE created_at < ? ORDER BY created_at LIMIT ?`
+	}
+
+	// 单条 DELETE 不包外层事务；ExecContext 成功返回时该批次已经自动提交。
+	result, err := s.ExecContext(ctx, query, cutoff.Unix(), limit)
+	if err != nil {
+		return 0, err
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 // TruncateDebugLogs 清空所有调试日志
 func (s *SQLStore) TruncateDebugLogs(ctx context.Context) error {
-	result, err := s.ExecContext(ctx, `DELETE FROM debug_logs`)
+	query := `TRUNCATE TABLE debug_logs`
+	if s.IsSQLite() {
+		// SQLite 没有 TRUNCATE TABLE；无条件 DELETE 会触发 truncate optimization。
+		query = `DELETE FROM debug_logs`
+	}
+	result, err := s.ExecContext(ctx, query)
 	if err != nil {
 		return err
 	}

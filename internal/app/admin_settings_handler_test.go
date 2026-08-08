@@ -11,6 +11,124 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func findAdminSetting(t *testing.T, settings []map[string]any, key string) map[string]any {
+	t.Helper()
+	for _, setting := range settings {
+		if setting["key"] == key {
+			return setting
+		}
+	}
+	t.Fatalf("setting %q not found", key)
+	return nil
+}
+
+func TestAdminContainerUpdateSettingsDisabled(t *testing.T) {
+	t.Setenv("CCLOAD_CONTAINER", "1")
+
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults failed: %v", err)
+	}
+
+	const disabledReason = "container_image_managed"
+	updateKeys := []string{autoUpdateIntervalSettingKey, autoUpdateChannelSettingKey}
+
+	t.Run("list and get expose disabled state", func(t *testing.T) {
+		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/settings", nil))
+		server.AdminListSettings(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		resp := mustParseAPIResponse[[]map[string]any](t, w.Body.Bytes())
+		for _, key := range updateKeys {
+			setting := findAdminSetting(t, resp.Data, key)
+			if editable, ok := setting["editable"].(bool); !ok || editable {
+				t.Fatalf("setting %q editable=%v, want false", key, setting["editable"])
+			}
+			if reason := setting["disabled_reason"]; reason != disabledReason {
+				t.Fatalf("setting %q disabled_reason=%v, want %q", key, reason, disabledReason)
+			}
+
+			c, w = newTestContext(t, newRequest(http.MethodGet, "/admin/settings/"+key, nil))
+			c.Params = gin.Params{{Key: "key", Value: key}}
+			server.AdminGetSetting(c)
+			if w.Code != http.StatusOK {
+				t.Fatalf("get %q status=%d, want %d body=%s", key, w.Code, http.StatusOK, w.Body.String())
+			}
+			view := mustParseAPIResponse[map[string]any](t, w.Body.Bytes()).Data
+			if view["editable"] != false || view["disabled_reason"] != disabledReason {
+				t.Fatalf("get %q view=%v, want disabled container view", key, view)
+			}
+		}
+	})
+
+	oldRestartFunc := RestartFunc
+	t.Cleanup(func() { RestartFunc = oldRestartFunc })
+	restarted := make(chan struct{}, 1)
+	RestartFunc = func() { restarted <- struct{}{} }
+
+	t.Run("all write paths reject container-managed settings", func(t *testing.T) {
+		for _, key := range updateKeys {
+			before, err := store.GetSetting(context.Background(), key)
+			if err != nil {
+				t.Fatalf("GetSetting %q before write: %v", key, err)
+			}
+
+			c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+key, map[string]string{"value": before.DefaultValue}))
+			c.Params = gin.Params{{Key: "key", Value: key}}
+			server.AdminUpdateSetting(c)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("update %q status=%d, want %d body=%s", key, w.Code, http.StatusConflict, w.Body.String())
+			}
+
+			c, w = newTestContext(t, newRequest(http.MethodPost, "/admin/settings/"+key+"/reset", nil))
+			c.Params = gin.Params{{Key: "key", Value: key}}
+			server.AdminResetSetting(c)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("reset %q status=%d, want %d body=%s", key, w.Code, http.StatusConflict, w.Body.String())
+			}
+
+			after, err := store.GetSetting(context.Background(), key)
+			if err != nil {
+				t.Fatalf("GetSetting %q after writes: %v", key, err)
+			}
+			if after.Value != before.Value {
+				t.Fatalf("setting %q changed from %q to %q", key, before.Value, after.Value)
+			}
+		}
+
+		beforeLogRetention, err := store.GetSetting(context.Background(), "log_retention_days")
+		if err != nil {
+			t.Fatalf("GetSetting log_retention_days before batch: %v", err)
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+			"log_retention_days":        "30",
+			autoUpdateChannelSettingKey: "preview",
+		}))
+		server.AdminBatchUpdateSettings(c)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("batch status=%d, want %d body=%s", w.Code, http.StatusConflict, w.Body.String())
+		}
+		afterLogRetention, err := store.GetSetting(context.Background(), "log_retention_days")
+		if err != nil {
+			t.Fatalf("GetSetting log_retention_days after batch: %v", err)
+		}
+		if afterLogRetention.Value != beforeLogRetention.Value {
+			t.Fatalf("batch partially changed log_retention_days from %q to %q", beforeLogRetention.Value, afterLogRetention.Value)
+		}
+
+		select {
+		case <-restarted:
+			t.Fatal("rejected container setting write triggered restart")
+		default:
+		}
+	})
+}
+
 func TestAdminUpdateModelCatalogSyncIntervalSetting(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()

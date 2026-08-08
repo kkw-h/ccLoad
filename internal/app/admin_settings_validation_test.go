@@ -1,6 +1,10 @@
 package app
 
-import "testing"
+import (
+	"testing"
+
+	"ccLoad/internal/config"
+)
 
 func TestValidateSettingValue(t *testing.T) {
 	t.Parallel()
@@ -66,6 +70,18 @@ func TestValidateSettingValue(t *testing.T) {
 		{name: "duration_upstream_connection_reuse_limit_reject_negative", key: "upstream_connection_reuse_limit_seconds", valueType: "duration", value: "-1", wantErr: true},
 
 		{name: "string_accepts_any", key: "any_string", valueType: "string", value: "", wantErr: false},
+		{name: "string_auto_update_channel_stable", key: "auto_update_channel", valueType: "string", value: "stable", wantErr: false},
+		{name: "string_auto_update_channel_preview", key: "auto_update_channel", valueType: "string", value: "preview", wantErr: false},
+		{name: "string_auto_update_channel_reject_beta", key: "auto_update_channel", valueType: "string", value: "beta", wantErr: true},
+		{name: "string_auto_update_channel_reject_empty", key: "auto_update_channel", valueType: "string", value: "", wantErr: true},
+		{name: "string_codex_base_url_accepts_empty", key: config.CodexBaseURLSettingKey, valueType: "string", value: "", wantErr: false},
+		{name: "string_codex_base_url_accepts_https", key: config.CodexBaseURLSettingKey, valueType: "string", value: "https://gateway.example/backend-api/codex/responses", wantErr: false},
+		{name: "string_xai_base_url_accepts_v1", key: config.XAIBaseURLSettingKey, valueType: "string", value: "https://gateway.example/v1", wantErr: false},
+		{name: "string_antigravity_url_accepts_http", key: config.AntigravityURLSettingKey, valueType: "string", value: "http://gateway.example", wantErr: false},
+		{name: "string_oauth_base_url_rejects_relative", key: config.CodexBaseURLSettingKey, valueType: "string", value: "/responses", wantErr: true},
+		{name: "string_oauth_base_url_rejects_credentials", key: config.XAIBaseURLSettingKey, valueType: "string", value: "https://user:pass@gateway.example/v1", wantErr: true},
+		{name: "string_oauth_base_url_rejects_query", key: config.AntigravityURLSettingKey, valueType: "string", value: "https://gateway.example?token=secret", wantErr: true},
+		{name: "string_oauth_base_url_rejects_non_http", key: config.CodexBaseURLSettingKey, valueType: "string", value: "ftp://gateway.example/responses", wantErr: true},
 
 		{name: "unknown_type_reject", key: "k", valueType: "wtf", value: "x", wantErr: true},
 	}

@@ -13,6 +13,7 @@ import (
 
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage/schema"
+	sqlstore "ccLoad/internal/storage/sql"
 
 	_ "modernc.org/sqlite"
 )
@@ -37,15 +38,16 @@ func TestMigrate_SQLite_AddsProtocolTransformModeWithAutoDefault(t *testing.T) {
 			name TEXT NOT NULL UNIQUE,
 			url TEXT NOT NULL,
 			priority INTEGER NOT NULL DEFAULT 0,
+			channel_type TEXT NOT NULL DEFAULT 'anthropic',
 			enabled INTEGER NOT NULL DEFAULT 1,
 			cooldown_until INTEGER NOT NULL DEFAULT 0,
 			cooldown_duration_ms INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		);
-		INSERT INTO channels(name, url, created_at, updated_at)
+		INSERT INTO channels(name, url, channel_type, created_at, updated_at)
 		VALUES('legacy', 'https://example.com
-https://example.com/v1/messages#', 1, 1)
+https://example.com/v1/messages#', 'codex', 1, 1)
 	`); err != nil {
 		t.Fatalf("create legacy channels: %v", err)
 	}
@@ -60,12 +62,35 @@ https://example.com/v1/messages#', 1, 1)
 	if !columns["protocol_transform_mode"] {
 		t.Fatalf("channels missing protocol_transform_mode: %v", columns)
 	}
+	if !columns["auth_type"] || !columns["oauth_credential"] {
+		t.Fatalf("channels missing Codex auth columns: %v", columns)
+	}
 	var mode string
 	if err := db.QueryRowContext(ctx, "SELECT protocol_transform_mode FROM channels WHERE name='legacy'").Scan(&mode); err != nil {
 		t.Fatalf("read migrated mode: %v", err)
 	}
 	if mode != "auto" {
 		t.Fatalf("migrated mode=%q, want auto", mode)
+	}
+	var channelID int64
+	var legacyChannelType, authType string
+	var credential sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT id, channel_type, auth_type, oauth_credential FROM channels WHERE name='legacy'").Scan(&channelID, &legacyChannelType, &authType, &credential); err != nil {
+		t.Fatalf("read migrated auth fields: %v", err)
+	}
+	if legacyChannelType != "codex" {
+		t.Fatalf("migration changed historical channel_type=%q, want codex", legacyChannelType)
+	}
+	if authType != model.AuthTypeAPIKey || credential.Valid {
+		t.Fatalf("migrated auth fields=(%q, %v), want (%q, NULL)", authType, credential, model.AuthTypeAPIKey)
+	}
+	store := sqlstore.NewSQLStore(db, "sqlite")
+	loaded, err := store.GetConfig(ctx, channelID)
+	if err != nil {
+		t.Fatalf("load migrated channel through store: %v", err)
+	}
+	if loaded.OAuthCredential != "" {
+		t.Fatalf("store OAuthCredential=%q, want empty", loaded.OAuthCredential)
 	}
 	var rawURLs string
 	if err := db.QueryRowContext(ctx, "SELECT url FROM channels WHERE name='legacy'").Scan(&rawURLs); err != nil {
@@ -81,6 +106,55 @@ https://example.com/v1/messages#', 1, 1)
 	}
 	if err := migrate(ctx, db, DialectSQLite); err != nil {
 		t.Fatalf("second migrate must be idempotent: %v", err)
+	}
+}
+
+func TestMigrate_SQLite_RenamesLegacyCodexCredentialToOAuthCredential(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channels (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			url TEXT NOT NULL,
+			priority INTEGER NOT NULL DEFAULT 0,
+			channel_type TEXT NOT NULL DEFAULT 'anthropic',
+			auth_type TEXT NOT NULL DEFAULT 'api_key',
+			codex_credential TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			cooldown_until INTEGER NOT NULL DEFAULT 0,
+			cooldown_duration_ms INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		INSERT INTO channels(name, url, auth_type, codex_credential, created_at, updated_at)
+		VALUES('codex-user', 'https://example.com', 'codex_oauth', '{"access_token":"at-secret"}', 1, 1)
+	`); err != nil {
+		t.Fatalf("create legacy Codex channel: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy Codex channel: %v", err)
+	}
+	var authType, credential string
+	if err := db.QueryRowContext(ctx,
+		"SELECT auth_type, oauth_credential FROM channels WHERE name='codex-user'",
+	).Scan(&authType, &credential); err != nil {
+		t.Fatalf("read migrated OAuth credential: %v", err)
+	}
+	if authType != model.AuthTypeCodexOAuth || credential != `{"access_token":"at-secret"}` {
+		t.Fatalf("migrated auth=(%q, %q)", authType, credential)
+	}
+	columns, err := sqliteExistingColumns(ctx, db, "channels")
+	if err != nil {
+		t.Fatalf("list migrated channel columns: %v", err)
+	}
+	if columns["codex_credential"] || !columns["oauth_credential"] {
+		t.Fatalf("credential column was not renamed: %v", columns)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("second migrate: %v", err)
 	}
 }
 
@@ -137,6 +211,71 @@ func TestMigrate_SQLite_FullFlow(t *testing.T) {
 	if val != "{}" || valueType != "json" || defaultValue != "{}" {
 		t.Fatalf("global_cooldown_detection_rules=%q/%q/%q, want {}/json/{}", val, valueType, defaultValue)
 	}
+}
+
+func TestMigrate_SQLite_AntigravitySensitiveWordsDefault(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const wantDefault = `["API","proxy","Claude","Anthropic"]`
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate new database: %v", err)
+	}
+
+	assertSetting := func(wantValue, wantDefaultValue string) {
+		t.Helper()
+		var value, defaultValue string
+		if err := db.QueryRowContext(ctx, `
+			SELECT value, default_value
+			FROM system_settings
+			WHERE key = 'antigravity_sensitive_words'
+		`).Scan(&value, &defaultValue); err != nil {
+			t.Fatalf("query antigravity_sensitive_words: %v", err)
+		}
+		if value != wantValue || defaultValue != wantDefaultValue {
+			t.Fatalf("antigravity_sensitive_words value/default=%q/%q, want %q/%q", value, defaultValue, wantValue, wantDefaultValue)
+		}
+	}
+
+	assertSetting(wantDefault, wantDefault)
+
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = '[]', default_value = '[]'
+		WHERE key = 'antigravity_sensitive_words'
+	`); err != nil {
+		t.Fatalf("restore legacy default: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy default: %v", err)
+	}
+	assertSetting(wantDefault, wantDefault)
+
+	const previousDefault = `["API","proxy"]`
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = ?, default_value = ?
+		WHERE key = 'antigravity_sensitive_words'
+	`, previousDefault, previousDefault); err != nil {
+		t.Fatalf("restore previous default: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate previous default: %v", err)
+	}
+	assertSetting(wantDefault, wantDefault)
+
+	const customValue = `["custom"]`
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = ?, default_value = ?
+		WHERE key = 'antigravity_sensitive_words'
+	`, customValue, previousDefault); err != nil {
+		t.Fatalf("set custom value: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("refresh custom value metadata: %v", err)
+	}
+	assertSetting(customValue, wantDefault)
 }
 
 func TestMigrate_SQLite_RenamesDuplicateModelFingerprintNames(t *testing.T) {
@@ -495,8 +634,8 @@ func TestMigrate_SQLite_AddsModelCooldownDuration(t *testing.T) {
 		t.Fatalf("create legacy model cooldown table: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO channels (name, url, created_at, updated_at)
-		VALUES ('legacy-model-cooldown', 'https://api.example.com', 700, 700)
+		INSERT INTO channels (name, url, oauth_credential, created_at, updated_at)
+		VALUES ('legacy-model-cooldown', 'https://api.example.com', '', 700, 700)
 	`); err != nil {
 		t.Fatalf("create legacy cooldown channel: %v", err)
 	}
@@ -1191,8 +1330,8 @@ func TestMigrateModelRedirectsData_WithLegacyData(t *testing.T) {
 
 	// 插入带旧格式数据的渠道
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO channels (name, url, priority, enabled, models, model_redirects, created_at, updated_at)
-		VALUES ('test-ch', 'https://api.example.com', 10, 1, '["gpt-4o","gpt-3.5-turbo"]', '{"gpt-3.5-turbo":"gpt-4o-mini"}', unixepoch(), unixepoch())
+		INSERT INTO channels (name, url, priority, enabled, oauth_credential, models, model_redirects, created_at, updated_at)
+		VALUES ('test-ch', 'https://api.example.com', 10, 1, '', '["gpt-4o","gpt-3.5-turbo"]', '{"gpt-3.5-turbo":"gpt-4o-mini"}', unixepoch(), unixepoch())
 	`)
 	if err != nil {
 		t.Fatalf("insert channel: %v", err)
@@ -1292,8 +1431,8 @@ func TestRepairLegacyChannelModelOrder_SQLite(t *testing.T) {
 	}
 
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO channels (id, name, url, priority, enabled, models, model_redirects, created_at, updated_at)
-		VALUES (1, 'repair-order', 'https://api.example.com', 10, 1, '["z-model","a-model"]', '{}', 100, 100)
+		INSERT INTO channels (id, name, url, priority, enabled, oauth_credential, models, model_redirects, created_at, updated_at)
+		VALUES (1, 'repair-order', 'https://api.example.com', 10, 1, '', '["z-model","a-model"]', '{}', 100, 100)
 	`)
 	if err != nil {
 		t.Fatalf("insert legacy channel: %v", err)
@@ -1382,6 +1521,9 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 
 	// 验证所有预期的设置项
 	expectedKeys := []string{
+		"CODEX_BASE_URL",
+		"XAI_BASE_URL",
+		"ANTIGRAVITY_URL",
 		"log_retention_days",
 		"max_key_retries",
 		"upstream_first_byte_timeout",
@@ -1400,6 +1542,7 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		"channel_test_content",
 		"channel_check_interval_hours",
 		"auto_update_interval_hours",
+		"auto_update_channel",
 		"channel_stats_range",
 		"enable_health_score",
 		"success_rate_penalty_weight",
@@ -1428,6 +1571,9 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		if key == "auto_update_interval_hours" && val != "12" {
 			t.Errorf("setting %q default = %q, want 12", key, val)
 		}
+		if key == "auto_update_channel" && val != "stable" {
+			t.Errorf("setting %q default = %q, want stable", key, val)
+		}
 		if key == "stream_timeout" && val != "0" {
 			t.Errorf("setting %q default = %q, want 0", key, val)
 		}
@@ -1446,6 +1592,9 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		if key == "responses_ws_max_transcript_bytes" && val != "134217728" {
 			t.Errorf("setting %q default = %q, want 134217728", key, val)
 		}
+		if (key == "CODEX_BASE_URL" || key == "XAI_BASE_URL" || key == "ANTIGRAVITY_URL") && val != "" {
+			t.Errorf("setting %q default = %q, want empty", key, val)
+		}
 	}
 	var valueType string
 	if err := db.QueryRowContext(ctx,
@@ -1455,6 +1604,14 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 	}
 	if valueType != "int" {
 		t.Fatalf("auto_update_interval_hours value_type = %q, want int", valueType)
+	}
+	if err := db.QueryRowContext(ctx,
+		"SELECT value_type FROM system_settings WHERE key='auto_update_channel'",
+	).Scan(&valueType); err != nil {
+		t.Fatalf("query auto_update_channel value_type: %v", err)
+	}
+	if valueType != "string" {
+		t.Fatalf("auto_update_channel value_type = %q, want string", valueType)
 	}
 
 	// 验证 idempotent：再次 init 不应报错

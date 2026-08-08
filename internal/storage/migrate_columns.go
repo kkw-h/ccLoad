@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -533,16 +534,51 @@ func ensureAuthTokensCacheFieldsMySQL(ctx context.Context, db *sql.DB) error {
 
 // ensureAuthTokensAllowedModels 确保auth_tokens表有allowed_models字段
 func ensureAuthTokensAllowedModels(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	return ensureColumn(ctx, db, dialect, "auth_tokens", "allowed_models",
-		"VARCHAR(2000) NOT NULL DEFAULT ''",
-		"TEXT NOT NULL DEFAULT ''")
+	return ensureAuthTokenRestrictionColumn(ctx, db, dialect, "allowed_models")
 }
 
 // ensureAuthTokensAllowedChannelIDs 确保auth_tokens表有allowed_channel_ids字段
 func ensureAuthTokensAllowedChannelIDs(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	return ensureColumn(ctx, db, dialect, "auth_tokens", "allowed_channel_ids",
-		"VARCHAR(2000) NOT NULL DEFAULT ''",
-		"TEXT NOT NULL DEFAULT ''")
+	return ensureAuthTokenRestrictionColumn(ctx, db, dialect, "allowed_channel_ids")
+}
+
+func ensureAuthTokenRestrictionColumn(ctx context.Context, db *sql.DB, dialect Dialect, column string) error {
+	if dialect != DialectPostgres {
+		return ensureColumn(ctx, db, dialect, "auth_tokens", column,
+			"VARCHAR(2000) NOT NULL DEFAULT ''",
+			"TEXT NOT NULL DEFAULT ''")
+	}
+
+	if err := ensurePostgresColumns(ctx, db, "auth_tokens", []mysqlColumnDef{{
+		name:       column,
+		definition: "TEXT NOT NULL DEFAULT ''",
+	}}); err != nil {
+		return err
+	}
+
+	var dataType string
+	if err := db.QueryRowContext(ctx, `
+		SELECT data_type
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'auth_tokens' AND column_name = $1
+	`, column).Scan(&dataType); err != nil {
+		return fmt.Errorf("inspect auth_tokens.%s type: %w", column, err)
+	}
+	if dataType == "text" {
+		return nil
+	}
+	if dataType != "character varying" {
+		return fmt.Errorf("auth_tokens.%s has unsupported type %q", column, dataType)
+	}
+
+	// column 只来自上面两个固定调用点，不接受外部输入。
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE auth_tokens ALTER COLUMN %s TYPE TEXT", column,
+	)); err != nil {
+		return fmt.Errorf("migrate auth_tokens.%s to TEXT: %w", column, err)
+	}
+	log.Printf("[MIGRATE] 已将 auth_tokens.%s 扩展为 TEXT (postgres)", column)
+	return nil
 }
 
 // ensureAuthTokensChannelRestrictionMode 确保auth_tokens表有channel_restriction_mode字段
@@ -646,6 +682,12 @@ func ensureChannelsProxyURL(ctx context.Context, db *sql.DB, dialect Dialect) er
 		"TEXT NOT NULL DEFAULT ''")
 }
 
+func ensureChannelsRetryOtherKeysOnFailure(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channels", "retry_other_keys_on_failure",
+		"TINYINT NOT NULL DEFAULT 0",
+		"INTEGER NOT NULL DEFAULT 0")
+}
+
 func ensureChannelsWebsockets(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	return ensureColumn(ctx, db, dialect, "channels", "websockets",
 		"TINYINT NOT NULL DEFAULT 0",
@@ -656,6 +698,68 @@ func ensureChannelsProtocolTransformMode(ctx context.Context, db *sql.DB, dialec
 	return ensureColumn(ctx, db, dialect, "channels", "protocol_transform_mode",
 		"VARCHAR(32) NOT NULL DEFAULT 'auto'",
 		"TEXT NOT NULL DEFAULT 'auto'")
+}
+
+// ensureChannelsAuthType adds an authentication-specific discriminator. It is
+// deliberately independent from the retained historical channel_type column.
+func ensureChannelsAuthType(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channels", "auth_type",
+		"VARCHAR(32) NOT NULL DEFAULT 'api_key'",
+		"TEXT NOT NULL DEFAULT 'api_key'")
+}
+
+func ensureChannelsOAuthCredential(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	legacyExists, err := migrationColumnExists(ctx, db, dialect, "channels", "codex_credential")
+	if err != nil {
+		return err
+	}
+	oauthExists, err := migrationColumnExists(ctx, db, dialect, "channels", "oauth_credential")
+	if err != nil {
+		return err
+	}
+	if oauthExists {
+		if legacyExists {
+			return errors.New("channels contains both codex_credential and oauth_credential")
+		}
+		return nil
+	}
+	if !legacyExists {
+		return ensureColumn(ctx, db, dialect, "channels", "oauth_credential", "TEXT", "TEXT")
+	}
+
+	statement := "ALTER TABLE channels RENAME COLUMN codex_credential TO oauth_credential"
+	if dialect == DialectMySQL {
+		statement = "ALTER TABLE channels CHANGE COLUMN codex_credential oauth_credential TEXT NULL"
+	}
+	if _, err := db.ExecContext(ctx, statement); err != nil {
+		return fmt.Errorf("rename channels codex_credential to oauth_credential: %w", err)
+	}
+	return nil
+}
+
+func migrationColumnExists(ctx context.Context, db *sql.DB, dialect Dialect, table, column string) (bool, error) {
+	switch dialect {
+	case DialectMySQL:
+		var count int
+		err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?",
+			table, column,
+		).Scan(&count)
+		return count > 0, err
+	case DialectPostgres:
+		var count int
+		err := db.QueryRowContext(ctx,
+			rebindIfPostgres(DialectPostgres, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?"),
+			table, column,
+		).Scan(&count)
+		return count > 0, err
+	default:
+		columns, err := sqliteExistingColumns(ctx, db, table)
+		if err != nil {
+			return false, err
+		}
+		return columns[column], nil
+	}
 }
 
 // migrateChannelsURLToText 将channels.url从VARCHAR(191)扩展为TEXT

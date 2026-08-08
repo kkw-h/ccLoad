@@ -40,7 +40,12 @@ func (s *Server) applyCooldownDecision(
 
 	in = s.completeCooldownInput(cfg, in)
 
-	action := s.cooldownManager.HandleError(cooldownCtx, in)
+	var action cooldown.Action
+	if cfg.RetryOtherKeysOnFailure {
+		action = s.cooldownManager.HandleErrorWithKeyFallback(cooldownCtx, in)
+	} else {
+		action = s.cooldownManager.HandleError(cooldownCtx, in)
+	}
 
 	if action == cooldown.ActionRetryKey || action == cooldown.ActionRetryModel || action == cooldown.ActionRetryChannel {
 		s.invalidateChannelRelatedCache(cfg.ID)
@@ -249,12 +254,15 @@ func (s *Server) handleNetworkError(
 		failure.nextAction = cooldown.ActionReturnClient
 		return failure, cooldown.ActionReturnClient
 	}
+	failure.isNetworkError = true
 
 	input := cooldownInputForModel(networkErrorInput(cfg.ID, keyIndex, statusCode), actualModel)
 	input.ModelScoped = util.IsModelScopedNetworkError(err)
 	if deferChannelCooldown {
 		action := s.decideCooldownAction(ctx, cfg, input)
-		if action == cooldown.ActionRetryChannel {
+		keyFallback := cfg.RetryOtherKeysOnFailure &&
+			s.cooldownManager.CanFallbackToOtherKey(s.completeCooldownInput(cfg, input))
+		if action == cooldown.ActionRetryChannel && !keyFallback {
 			failure.nextAction = action
 			return failure, action
 		}
@@ -458,10 +466,12 @@ func (s *Server) handleProxySuccess(
 			log.Printf("[WARN] ClearChannelCooldown 失败 (累计: %d): channel_id=%d err=%v", count, cfg.ID, err)
 		}
 	}
-	if err := s.cooldownManager.ClearKeyCooldown(cooldownCtx, cfg.ID, keyIndex); err != nil {
-		count := cooldownClearKeyFailCount.Add(1)
-		if count%100 == 1 {
-			log.Printf("[WARN] ClearKeyCooldown 失败 (累计: %d): channel_id=%d key_index=%d err=%v", count, cfg.ID, keyIndex, err)
+	if keyIndex != cooldown.NoKeyIndex {
+		if err := s.cooldownManager.ClearKeyCooldown(cooldownCtx, cfg.ID, keyIndex); err != nil {
+			count := cooldownClearKeyFailCount.Add(1)
+			if count%100 == 1 {
+				log.Printf("[WARN] ClearKeyCooldown 失败 (累计: %d): channel_id=%d key_index=%d err=%v", count, cfg.ID, keyIndex, err)
+			}
 		}
 	}
 	if actualModel != "" && s.hasActiveModelCooldown(ctx, cfg.ID, actualModel) {
@@ -476,6 +486,10 @@ func (s *Server) handleProxySuccess(
 
 	// 冷却状态已恢复，刷新相关缓存避免下次命中过期数据
 	s.invalidateChannelRelatedCache(cfg.ID)
+
+	if cfg.RetryOtherKeysOnFailure && reqCtx.routingSession != nil {
+		reqCtx.routingSession.rememberPreferredChannel(cfg.ID)
+	}
 
 	// 记录成功日志
 	s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, res.Status, duration, res, "")
@@ -572,7 +586,14 @@ func (s *Server) handleProxyErrorResponse(
 	input := cooldownInputForModel(httpErrorInput(cfg.ID, keyIndex, res), actualModel)
 	if deferChannelCooldown {
 		action := s.decideCooldownAction(ctx, cfg, input)
-		if action == cooldown.ActionRetryChannel {
+		if cfg.UsesAntigravityOAuth() && shouldFallbackAntigravityBaseURL(res.Status, res.Body) {
+			failure.nextAction = action
+			failure.deferredCooldown = &input
+			return failure, action
+		}
+		keyFallback := cfg.RetryOtherKeysOnFailure &&
+			s.cooldownManager.CanFallbackToOtherKey(s.completeCooldownInput(cfg, input))
+		if action == cooldown.ActionRetryChannel && !keyFallback {
 			failure.nextAction = action
 			failure.deferredCooldown = &input
 			return failure, action

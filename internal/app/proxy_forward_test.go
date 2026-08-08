@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/protocol/builtin"
+	"ccLoad/internal/util"
+
+	"github.com/tidwall/gjson"
 )
 
 func runHandleSuccessResponse(t *testing.T, body string, headers http.Header, isStreaming bool, upstreamProtocol string) (*fwResult, string) {
@@ -39,6 +43,214 @@ func runHandleSuccessResponse(t *testing.T, body string, headers http.Header, is
 	}
 
 	return res, rec.Body.String()
+}
+
+func TestCodexOAuthRequestUsesRuntimeCredentialAndCodexWireContract(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1, Name: "codex", AuthType: model.AuthTypeCodexOAuth,
+		URLs:             model.ChannelURLs{{URL: "https://chatgpt.example.test/backend-api/codex/responses", Exact: true, Protocols: []string{"codex"}}},
+		CodexAccessToken: "at-secret", CodexAccountID: "account-1",
+		CustomRequestRules: &model.CustomRequestRules{Headers: []model.CustomHeaderRule{
+			{Action: model.RuleActionOverride, Name: "Authorization", Value: "Bearer attacker"},
+			{Action: model.RuleActionOverride, Name: "User-Agent", Value: "attacker"},
+			{Action: model.RuleActionOverride, Name: "X-Configured", Value: "kept"},
+		}},
+	}
+	body := []byte(`{"model":"gpt-5.4-mini","stream":false,"input":[{"role":"system","content":"rules"}],"reasoning":{"effort":"minimal"},"max_output_tokens":12,"temperature":0.2,"truncation":"auto","context_management":{"type":"compaction"},"user":"u","previous_response_id":"resp-old","generate":true,"tools":[{"type":"web_search_preview"}]}`)
+	reqCtx := &requestContext{
+		ctx: context.Background(), startTime: time.Now(), isStreaming: false,
+		clientProtocol: protocol.Codex, upstreamProtocol: protocol.Codex,
+	}
+	req, err := srv.buildProxyRequest(
+		reqCtx, cfg, "must-not-be-used", http.MethodPost, body,
+		http.Header{
+			"Content-Type":                          []string{"application/json"},
+			"OpenAI-Beta":                           []string{"http-must-drop"},
+			"X-Codex-Beta-Features":                 []string{"feature-1"},
+			"Version":                               []string{"1.2.3"},
+			"X-Codex-Turn-State":                    []string{"turn-state-1"},
+			"X-Codex-Turn-Metadata":                 []string{`{"turn_id":"turn-1"}`},
+			"X-Client-Request-Id":                   []string{"request-1"},
+			"X-Forwarded-For":                       []string{"203.0.113.10"},
+			"X-Arbitrary-Client":                    []string{"drop-me"},
+			"X-ResponsesAPI-Include-Timing-Metrics": []string{"true"},
+		},
+		"", "/v1/responses", cfg.GetURLs()[0],
+	)
+	if err != nil {
+		t.Fatalf("buildProxyRequest() error = %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer at-secret" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := req.Header.Get("ChatGPT-Account-ID"); got != "account-1" {
+		t.Fatalf("ChatGPT-Account-ID = %q", got)
+	}
+	if req.Header.Get("User-Agent") != codexUserAgent || req.Header.Get("Originator") != "codex-tui" {
+		t.Fatalf("Codex identity headers = %v", req.Header)
+	}
+	if req.Header.Get("Session_id") == "" {
+		t.Fatalf("Codex Session_id header is missing: %v", req.Header)
+	}
+	if got := req.Header.Get("Accept"); got != "text/event-stream" {
+		t.Fatalf("Accept = %q, want text/event-stream", got)
+	}
+	if req.Header.Get("X-Api-Key") != "" || req.Header.Get("x-goog-api-key") != "" {
+		t.Fatalf("static key headers leaked: %v", req.Header)
+	}
+	for _, name := range []string{
+		"X-Codex-Beta-Features", "Version", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Configured",
+	} {
+		if req.Header.Get(name) == "" {
+			t.Fatalf("missing passthrough header %s: %v", name, req.Header)
+		}
+	}
+	for _, name := range []string{
+		"OpenAI-Beta", "X-Codex-Turn-State", "X-Forwarded-For", "X-Arbitrary-Client",
+		"X-ResponsesAPI-Include-Timing-Metrics",
+	} {
+		if got := req.Header.Get(name); got != "" {
+			t.Fatalf("unexpected HTTP header %s=%q: %v", name, got, req.Header)
+		}
+	}
+	wireBody := reqCtx.translatedBody
+	for _, field := range []string{"max_output_tokens", "temperature", "truncation", "context_management", "user"} {
+		if gjson.GetBytes(wireBody, field).Exists() {
+			t.Fatalf("unsupported field %s leaked: %s", field, wireBody)
+		}
+	}
+	if !gjson.GetBytes(wireBody, "stream").Bool() || gjson.GetBytes(wireBody, "store").Bool() {
+		t.Fatalf("required stream/store values missing: %s", wireBody)
+	}
+	if got := gjson.GetBytes(wireBody, "input.0.role").String(); got != "developer" {
+		t.Fatalf("system role = %q, body=%s", got, wireBody)
+	}
+	if got := gjson.GetBytes(wireBody, "tools.0.type").String(); got != "web_search" {
+		t.Fatalf("tool type = %q, body=%s", got, wireBody)
+	}
+	if got := gjson.GetBytes(wireBody, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("reasoning.effort = %q, want minimal normalized to low; body=%s", got, wireBody)
+	}
+	if !gjson.GetBytes(wireBody, "instructions").Exists() ||
+		gjson.GetBytes(wireBody, "include.0").String() != "reasoning.encrypted_content" {
+		t.Fatalf("Codex required fields missing: %s", wireBody)
+	}
+
+	plan, err := protocol.BuildTransformPlan(
+		protocol.Codex, protocol.Codex, "/v1/responses", "/v1/responses",
+		body, wireBody, "gpt-5.6-sol", "gpt-5.6-sol", false,
+	)
+	if err != nil {
+		t.Fatalf("BuildTransformPlan() error = %v", err)
+	}
+	httpBody := responsesBodyForHTTPTransport(cfg, plan, wireBody)
+	for _, field := range []string{"previous_response_id", "generate", "prompt_cache_retention", "safety_identifier", "stream_options"} {
+		if gjson.GetBytes(httpBody, field).Exists() {
+			t.Fatalf("HTTP-only unsupported field %s leaked: %s", field, httpBody)
+		}
+	}
+}
+
+func TestCodexOAuthNonStreamReassemblesTerminalResponse(t *testing.T) {
+	body := "event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg-1","content":[{"type":"output_text","text":"ok"}]}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}` + "\n\n"
+	reqCtx := &requestContext{
+		ctx: context.Background(), startTime: time.Now(), responsesSSEUpstreamNonStream: true,
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	recorder := newRecorder()
+	result, _, err := (&Server{}).handleSuccessResponse(
+		reqCtx, resp, resp.Header.Clone(), recorder, string(protocol.Codex), &streamReadStats{}, nil,
+	)
+	if err != nil {
+		t.Fatalf("handleSuccessResponse() error = %v", err)
+	}
+	if !result.ResponseCommitted || result.InputTokens != 10 || result.OutputTokens != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	if got := gjson.Get(recorder.Body.String(), "id").String(); got != "resp-1" {
+		t.Fatalf("response id = %q, body=%s", got, recorder.Body.String())
+	}
+	if got := gjson.Get(recorder.Body.String(), "output.0.content.0.text").String(); got != "ok" {
+		t.Fatalf("reassembled output = %q, body=%s", got, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "data:") || strings.Contains(recorder.Body.String(), "response.completed") {
+		t.Fatalf("SSE framing leaked to non-stream client: %s", recorder.Body.String())
+	}
+}
+
+// StreamDiagMsg 非空会让 forwardAttempt 把结果判为 599 并触发模型级冷却，
+// 所以只有真实上游故障才允许写入：客户端取消必须留空，交给 499 路径。
+func TestCodexOAuthNonStreamDiagnosticsOnlyForUpstreamFailure(t *testing.T) {
+	partial := "event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg-1","content":[{"type":"output_text","text":"ok"}]}}` + "\n\n"
+
+	t.Run("client cancel", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		reqCtx := &requestContext{ctx: ctx, startTime: time.Now(), responsesSSEUpstreamNonStream: true}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(partial)),
+		}
+		result, _, err := (&Server{}).handleSuccessResponse(
+			reqCtx, resp, resp.Header.Clone(), newRecorder(), string(protocol.Codex), &streamReadStats{}, nil,
+		)
+		if err == nil {
+			t.Fatalf("expected cancellation error")
+		}
+		if result.StreamDiagMsg != "" {
+			t.Fatalf("客户端取消不得写入流诊断（会被误判为 599）: %q", result.StreamDiagMsg)
+		}
+	})
+
+	t.Run("upstream failure", func(t *testing.T) {
+		reqCtx := &requestContext{ctx: context.Background(), startTime: time.Now(), responsesSSEUpstreamNonStream: true}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(io.MultiReader(
+				strings.NewReader(partial),
+				iotest.ErrReader(errors.New("websocket: close 1006 (abnormal closure): unexpected EOF")),
+			)),
+		}
+		result, _, err := (&Server{}).handleSuccessResponse(
+			reqCtx, resp, resp.Header.Clone(), newRecorder(), string(protocol.Codex), &streamReadStats{}, nil,
+		)
+		if err == nil {
+			t.Fatalf("expected upstream read error")
+		}
+		if result.StreamDiagMsg == "" {
+			t.Fatalf("上游中断必须写入流诊断，否则不会归类为 599")
+		}
+		markIncompleteStreamForwardResult(result)
+		if result.Status != util.StatusStreamIncomplete {
+			t.Fatalf("status = %d, want %d", result.Status, util.StatusStreamIncomplete)
+		}
+	})
+}
+
+// 598 语义比 599 更精确（冷却时长不同），流诊断不得把它降级覆盖。
+func TestMarkIncompleteStreamForwardResultKeepsFirstByteTimeout(t *testing.T) {
+	res := &fwResult{Status: util.StatusFirstByteTimeout, StreamDiagMsg: "流传输中断"}
+	markIncompleteStreamForwardResult(res)
+	if res.Status != util.StatusFirstByteTimeout {
+		t.Fatalf("status = %d, want %d", res.Status, util.StatusFirstByteTimeout)
+	}
+
+	committed := &fwResult{Status: http.StatusOK, StreamDiagMsg: "流传输中断"}
+	markIncompleteStreamForwardResult(committed)
+	if committed.Status != util.StatusStreamIncomplete {
+		t.Fatalf("status = %d, want %d", committed.Status, util.StatusStreamIncomplete)
+	}
 }
 
 func TestHandleSuccessResponse_ExtractsUsageFromJSON(t *testing.T) {
@@ -127,6 +339,30 @@ func TestClassifySSEErrorStatus_RateLimits(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := classifySSEErrorStatus(tt.body); got != http.StatusTooManyRequests {
 				t.Fatalf("classifySSEErrorStatus()=%d, want %d", got, http.StatusTooManyRequests)
+			}
+		})
+	}
+}
+
+func TestClassifySSEErrorStatus_ContextLengthExceeded(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "error_event",
+			body: []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}`),
+		},
+		{
+			name: "response_failed",
+			body: []byte(`{"type":"response.failed","response":{"error":{"code":"context_too_large","message":"Your input exceeds the context window of this model."}}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifySSEErrorStatus(tt.body); got != http.StatusBadRequest {
+				t.Fatalf("classifySSEErrorStatus()=%d, want %d", got, http.StatusBadRequest)
 			}
 		})
 	}

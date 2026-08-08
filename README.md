@@ -22,7 +22,7 @@ ccLoad removes the operational mess of running multiple AI API upstreams. It kee
 During OpenAI Build Week, Codex powered by GPT-5.6 was the primary engineering agent used to:
 
 - Trace request routing, failover, cooldown, protocol conversion, and dashboard flows across the Go backend and embedded web UI.
-- Implement and review model-scoped cooldown handling for upstream `5xx`, key-level `429`, and model-unavailable `404` failures without unnecessarily cooling an entire channel.
+- Implement and review model-scoped cooldown handling for upstream `5xx`, key-level `429`, model-unavailable `404`, and explicit model-retirement `410` failures without unnecessarily cooling an entire channel.
 - Refine the model-status and call-statistics UI, update the English and Chinese documentation, and verify the result with focused Go tests, builds, and browser walkthroughs.
 - Prepare the reproducible demo and Devpost submission while keeping architecture, security, and final-review decisions under human control.
 
@@ -44,7 +44,7 @@ ccLoad handles those cases with:
 
 - **Smart routing**: High-priority channels are selected first; channels at the same priority use smooth weighted round-robin.
 - **Automatic failover**: Failed keys, models, channels, and URLs are skipped according to the classified error scope.
-- **Model-aware cooldown**: Structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, and model-unavailable 404 errors all cool only the actual upstream model first; other models on the same channel remain available. The channel is promoted to cooldown only after every configured model or every enabled key is cooling.
+- **Model-aware cooldown**: Structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, model-unavailable 404 errors, and explicit model-retirement 410 errors all cool only the actual upstream model first; other models on the same channel remain available. The channel is promoted to cooldown only after every configured model or every enabled key is cooling.
 - **Multi-URL scheduling**: A single channel can use multiple upstream URLs, weighted by observed latency and health.
 - **Per-URL protocol routing**: Each URL can declare the upstream wire protocols it accepts. Explicit declarations route directly; an empty declaration tries the client protocol first and caches the working fallback.
 - **Responses WebSocket bridging**: Authenticated Codex clients can keep a downstream WebSocket while each candidate uses native Codex WebSocket or the existing HTTP/SSE transport.
@@ -85,7 +85,7 @@ ccLoad handles those cases with:
 - 💬 **Conversational Model Testing** - Channel/model/chat testing modes with image upload, reasoning level, built-in search, and chat export
 - 🔍 **Debug Logs** - Upstream request/response raw data capture with sensitive header masking, essential for troubleshooting
 - 🕐 **Scheduled Checks** - Background periodic channel availability probing, auto-detect failed channels
-- 🔄 **Auto Updates** - Checks for new releases every 12 hours by default, configurable from the admin settings page
+- 🔄 **Release Channels** - Stable updates by default, with an opt-in preview channel; check interval is configurable from the admin settings page
 - 🧩 **Custom Request Rules** - Per-channel HTTP header & JSON body rewriting (remove/override/append), with auth header protection, CRLF guard, and capacity caps
 - 🎛️ **Log Column Customization** - Show/hide table columns per preference, settings persist in browser localStorage
 
@@ -688,6 +688,8 @@ curl -X POST http://localhost:8080/admin/channels \
 
 > **Model Entry Note**: each `models` element is `{model, redirect_model, disabled}`. `redirect_model` rewrites the model name sent upstream while clients keep requesting the original name. `disabled: true` removes that model from the channel entirely — it stops being advertised, matched (exact or fuzzy), and cooled down, without deleting the entry. When you refresh the model list in `replace` mode, existing disabled flags are carried over to the newly fetched entries by original name, normalized alias, and redirect target, so a refresh does not silently re-enable models you turned off.
 
+> **Independent-key relay fallback**: In the channel editor, open **Advanced → Other** and enable **Try another key on failure** only when the channel's Keys reach independent upstream providers behind the same relay. For retryable model- or channel-level upstream failures (such as 5xx, connection errors, and first-byte timeouts), ccLoad then cools the current Key and tries another Key in that channel before moving to another channel. The option is off by default, preserving the normal model/channel cooldown behavior.
+
 > **RPM Limit Note**: `rpm_limit` is a per-channel request cap over a rolling 60-second window; `0` means unlimited. Proxy forwarding, manual tests, single-URL tests, and scheduled checks all count toward the cap. Multi-URL failover counts each actual upstream HTTP request. The counter is in-memory: restart clears it, and multiple instances count independently.
 
 > **Concurrency Limit Note**: `max_concurrency` is a per-channel cap on simultaneous in-flight upstream requests; `0` means unlimited. A slot is acquired before the upstream request starts and released when the response body is closed, so streaming requests hold the slot until the stream ends. Over-limit channels are skipped without cooldown. The counter is in-memory and per instance.
@@ -855,7 +857,7 @@ Check out the awesome admin dashboard 👇
   - Eliminates duplicate code, unified cooldown logic
   - Distinguishes network vs HTTP error classification
   - Uses separate Key/Model/Channel actions; `ActionRetryModel` does not retry another Key or URL in the same channel
-  - Persists structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, and model-unavailable 404 errors by `(channel_id, actual upstream model)`; other models on that channel stay eligible
+  - Persists structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, model-unavailable 404 errors, and explicit model-retirement 410 errors by `(channel_id, actual upstream model)`; other models on that channel stay eligible
   - Automatically promotes to channel cooldown only when all configured models or all enabled keys are cooling
 - **Multi-URL Selector** (URLSelector):
   - `url_selector.go`: Smart URL selection within a single channel
@@ -999,7 +1001,8 @@ These settings live in the database and are managed from `/web/settings.html`. S
 | `ttfb_min_confident_sample` | `10` | TTFB confidence sample threshold |
 | `channel_check_interval_hours` | `5` | Scheduled channel check interval (hours, supports decimals, 0=disabled) |
 | `model_catalog_sync_interval_hours` | `6` | Syncs the models.dev catalog every 6 hours; `0` disables network sync. At startup, the last-good cache is used, with the embedded catalog as fallback; channel `cost_multiplier` still applies. |
-| `auto_update_interval_hours` | `12` | Auto-update check interval (hours, 0=disabled, minimum enabled value is 1) |
+| `auto_update_interval_hours` | `12` | Non-container release check interval (hours, 0=disabled, minimum enabled value is 1); unavailable in containers |
+| `auto_update_channel` | `stable` | Non-container release channel: `stable` accepts stable releases only; `preview` accepts stable and prerelease versions and selects the highest SemVer; unavailable in containers |
 | `model_fuzzy_match` | `false` | When an exact model name misses, fall back to substring matching plus version sorting |
 | `responses_ws_max_connections` | `64` | Max concurrent downstream Responses WebSocket connections across the process |
 | `responses_ws_max_connections_per_token` | `16` | Max concurrent downstream Responses WebSocket connections per auth token |
@@ -1010,9 +1013,13 @@ Per-protocol timeouts apply to the runtime upstream protocol: if a transformed r
 
 #### Auto Updates
 
-ccLoad supports in-process auto updates. It checks releases every 12 hours by default, trying `gh.monlor.com`, `fastgit.cc`, and `ghfast.top` in order before falling back to GitHub directly. A source is accepted only when release detection, binary download, checksum download, and SHA256 verification all succeed. The interval can be changed from the Web admin settings page via `auto_update_interval_hours`; set it to `0` to disable automatic update checks.
+For non-container deployments, one update manager owns release checks, version notifications, and optional in-process updates. It checks once at startup and every 12 hours by default. `auto_update_channel=stable` accepts stable releases only; `preview` considers stable and prerelease versions and selects the highest valid SemVer without downgrading the running or pending version. Change both settings from the Web admin settings page. Set `auto_update_interval_hours=0` to disable all release checks.
 
-To use only a private mirror, set `CCLOAD_RELEASE_BASE_URL` to a complete latest-download base such as `https://mirror.example/caidaoli/ccLoad/releases/latest/download`. An explicit value disables the built-in fallback sources. This setting affects release downloads only; it does not configure `HTTP_PROXY` or `HTTPS_PROXY` for upstream API traffic.
+Stable metadata is resolved through the configured release sources. Preview discovery reads GitHub's Releases Atom feed, which includes stable and prerelease entries without using the rate-limited REST API. After resolving an exact Tag, ccLoad downloads that Tag's binary and checksum from the configured download sources—by default `gh.monlor.com`, `fastgit.cc`, `ghfast.top`, then GitHub; SHA256 must match before replacement.
+
+Official containers do not run the release check or in-process update loop. Every stable and Beta image contains the exact binary produced by the matching GitHub Release. Stable releases publish an exact version Tag plus `latest`; Beta releases publish an exact prerelease Tag plus the rolling `beta` alias. Switch the image Tag in Compose, then pull and recreate the container.
+
+To use a private release mirror, set `CCLOAD_RELEASE_BASE_URL` to a complete latest-download base such as `https://mirror.example/caidaoli/ccLoad/releases/latest/download`. An explicit value disables built-in fallback sources for stable metadata and all asset downloads. Preview metadata still comes from GitHub's Releases Atom feed. This setting does not configure `HTTP_PROXY` or `HTTPS_PROXY` for upstream API traffic.
 
 #### Dynamic Channel Sorting
 
@@ -1082,9 +1089,11 @@ Project supports multi-arch Docker images:
 - **Image Registry**: `ghcr.io/caidaoli/ccload`
 - **Available Tags**:
   - `latest` - Latest stable version
-  - `v2.44.1` - Specific release tag, matching the GitHub Release tag
+  - `beta` - Latest Beta version
+  - `v2.44.1` - Exact stable version, matching the GitHub Release tag
+  - `vX.Y.Z-beta.N` - Exact Beta version, matching the GitHub prerelease tag
 
-The official GHCR runtime image is Alpine-based. On container startup, it downloads and verifies the latest Linux release binary, trying `v4.gh-proxy.org`, `gh-proxy.com`, and `ghp.keleyaa.com` in order before falling back to GitHub directly. The in-process updater uses the separate source order documented above because it must resolve a release tag through `/releases/latest`. Set `CCLOAD_RELEASE_BASE_URL` to a complete `.../releases/latest/download` URL to use only a custom mirror. The default in-process check interval is 12 hours and can be changed with `auto_update_interval_hours` in the Web admin settings.
+The official GHCR runtime image is Alpine-based and immutable: every release packages the already-tested `ccload-linux-amd64` and `ccload-linux-arm64` GitHub Release binaries into the matching multi-arch image. Exact version Tags are immutable release references; `latest` and `beta` are rolling aliases for the newest stable and Beta images. Containers do not check for releases or replace their binary in process; pull an exact Tag or the desired rolling alias and recreate the container.
 
 ### Image Tag Guide
 
@@ -1094,6 +1103,13 @@ docker pull ghcr.io/caidaoli/ccload:latest
 
 # Pull specific version
 docker pull ghcr.io/caidaoli/ccload:v2.44.1
+
+# Pull latest Beta; replace beta with a published vX.Y.Z-beta.N Tag to pin it
+docker pull ghcr.io/caidaoli/ccload:beta
+
+# With Compose, set image to :latest or :beta, then apply the change
+docker compose pull
+docker compose up -d
 
 # Specify architecture (Docker usually auto-selects)
 docker pull --platform linux/amd64 ghcr.io/caidaoli/ccload:latest

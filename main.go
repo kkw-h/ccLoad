@@ -84,9 +84,6 @@ func main() {
 	// 打印启动 Banner
 	version.PrintBanner()
 
-	// 启动后台版本检测（每4小时检查GitHub releases）
-	version.StartChecker()
-
 	// 优先读取.env文件
 	if err := godotenv.Load(); err != nil {
 		log.Printf("未找到 .env 文件: %v", err)
@@ -126,7 +123,7 @@ func main() {
 		}
 	}
 
-	srv.StartAutoUpdateLoop()
+	srv.StartUpdateManager()
 
 	// 创建Gin引擎
 	r := gin.New()

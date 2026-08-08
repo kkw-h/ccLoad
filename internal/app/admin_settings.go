@@ -6,9 +6,13 @@ import (
 	"log"
 	"math"
 	"net/http"
+	neturl "net/url"
 	"strconv"
+	"strings"
 
+	"ccLoad/internal/config"
 	"ccLoad/internal/model"
+	"ccLoad/internal/version"
 
 	"github.com/gin-gonic/gin"
 )
@@ -19,6 +23,41 @@ const (
 	LogRetentionDaysMax      = 365
 	LogRetentionDaysDisabled = -1 // 永久保留
 )
+
+type adminSystemSetting struct {
+	*model.SystemSetting
+	Editable       bool   `json:"editable"`
+	DisabledReason string `json:"disabled_reason,omitempty"`
+}
+
+const containerImageManagedDisabledReason = "container_image_managed"
+
+func isContainerManagedUpdateSetting(key string) bool {
+	if !runningInContainer() {
+		return false
+	}
+	return key == autoUpdateIntervalSettingKey || key == autoUpdateChannelSettingKey
+}
+
+func systemSettingForAdmin(setting *model.SystemSetting) adminSystemSetting {
+	view := adminSystemSetting{
+		SystemSetting: setting,
+		Editable:      true,
+	}
+	if isContainerManagedUpdateSetting(setting.Key) {
+		view.Editable = false
+		view.DisabledReason = containerImageManagedDisabledReason
+	}
+	return view
+}
+
+func rejectContainerManagedUpdateSetting(c *gin.Context, key string) bool {
+	if !isContainerManagedUpdateSetting(key) {
+		return false
+	}
+	RespondErrorMsg(c, http.StatusConflict, "container image updates are managed by image tags; use latest for stable or beta for preview")
+	return true
+}
 
 // AdminListSettings 获取所有配置项
 // GET /admin/settings
@@ -33,7 +72,11 @@ func (s *Server) AdminListSettings(c *gin.Context) {
 	if settings == nil {
 		settings = make([]*model.SystemSetting, 0)
 	}
-	RespondJSON(c, http.StatusOK, settings)
+	views := make([]adminSystemSetting, 0, len(settings))
+	for _, setting := range settings {
+		views = append(views, systemSettingForAdmin(setting))
+	}
+	RespondJSON(c, http.StatusOK, views)
 }
 
 // AdminGetSetting 获取单个配置项
@@ -59,7 +102,7 @@ func (s *Server) AdminGetSetting(c *gin.Context) {
 
 	// 配置项变更频率极低，允许浏览器缓存 5 分钟
 	c.Header("Cache-Control", "private, max-age=300")
-	RespondJSON(c, http.StatusOK, setting)
+	RespondJSON(c, http.StatusOK, systemSettingForAdmin(setting))
 }
 
 // AdminUpdateSetting 更新配置项
@@ -70,7 +113,9 @@ func (s *Server) AdminUpdateSetting(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "missing setting key")
 		return
 	}
-
+	if rejectContainerManagedUpdateSetting(c, key) {
+		return
+	}
 	var req SettingUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", err))
@@ -117,7 +162,9 @@ func (s *Server) AdminResetSetting(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "missing setting key")
 		return
 	}
-
+	if rejectContainerManagedUpdateSetting(c, key) {
+		return
+	}
 	// 获取默认值
 	setting := s.configService.GetSetting(key)
 	if setting == nil {
@@ -160,6 +207,9 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 
 	// 验证所有配置
 	for key, value := range req {
+		if rejectContainerManagedUpdateSetting(c, key) {
+			return
+		}
 		setting := s.configService.GetSetting(key)
 		if setting == nil {
 			RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("unknown setting: %s", key))
@@ -279,16 +329,44 @@ func validateSettingValue(key, valueType, value string) error {
 
 	case "string":
 		switch key {
+		case config.CodexBaseURLSettingKey,
+			config.XAIBaseURLSettingKey,
+			config.AntigravityURLSettingKey:
+			return validateOptionalOAuthBaseURL(value)
 		case "log_channel_click_action":
 			if value != "edit" && value != "navigate" {
 				return fmt.Errorf("log_channel_click_action must be edit or navigate")
 			}
+		case "auto_update_channel":
+			_, err := version.ParseReleaseChannel(value)
+			return err
 		}
 
 	default:
 		return fmt.Errorf("unknown value type: %s", valueType)
 	}
 
+	return nil
+}
+
+func validateOptionalOAuthBaseURL(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parsed, err := neturl.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("must be empty or a valid HTTP(S) URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be http or https")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("URL must not contain user info")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("URL must not contain a query or fragment")
+	}
 	return nil
 }
 

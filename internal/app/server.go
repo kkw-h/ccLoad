@@ -3,18 +3,22 @@ package app
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
+	"regexp"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
@@ -22,6 +26,8 @@ import (
 	protocolbuiltin "ccLoad/internal/protocol/builtin"
 	"ccLoad/internal/storage"
 	"ccLoad/internal/util"
+	"ccLoad/internal/version"
+	"ccLoad/internal/xaiauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -47,6 +53,7 @@ type Server struct {
 	channelRPMLimiter             *channelRPMLimiter         // 渠道RPM限制器（内存滑动窗口）
 	channelConcurrencyLimiter     *channelConcurrencyLimiter // 渠道并发限制器（内存计数）
 	statsCache                    *StatsCache                // 统计结果缓存层
+	updateManager                 *version.UpdateManager     // 版本检查与可选自动应用的唯一状态源
 	channelBalancer               *SmoothWeightedRR          // 渠道负载均衡器（平滑加权轮询）
 	urlSelector                   *URLSelector               // URL选择器（多URL场景的延迟追踪与冷却）
 	protocolRegistry              *protocol.Registry
@@ -57,6 +64,16 @@ type Server struct {
 	activeRequests                *activeRequestManager // 进行中请求（内存状态，不持久化）
 	responsesExecutionSessions    *responsesExecutionSessionStore
 	responsesWebsocketConnections *responsesWebsocketConnectionLimiter
+	codexOAuth                    *codexOAuthManager
+	codexService                  *codexauth.Service
+	codexCredentials              *codexCredentialManager
+	antigravityOAuth              *codexOAuthManager
+	antigravityCredentials        *antigravityCredentialManager
+	antigravityService            *antigravityauth.Service
+	xaiService                    *xaiauth.Service
+	xaiCredentials                *xaiCredentialManager
+	xaiOAuth                      *xaiOAuthManager
+	antigravityPromptMatcher      *regexp.Regexp
 	scheduledChannelChecksRunning atomic.Bool
 
 	// 异步统计（有界队列，避免每请求起goroutine）
@@ -99,7 +116,10 @@ type Server struct {
 	wg                      sync.WaitGroup // 等待所有后台goroutine结束
 
 	// 指纹任务管理器（内存）
-	fingerprintJobs *FingerprintJobManager
+	fingerprintJobs             *FingerprintJobManager
+	oauthCredentialImportRunMu  sync.Mutex
+	oauthCredentialImportJobsMu sync.Mutex
+	oauthCredentialImportJobs   *oauthCredentialImportJobManager
 }
 
 // NewServer 创建并初始化一个新的 Server 实例
@@ -213,6 +233,52 @@ func NewServer(store storage.Store) *Server {
 
 	// 初始化高性能缓存层（60秒TTL，避免数据库性能杀手查询）
 	s.channelCache = storage.NewChannelCache(store, 60*time.Second)
+	channelLoadCtx, channelLoadCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	channels, err := store.ListConfigs(channelLoadCtx)
+	channelLoadCancel()
+	if err != nil {
+		log.Fatalf("[FATAL] 加载渠道配置失败: %v", err)
+	}
+	log.Printf("[INFO] 已加载渠道配置（%d项）", len(channels))
+
+	codexOAuthService := codexauth.NewService(s.client)
+	s.codexService = codexOAuthService
+	s.codexCredentials = newCodexCredentialManager(codexOAuthService, store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.codexOAuth = newCodexOAuthManager(codexOAuthService, store, func(channelID int64) {
+		s.codexCredentials.invalidate(channelID)
+		s.InvalidateChannelListCache()
+	})
+	s.antigravityService = antigravityauth.NewService(s.client)
+	s.antigravityPromptMatcher = loadAntigravityPromptMatcher(configService)
+	s.antigravityCredentials = newAntigravityCredentialManager(s.antigravityService, store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.antigravityOAuth = newAntigravityOAuthManager(s.antigravityService, store, func(channelID int64) {
+		s.antigravityCredentials.invalidate(channelID)
+		s.InvalidateChannelListCache()
+	})
+	s.xaiService = xaiauth.NewService(s.client)
+	s.xaiCredentials = newXAICredentialManager(store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.xaiOAuth = newXAIOAuthManager(
+		s.baseCtx,
+		s.xaiService,
+		func(ctx context.Context, credential *xaiauth.Credential) (*xaiauth.Credential, error) {
+			return completeXAICredential(ctx, s.xaiService, s.client, credential, xaiauth.CLIBaseURL)
+		},
+		func(ctx context.Context, credential *xaiauth.Credential) (int64, error) {
+			cfg, _, err := createOrUpdateXAIChannel(ctx, store, credential)
+			if err != nil {
+				return 0, err
+			}
+			s.xaiCredentials.invalidate(cfg.ID)
+			s.InvalidateChannelListCache()
+			return cfg.ID, nil
+		},
+	)
 
 	// 初始化冷却管理器（统一管理渠道级和Key级冷却）
 	// 传入Server作为configGetter，利用缓存层查询渠道配置
@@ -231,7 +297,6 @@ func NewServer(store storage.Store) *Server {
 	healthConfig := loadHealthScoreConfig(configService)
 	s.healthCache = NewHealthCache(store, healthConfig, s.shutdownCh, &s.isShuttingDown, &s.wg)
 	if healthConfig.Enabled {
-		s.healthCache.Start()
 		log.Print("[INFO] 健康度排序已启用（基于成功率动态调整渠道优先级；冷却仍按原规则过滤）")
 	}
 
@@ -257,12 +322,6 @@ func NewServer(store storage.Store) *Server {
 		&s.isShuttingDown,
 		&s.wg,
 	)
-	// 启动日志 Workers
-	s.logService.StartWorkers()
-
-	// 启动清理协程（调试日志清理始终运行，普通日志按保留天数决定）
-	s.logService.StartCleanupLoop()
-
 	// 2. AuthService（负责认证授权）
 	// 初始化时自动从数据库加载API访问令牌
 	s.authService = NewAuthService(
@@ -270,6 +329,7 @@ func NewServer(store storage.Store) *Server {
 		s.loginRateLimiter,
 		store, // 传入store用于热更新令牌
 	)
+	s.authService.RegisterWebSessionRevokeHook(s.xaiOAuth.cancelByAdmin)
 
 	// 启动后台 worker（Token 统计 / Token 清理 / 状态清理）
 	s.startBackgroundWorkers()
@@ -285,9 +345,28 @@ func NewServer(store storage.Store) *Server {
 
 	// 指纹 Job 管理器（内存）
 	s.fingerprintJobs = NewFingerprintJobManager(s.baseCtx, 2)
+	s.oauthCredentialImportJobs = newOAuthCredentialImportJobManager(s.baseCtx, oauthCredentialImportMaxRunningJobs)
+
+	// 所有启动关键状态完成加载后，再启动非关键后台任务。
+	// SQLite 纯模式只有一个连接，维护任务不得与认证/渠道初始化竞争。
+	s.healthCache.Start()
+	s.logService.StartWorkers()
+	s.logService.StartCleanupLoop()
 
 	return s
 
+}
+
+func loadAntigravityPromptMatcher(configService *ConfigService) *regexp.Regexp {
+	if configService == nil {
+		return nil
+	}
+	var words []string
+	if err := json.Unmarshal([]byte(configService.GetString("antigravity_sensitive_words", `["API","proxy","Claude","Anthropic"]`)), &words); err != nil {
+		log.Printf("[WARN] 无效的 antigravity_sensitive_words，已禁用提示词替换: %v", err)
+		return nil
+	}
+	return buildAntigravitySensitiveWordMatcher(words)
 }
 
 // StartModelCatalogSync 加载本地快照，并在启用时同步官方模型目录。
@@ -765,6 +844,20 @@ func (s *Server) GetEnabledChannelsByModel(ctx context.Context, modelName string
 	)
 }
 
+// getEnabledChannelsSnapshotByModel 返回路由热路径使用的只读渠道快照。
+// Config 指针由 ChannelCache 持有，调用方只能过滤或重排外层 slice，不能修改 Config。
+func (s *Server) getEnabledChannelsSnapshotByModel(ctx context.Context, modelName string) ([]*model.Config, error) {
+	return readThroughChannelCache(
+		s,
+		func(cache *storage.ChannelCache) ([]*model.Config, error) {
+			return cache.GetEnabledChannelsSnapshotByModel(ctx, modelName)
+		},
+		func() ([]*model.Config, error) {
+			return s.store.GetEnabledChannelsByModel(ctx, modelName)
+		},
+	)
+}
+
 func (s *Server) getAPIKeys(ctx context.Context, channelID int64) ([]*model.APIKey, error) {
 	return readThroughChannelCache(
 		s,
@@ -980,15 +1073,38 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/channels/filter-options", s.HandleChannelsFilterOptions)
 		admin.GET("/channels/export", s.HandleExportChannelsCSV)
 		admin.POST("/channels/import", s.HandleImportChannelsCSV)
+		admin.POST("/oauth/credentials/import", s.HandleImportOAuthCredentials)
+		admin.POST("/oauth/credentials/import/stream", s.HandleImportOAuthCredentialsStream)
+		admin.POST("/oauth/credentials/import/jobs", s.HandleStartOAuthCredentialImportJob)
+		admin.GET("/oauth/credentials/import/jobs/:id", s.HandleOAuthCredentialImportJob)
+		admin.POST("/codex/oauth/start", s.HandleStartCodexOAuth)
+		admin.GET("/codex/oauth/status", s.HandleCodexOAuthStatus)
+		admin.POST("/codex/oauth/cancel", s.HandleCancelCodexOAuth)
+		admin.POST("/codex/oauth/callback", s.HandleSubmitCodexOAuthCallback)
+		admin.POST("/codex/credentials/import", s.HandleImportCodexCredential)
+		admin.POST("/channels/:id/codex-credential/refresh", s.HandleRefreshCodexCredential)
+		admin.POST("/channels/:id/oauth-usage", s.HandleOAuthUsage)
+		admin.POST("/antigravity/oauth/start", s.HandleStartAntigravityOAuth)
+		admin.GET("/antigravity/oauth/status", s.HandleAntigravityOAuthStatus)
+		admin.POST("/antigravity/oauth/cancel", s.HandleCancelAntigravityOAuth)
+		admin.POST("/antigravity/oauth/callback", s.HandleSubmitAntigravityOAuthCallback)
+		admin.POST("/antigravity/credentials/import", s.HandleImportAntigravityCredential)
+		admin.POST("/channels/:id/antigravity-credential/refresh", s.HandleRefreshAntigravityCredential)
+		admin.POST("/xai/oauth/start", s.HandleStartXAIOAuth)
+		admin.GET("/xai/oauth/status", s.HandleXAIOAuthStatus)
+		admin.POST("/xai/oauth/cancel", s.HandleCancelXAIOAuth)
+		admin.POST("/xai/oauth/callback", s.HandleSubmitXAIOAuthCallback)
+		admin.POST("/xai/credentials/import/stream", s.HandleImportXAICredentialsStream)
 		admin.POST("/channels/check-duplicate", s.HandleCheckDuplicateChannel)
 		admin.POST("/channels/batch-priority", s.HandleBatchUpdatePriority) // 批量更新渠道优先级
 		admin.POST("/channels/batch-enabled", s.HandleBatchSetEnabled)      // 批量启用/禁用渠道
-		admin.POST("/channels/batch-protocol-mode", s.HandleBatchSetProtocolTransformMode)
+		admin.POST("/channels/batch-advanced", s.HandleBatchPatchChannels)
 		admin.POST("/channels/batch-delete", s.HandleBatchDeleteChannels) // 批量删除渠道
 		admin.POST("/channels/cooldown-detection/test", s.HandleCooldownDetectionTest)
 		admin.GET("/channels/:id", s.HandleChannelByID)
 		admin.PUT("/channels/:id", s.HandleChannelByID)
 		admin.DELETE("/channels/:id", s.HandleChannelByID)
+		admin.GET("/channels/:id/editor", s.HandleChannelEditor)
 		admin.GET("/channels/:id/keys", s.HandleChannelKeys)
 		admin.GET("/channels/:id/model-stats", s.HandleChannelModelStats)
 		admin.GET("/channels/:id/url-stats", s.HandleChannelURLStats)
@@ -1156,6 +1272,14 @@ func (s *Server) AddLogAsync(entry *model.LogEntry) {
 
 	// 委托给 LogService 处理日志写入
 	s.logService.AddLogAsync(entry)
+	s.recordURLRequestFromLog(entry)
+}
+
+func (s *Server) recordURLRequestFromLog(entry *model.LogEntry) {
+	if s == nil || s.urlSelector == nil || entry == nil {
+		return
+	}
+	s.urlSelector.RecordRequestResult(entry.ChannelID, entry.BaseURL, entry.StatusCode)
 }
 
 // getAllEnabledModels 获取所有启用渠道的去重模型列表。
@@ -1213,6 +1337,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	// 取消server级context，通知所有派生的后台任务退出
 	s.baseCancel()
+	if s.codexOAuth != nil {
+		s.codexOAuth.close()
+	}
+	if s.antigravityOAuth != nil {
+		s.antigravityOAuth.close()
+	}
+	if s.xaiOAuth != nil {
+		s.xaiOAuth.close()
+	}
 	if s.responsesExecutionSessions != nil {
 		s.responsesExecutionSessions.close()
 	}
@@ -1239,6 +1372,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.fingerprintJobs != nil {
 		fingerprintShutdownErr = s.fingerprintJobs.Close(ctx)
 	}
+	var oauthCredentialImportShutdownErr error
+	if manager := s.currentOAuthCredentialImportJobs(); manager != nil {
+		oauthCredentialImportShutdownErr = manager.Close(ctx)
+	}
 
 	// 使用channel等待所有goroutine完成
 	done := make(chan struct{})
@@ -1251,6 +1388,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	var err error
 	if fingerprintShutdownErr != nil {
 		err = fingerprintShutdownErr
+	}
+	if err == nil && oauthCredentialImportShutdownErr != nil {
+		err = oauthCredentialImportShutdownErr
 	}
 	select {
 	case <-done:

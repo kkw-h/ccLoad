@@ -11,7 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/xaiauth"
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
@@ -72,6 +75,51 @@ func configHasURLProtocol(cfg *model.Config, configuredProtocol string) bool {
 	return false
 }
 
+type channelCooldownSnapshot struct {
+	channels map[int64]time.Time
+	keys     map[int64]map[int]time.Time
+	models   map[int64]map[string]time.Time
+}
+
+func (s *Server) loadChannelCooldownSnapshot(ctx context.Context) channelCooldownSnapshot {
+	snapshot := channelCooldownSnapshot{}
+	var err error
+
+	snapshot.channels, err = s.getAllChannelCooldowns(ctx)
+	if err != nil {
+		log.Printf("[WARN] 批量查询渠道冷却状态失败: %v", err)
+		snapshot.channels = make(map[int64]time.Time)
+	}
+	snapshot.keys, err = s.getAllKeyCooldowns(ctx)
+	if err != nil {
+		log.Printf("[WARN] 批量查询Key冷却状态失败: %v", err)
+		snapshot.keys = make(map[int64]map[int]time.Time)
+	}
+	snapshot.models, err = s.getAllModelCooldowns(ctx)
+	if err != nil {
+		log.Printf("[WARN] 批量查询模型冷却状态失败: %v", err)
+		snapshot.models = make(map[int64]map[string]time.Time)
+	}
+	return snapshot
+}
+
+func (snapshot channelCooldownSnapshot) hasActiveCooldown(channelID int64, now time.Time) bool {
+	if until, ok := snapshot.channels[channelID]; ok && until.After(now) {
+		return true
+	}
+	for _, until := range snapshot.keys[channelID] {
+		if until.After(now) {
+			return true
+		}
+	}
+	for _, until := range snapshot.models[channelID] {
+		if until.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleListChannels(c *gin.Context) {
 	cfgs, err := s.store.ListConfigs(c.Request.Context())
 	if err != nil {
@@ -81,28 +129,15 @@ func (s *Server) handleListChannels(c *gin.Context) {
 
 	now := time.Now()
 
-	// 批量获取冷却状态（缓存优先）
-	allChannelCooldowns, err := s.getAllChannelCooldowns(c.Request.Context())
-	if err != nil {
-		// 渠道冷却查询失败不影响主流程，仅记录错误
-		log.Printf("[WARN] 批量查询渠道冷却状态失败: %v", err)
-		allChannelCooldowns = make(map[int64]time.Time)
-	}
+	// 三类冷却必须使用同一份快照，否则筛选结果和列表状态会互相矛盾。
+	cooldowns := s.loadChannelCooldownSnapshot(c.Request.Context())
 
 	// 应用所有列表过滤（type / channel_name|search / status / model|model_like）
 	// 注意：筛选下拉的全集走独立接口 /admin/channels/filter-options，
 	// 这里只负责按所有筛选条件返回当前页，避免列表数据与下拉选项耦合。
-	cfgs = applyChannelListFilters(cfgs, c, allChannelCooldowns, now)
+	cfgs = applyChannelListFilters(cfgs, c, cooldowns, now)
 
 	hasPagination := c.Query("limit") != "" || c.Query("offset") != ""
-
-	// 批量查询所有Key冷却状态（缓存优先）
-	allKeyCooldowns, err := s.getAllKeyCooldowns(c.Request.Context())
-	if err != nil {
-		// Key冷却查询失败不影响主流程，仅记录错误
-		log.Printf("[WARN] 批量查询Key冷却状态失败: %v", err)
-		allKeyCooldowns = make(map[int64]map[int]time.Time)
-	}
 
 	// 批量查询所有API Keys（一次查询替代 N 次）
 	allAPIKeys, err := s.store.GetAllAPIKeys(c.Request.Context())
@@ -129,8 +164,9 @@ func (s *Server) handleListChannels(c *gin.Context) {
 		healthEnabled:       healthEnabled,
 		priorityMap:         priorityMap,
 		successRateMap:      successRateMap,
-		channelCooldownsMap: allChannelCooldowns,
-		keyCooldownsMap:     allKeyCooldowns,
+		channelCooldownsMap: cooldowns.channels,
+		keyCooldownsMap:     cooldowns.keys,
+		modelCooldownsMap:   cooldowns.models,
 		apiKeysMap:          allAPIKeys,
 	}
 	out := make([]ChannelWithCooldown, 0, len(cfgs))
@@ -156,15 +192,23 @@ func (s *Server) handleListChannels(c *gin.Context) {
 
 // applyChannelListFilters 串联应用所有列表过滤条件：
 //   - protocol: URL 显式声明的协议，或 auto（存在未声明协议的 URL）
+//   - auth_type: api_key / codex_oauth（认证机制，不复用历史 channel_type）
 //   - channel_name | search: 名称精确/模糊（互斥，channel_name 优先）
-//   - status: enabled / disabled / cooldown（cooldown 依赖 channelCooldownsMap）
+//   - status: enabled / disabled / cooldown（cooldown 包含渠道、Key、模型任一有效冷却）
 //   - model | model_like: 模型精确/模糊（互斥，model 优先）
 //
 // 空字符串或 "all" 视为不过滤。
-func applyChannelListFilters(cfgs []*model.Config, c *gin.Context, channelCooldownsMap map[int64]time.Time, now time.Time) []*model.Config {
+func applyChannelListFilters(cfgs []*model.Config, c *gin.Context, cooldowns channelCooldownSnapshot, now time.Time) []*model.Config {
 	if configuredProtocol := strings.TrimSpace(c.Query("protocol")); configuredProtocol != "" && configuredProtocol != "all" {
 		cfgs = filterConfigs(cfgs, func(cfg *model.Config) bool {
 			return configHasURLProtocol(cfg, configuredProtocol)
+		})
+	}
+
+	if authType := strings.TrimSpace(c.Query("auth_type")); authType != "" && authType != "all" {
+		normalizedAuthType := model.NormalizeAuthType(authType)
+		cfgs = filterConfigs(cfgs, func(cfg *model.Config) bool {
+			return normalizedAuthType != "" && cfg.GetAuthType() == normalizedAuthType
 		})
 	}
 
@@ -189,8 +233,7 @@ func applyChannelListFilters(cfgs []*model.Config, c *gin.Context, channelCooldo
 			case "disabled":
 				return !cfg.Enabled
 			case "cooldown":
-				until, cooled := channelCooldownsMap[cfg.ID]
-				return cooled && until.After(now)
+				return cooldowns.hasActiveCooldown(cfg.ID, now)
 			}
 			return false
 		})
@@ -288,13 +331,23 @@ type channelEnrichmentContext struct {
 	successRateMap      map[int64]float64
 	channelCooldownsMap map[int64]time.Time
 	keyCooldownsMap     map[int64]map[int]time.Time
+	modelCooldownsMap   map[int64]map[string]time.Time
 	apiKeysMap          map[int64][]*model.APIKey
 }
 
 // enrichChannel 把单个 cfg 拼装为 ChannelWithCooldown：
-// 渠道冷却剩余时间、健康度模式下的有效优先级与成功率、Key 策略与各 Key 冷却详情。
+// 渠道冷却剩余时间、健康度模式下的有效优先级与成功率、Key 策略、Key 与模型冷却详情。
 func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWithCooldown {
-	oc := ChannelWithCooldown{Config: cfg}
+	metadata := channelOAuthMetadataFromCredential(cfg)
+	oc := ChannelWithCooldown{
+		Config:                       cfg,
+		CodexPlanType:                metadata.planType,
+		CodexSubscriptionActiveUntil: metadata.subscriptionActiveUntil,
+		AntigravityPaidTier:          metadata.antigravityPaidTier,
+		XAIEmail:                     metadata.xaiEmail,
+		XAISubscriptionTier:          metadata.xaiSubscriptionTier,
+		XAIEntitlementStatus:         metadata.xaiEntitlementStatus,
+	}
 
 	// 渠道级别冷却：使用批量查询结果（性能提升：N -> 1 次查询）
 	if until, cooled := ectx.channelCooldownsMap[cfg.ID]; cooled && until.After(ectx.now) {
@@ -329,7 +382,53 @@ func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWi
 		keyCooldowns = append(keyCooldowns, keyInfo)
 	}
 	oc.KeyCooldowns = keyCooldowns
+	oc.ModelCooldowns = activeModelCooldownInfos(ectx.modelCooldownsMap[cfg.ID], ectx.now)
 	return oc
+}
+
+type channelOAuthMetadata struct {
+	planType                string
+	subscriptionActiveUntil *time.Time
+	antigravityPaidTier     string
+	xaiEmail                string
+	xaiSubscriptionTier     string
+	xaiEntitlementStatus    string
+}
+
+func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata {
+	if cfg == nil || cfg.OAuthCredential == "" {
+		return channelOAuthMetadata{}
+	}
+	if cfg.UsesAntigravityOAuth() {
+		credential, err := antigravityauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return channelOAuthMetadata{}
+		}
+		return channelOAuthMetadata{antigravityPaidTier: credential.PaidTier.DisplayName()}
+	}
+	if cfg.UsesXAIOAuth() {
+		credential, err := xaiauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return channelOAuthMetadata{}
+		}
+		return channelOAuthMetadata{
+			xaiEmail:             credential.Identity().Email,
+			xaiSubscriptionTier:  strings.TrimSpace(credential.SubscriptionTier),
+			xaiEntitlementStatus: strings.TrimSpace(credential.EntitlementStatus),
+		}
+	}
+	if !cfg.UsesCodexOAuth() {
+		return channelOAuthMetadata{}
+	}
+	credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+	if err != nil {
+		return channelOAuthMetadata{}
+	}
+	metadata := channelOAuthMetadata{planType: credential.PlanType}
+	if until, ok := credential.SubscriptionActiveUntil(); ok {
+		metadata.subscriptionActiveUntil = &until
+	}
+	return metadata
 }
 
 func activeModelCooldownInfos(cooldowns map[string]time.Time, now time.Time) []ModelCooldownInfo {
@@ -361,15 +460,15 @@ func (s *Server) HandleChannelsFilterOptions(c *gin.Context) {
 		return
 	}
 
-	cooldowns, err := s.getAllChannelCooldowns(c.Request.Context())
-	if err != nil {
-		log.Printf("[WARN] 批量查询渠道冷却状态失败: %v", err)
-		cooldowns = make(map[int64]time.Time)
+	status := strings.TrimSpace(c.Query("status"))
+	var cooldowns channelCooldownSnapshot
+	if status == "cooldown" {
+		cooldowns = s.loadChannelCooldownSnapshot(c.Request.Context())
 	}
 	cfgs = filterChannelOptionConfigs(
 		cfgs,
 		strings.TrimSpace(c.Query("protocol")),
-		strings.TrimSpace(c.Query("status")),
+		status,
 		cooldowns,
 		time.Now(),
 	)
@@ -385,7 +484,6 @@ func (s *Server) HandleCheckDuplicateChannel(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "invalid request: "+err.Error())
 		return
 	}
-
 	// 构建新渠道 URL 集合（去除空行）
 	newURLSet := make(map[string]struct{}, len(req.URLs))
 	for _, entry := range req.URLs {
@@ -424,6 +522,10 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 	var req ChannelRequest
 	if err := BindAndValidate(c, &req); err != nil {
 		RespondErrorMsg(c, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	if req.AuthType != model.AuthTypeAPIKey {
+		RespondErrorMsg(c, http.StatusBadRequest, "OAuth channels must be created by login or credential import")
 		return
 	}
 
@@ -493,6 +595,16 @@ func (s *Server) handleGetChannel(c *gin.Context, id int64) {
 		RespondError(c, http.StatusNotFound, fmt.Errorf("channel not found"))
 		return
 	}
+	detail, _, err := s.buildChannelDetail(c.Request.Context(), id, cfg)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	RespondJSON(c, http.StatusOK, detail)
+}
+
+func (s *Server) buildChannelDetail(ctx context.Context, id int64, cfg *model.Config) (ChannelWithCooldown, []*model.APIKey, error) {
 	// 填充空的重定向模型为请求模型（方便前端编辑时显示）
 	for i := range cfg.ModelEntries {
 		if cfg.ModelEntries[i].RedirectModel == "" {
@@ -500,23 +612,31 @@ func (s *Server) handleGetChannel(c *gin.Context, id int64) {
 		}
 	}
 
-	apiKeys, err := s.getAPIKeys(c.Request.Context(), id)
+	apiKeys, err := s.getAPIKeys(ctx, id)
 	if err != nil {
-		RespondError(c, http.StatusInternalServerError, err)
-		return
+		return ChannelWithCooldown{}, nil, err
 	}
-	allModelCooldowns, err := s.getAllModelCooldowns(c.Request.Context())
+	if apiKeys == nil {
+		apiKeys = make([]*model.APIKey, 0)
+	}
+	allModelCooldowns, err := s.getAllModelCooldowns(ctx)
 	if err != nil {
 		log.Printf("[WARN] 查询渠道模型冷却状态失败 (channel=%d): %v", id, err)
 		allModelCooldowns = make(map[int64]map[string]time.Time)
 	}
 
-	// 渠道详情返回配置和策略，但仍不返回明文 Key；API Keys 继续走 /keys 端点。
-	RespondJSON(c, http.StatusOK, ChannelWithCooldown{
-		Config:         cfg,
-		KeyStrategy:    channelKeyStrategy(apiKeys),
-		ModelCooldowns: activeModelCooldownInfos(allModelCooldowns[id], time.Now()),
-	})
+	metadata := channelOAuthMetadataFromCredential(cfg)
+	return ChannelWithCooldown{
+		Config:                       cfg,
+		CodexPlanType:                metadata.planType,
+		CodexSubscriptionActiveUntil: metadata.subscriptionActiveUntil,
+		AntigravityPaidTier:          metadata.antigravityPaidTier,
+		XAIEmail:                     metadata.xaiEmail,
+		XAISubscriptionTier:          metadata.xaiSubscriptionTier,
+		XAIEntitlementStatus:         metadata.xaiEntitlementStatus,
+		KeyStrategy:                  channelKeyStrategy(apiKeys),
+		ModelCooldowns:               activeModelCooldownInfos(allModelCooldowns[id], time.Now()),
+	}, apiKeys, nil
 }
 
 // handleGetChannelKeys 获取渠道的所有 API Keys
@@ -546,18 +666,25 @@ func (s *Server) HandleChannelModelStats(c *gin.Context) {
 		return
 	}
 
+	result, err := s.getChannelModelStats(c.Request.Context(), id)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	RespondJSON(c, http.StatusOK, result)
+}
+
+func (s *Server) getChannelModelStats(ctx context.Context, id int64) ([]ChannelModelStats, error) {
 	params := &PaginationParams{Range: "today"}
 	startTime, endTime := params.GetTimeRange()
 	filter := &model.LogFilter{
 		ChannelID: &id,
 		LogSource: model.LogSourceProxy,
 	}
-	stats, err := s.statsCache.GetStatsLite(c.Request.Context(), startTime, endTime, filter)
+	stats, err := s.statsCache.GetStatsLite(ctx, startTime, endTime, filter)
 	if err != nil {
-		RespondError(c, http.StatusInternalServerError, err)
-		return
+		return nil, err
 	}
-
 	result := make([]ChannelModelStats, 0, len(stats))
 	for _, entry := range stats {
 		result = append(result, ChannelModelStats{
@@ -569,7 +696,7 @@ func (s *Server) HandleChannelModelStats(c *gin.Context) {
 			AvgDurationSeconds:      entry.AvgDurationSeconds,
 		})
 	}
-	RespondJSON(c, http.StatusOK, result)
+	return result, nil
 }
 
 // HandleChannelURLStats 返回渠道各URL的实时状态（延迟、冷却）
@@ -687,6 +814,9 @@ func (s *Server) handleAPIKeyToggle(c *gin.Context, disable bool) {
 		return
 	}
 	keyIndex := *req.KeyIndex
+	if !s.requireMutableAPIKeys(c, id) {
+		return
+	}
 
 	if _, err := s.store.GetAPIKey(c.Request.Context(), id, keyIndex); err != nil {
 		RespondErrorMsg(c, http.StatusNotFound, "api key not found")
@@ -729,11 +859,20 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			if enabled {
 				s.clearAllChannelCooldowns(c.Request.Context(), id)
 			}
+			if upd.UsesXAIOAuth() && s.xaiCredentials != nil {
+				s.xaiCredentials.invalidate(id)
+			}
 			// enabled 状态变更影响渠道选择，必须立即失效缓存
 			s.InvalidateChannelListCache()
 			RespondJSON(c, http.StatusOK, upd)
 			return
 		}
+	}
+
+	existing, err := s.store.GetConfig(c.Request.Context(), id)
+	if err != nil {
+		RespondError(c, http.StatusNotFound, fmt.Errorf("channel not found"))
+		return
 	}
 
 	// 处理完整更新：重新序列化为ChannelRequest
@@ -748,6 +887,39 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		RespondErrorMsg(c, http.StatusBadRequest, "invalid request format")
 		return
 	}
+	if strings.TrimSpace(req.AuthType) == "" {
+		req.AuthType = existing.GetAuthType()
+	}
+	if existing.UsesOAuth() {
+		if req.AuthType != existing.GetAuthType() {
+			RespondErrorMsg(c, http.StatusConflict, "OAuth channel auth_type is read-only")
+			return
+		}
+		if len(req.normalizeAPIKeys()) != 0 {
+			RespondErrorMsg(c, http.StatusConflict, "OAuth channel API keys are read-only")
+			return
+		}
+		if _, submitted := rawReq["key_strategy"]; submitted {
+			RespondErrorMsg(c, http.StatusConflict, "OAuth channel key strategy is read-only")
+			return
+		}
+	}
+	if existing.UsesXAIOAuth() {
+		for _, field := range []string{"oauth_credential", "credential", "access_token", "refresh_token", "id_token"} {
+			if _, submitted := rawReq[field]; submitted {
+				RespondErrorMsg(c, http.StatusConflict, "xAI OAuth credential is read-only")
+				return
+			}
+		}
+	}
+	if existing.UsesCodexOAuth() {
+		credential, parseErr := codexauth.ParseCredential([]byte(existing.OAuthCredential))
+		if parseErr != nil {
+			RespondError(c, http.StatusInternalServerError, parseErr)
+			return
+		}
+		req.Models = filterCodexOAuthModelEntries(req.Models, credential.PlanType)
+	}
 
 	if err := req.Validate(); err != nil {
 		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
@@ -759,6 +931,9 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	if err != nil {
 		log.Printf("[WARN] 查询旧API Keys失败: %v", err)
 		oldKeys = []*model.APIKey{}
+	}
+	if existing.UsesOAuth() {
+		oldKeys = nil
 	}
 
 	newKeys := req.normalizeAPIKeys()
@@ -804,9 +979,14 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		RespondError(c, http.StatusNotFound, err)
 		return
 	}
+	if existing.UsesXAIOAuth() && s.xaiCredentials != nil {
+		s.xaiCredentials.invalidate(id)
+	}
 
 	// Key或策略变化时更新API Keys
-	if keyChanged {
+	if existing.UsesOAuth() {
+		// OAuth 凭证只由登录、导入和刷新链路维护。
+	} else if keyChanged {
 		disabledByAPIKey := make(map[string]bool, len(oldKeys))
 		for _, oldKey := range oldKeys {
 			if oldKey.Disabled {
@@ -906,6 +1086,19 @@ func (s *Server) cleanupOrphanedURLStates(ctx context.Context, channelID int64, 
 	}
 }
 
+func (s *Server) requireMutableAPIKeys(c *gin.Context, channelID int64) bool {
+	cfg, err := s.store.GetConfig(c.Request.Context(), channelID)
+	if err != nil {
+		RespondError(c, http.StatusNotFound, err)
+		return false
+	}
+	if cfg.UsesOAuth() {
+		RespondErrorMsg(c, http.StatusConflict, "OAuth channel API keys are read-only")
+		return false
+	}
+	return true
+}
+
 // HandleDeleteAPIKey 删除渠道下的单个Key，并保持key_index连续
 func (s *Server) HandleDeleteAPIKey(c *gin.Context) {
 	// 解析渠道ID
@@ -924,6 +1117,9 @@ func (s *Server) HandleDeleteAPIKey(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	if !s.requireMutableAPIKeys(c, channelID) {
+		return
+	}
 
 	// 获取当前Keys，确认目标存在并计算剩余数量
 	apiKeys, err := s.store.GetAPIKeys(ctx, channelID)
@@ -1192,23 +1388,19 @@ func (s *Server) HandleBatchSetEnabled(c *gin.Context) {
 	})
 }
 
-// HandleBatchSetProtocolTransformMode updates protocol handling for selected channels.
-// POST /admin/channels/batch-protocol-mode
-func (s *Server) HandleBatchSetProtocolTransformMode(c *gin.Context) {
+// HandleBatchPatchChannels atomically applies advanced settings to selected channels.
+// POST /admin/channels/batch-advanced
+func (s *Server) HandleBatchPatchChannels(c *gin.Context) {
 	var req struct {
-		ChannelIDs            []int64 `json:"channel_ids"`
-		ProtocolTransformMode string  `json:"protocol_transform_mode"`
+		ChannelIDs            []int64            `json:"channel_ids"`
+		CostMultiplier        *float64           `json:"cost_multiplier"`
+		ProtocolTransformMode *string            `json:"protocol_transform_mode"`
+		Models                []model.ModelEntry `json:"models"`
+		ModelImportMode       string             `json:"model_import_mode"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		RespondError(c, http.StatusBadRequest, err)
-		return
-	}
-
-	rawMode := strings.TrimSpace(req.ProtocolTransformMode)
-	mode := model.NormalizeProtocolTransformMode(rawMode)
-	if rawMode == "" || mode == "" {
-		RespondError(c, http.StatusBadRequest, fmt.Errorf("invalid protocol_transform_mode: %q (allowed: auto, upstream, local)", req.ProtocolTransformMode))
 		return
 	}
 
@@ -1218,46 +1410,33 @@ func (s *Server) HandleBatchSetProtocolTransformMode(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	changedIDs := make([]int64, 0, len(channelIDs))
-	notFound := make([]int64, 0)
-	unchanged := 0
-	for _, channelID := range channelIDs {
-		cfg, err := s.store.GetConfig(ctx, channelID)
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				notFound = append(notFound, channelID)
-				continue
-			}
-			RespondError(c, http.StatusInternalServerError, err)
-			return
-		}
-		if cfg.GetProtocolTransformMode() == mode {
-			unchanged++
-			continue
-		}
-		changedIDs = append(changedIDs, channelID)
+	patch, err := (model.BatchConfigPatch{
+		CostMultiplier:        req.CostMultiplier,
+		ProtocolTransformMode: req.ProtocolTransformMode,
+		ModelEntries:          req.Models,
+		ModelImportMode:       req.ModelImportMode,
+	}).Normalize()
+	if err != nil {
+		RespondError(c, http.StatusBadRequest, err)
+		return
 	}
 
-	updated := int64(0)
-	if len(changedIDs) > 0 {
-		var err error
-		updated, err = s.store.BatchUpdateProtocolTransformMode(ctx, changedIDs, mode)
-		if err != nil {
-			log.Printf("批量更新协议处理失败: %v", err)
-			RespondError(c, http.StatusInternalServerError, err)
-			return
-		}
+	result, err := s.store.BatchPatchConfigs(c.Request.Context(), channelIDs, patch)
+	if err != nil {
+		log.Printf("批量更新渠道高级配置失败: %v", err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	if result.Updated > 0 {
 		s.InvalidateChannelListCache()
 	}
 
 	RespondJSON(c, http.StatusOK, gin.H{
-		"protocol_transform_mode": mode,
-		"total":                   len(channelIDs),
-		"updated":                 updated,
-		"unchanged":               unchanged,
-		"not_found":               notFound,
-		"not_found_count":         len(notFound),
+		"total":           len(channelIDs),
+		"updated":         result.Updated,
+		"unchanged":       result.Unchanged,
+		"not_found":       result.NotFound,
+		"not_found_count": len(result.NotFound),
 	})
 }
 
@@ -1336,7 +1515,8 @@ func (s *Server) deleteChannelByID(ctx context.Context, id int64) (bool, error) 
 		return false, nil
 	}
 
-	if _, err := s.store.GetConfig(ctx, id); err != nil {
+	cfg, err := s.store.GetConfig(ctx, id)
+	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return false, nil
 		}
@@ -1354,6 +1534,15 @@ func (s *Server) deleteChannelByID(ctx context.Context, id int64) (bool, error) 
 	}
 	if s.channelRPMLimiter != nil {
 		s.channelRPMLimiter.RemoveChannel(id)
+	}
+	if s.codexCredentials != nil {
+		s.codexCredentials.invalidate(id)
+	}
+	if s.antigravityCredentials != nil {
+		s.antigravityCredentials.invalidate(id)
+	}
+	if cfg.UsesXAIOAuth() && s.xaiCredentials != nil {
+		s.xaiCredentials.invalidate(id)
 	}
 	return true, nil
 }

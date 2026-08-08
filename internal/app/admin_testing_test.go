@@ -14,14 +14,91 @@ import (
 	"testing"
 	"time"
 
+	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/testutil"
 	"ccLoad/internal/util"
+	"ccLoad/internal/xaiauth"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 )
+
+func createCodexOAuthChannelForAdminTest(t testing.TB, srv *Server, upstreamURL string) *model.Config {
+	t.Helper()
+	credential := &codexauth.Credential{
+		Type:         "codex",
+		AccessToken:  "at-admin-test",
+		RefreshToken: "rt-admin-test",
+		Expired:      time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		AccountID:    "account-admin-test",
+	}
+	payload, err := credential.JSON()
+	if err != nil {
+		t.Fatalf("encode Codex credential: %v", err)
+	}
+	created, err := srv.store.CreateConfig(context.Background(), &model.Config{
+		Name:                  "codex-oauth-admin-test",
+		AuthType:              model.AuthTypeCodexOAuth,
+		OAuthCredential:       payload,
+		URLs:                  model.ChannelURLs{{URL: upstreamURL, Exact: true, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
+		ModelEntries:          []model.ModelEntry{{Model: "gpt-5.6-sol"}},
+		Enabled:               true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig Codex OAuth channel: %v", err)
+	}
+	return created
+}
+
+func createAntigravityOAuthChannelForAdminTest(t testing.TB, srv *Server, upstreamURL string) *model.Config {
+	t.Helper()
+	credential := &antigravityauth.Credential{
+		Type: antigravityauth.ChannelType, AccessToken: "at-gravity-admin", RefreshToken: "rt-gravity-admin",
+		Expired: time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		Email:   "gravity-admin@example.com", ProjectID: "gravity-admin-project",
+	}
+	payload, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.store.CreateConfig(context.Background(), &model.Config{
+		Name: "antigravity-oauth-admin-test", AuthType: model.AuthTypeAntigravityOAuth, OAuthCredential: payload,
+		URLs:                  model.ChannelURLs{{URL: upstreamURL, Protocols: []string{util.ProtocolGemini}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "gemini-3-flash"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+func createXAIOAuthChannelForAdminTest(t testing.TB, srv *Server, upstreamURL string) *model.Config {
+	t.Helper()
+	credential := &xaiauth.Credential{
+		Type: xaiauth.ChannelType, AuthKind: "oauth", AccessToken: "at-xai-admin", RefreshToken: "rt-xai-admin",
+		TokenType: "Bearer", Expired: time.Now().UTC().Add(6 * time.Hour).Format(time.RFC3339),
+		TokenEndpoint: xaiauth.TokenURL, BaseURL: xaiauth.CLIBaseURL,
+	}
+	payload, err := credential.JSON()
+	if err != nil {
+		t.Fatalf("encode xAI credential: %v", err)
+	}
+	created, err := srv.store.CreateConfig(context.Background(), &model.Config{
+		Name: "xai-oauth-admin-test", AuthType: model.AuthTypeXAIOAuth, OAuthCredential: payload,
+		URLs:                  model.ChannelURLs{{URL: upstreamURL, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "grok-4.5"}}, Enabled: true, Websockets: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig xAI OAuth channel: %v", err)
+	}
+	return created
+}
 
 // TestHandleChannelTest 测试渠道测试功能
 func TestHandleChannelTest(t *testing.T) {
@@ -171,6 +248,24 @@ func TestChannelTestCodexUsesNativeWebsocketWhenEnabled(t *testing.T) {
 		if !websocket.IsWebSocketUpgrade(r) {
 			t.Fatalf("WebSocket 渠道测试错误地走了 HTTP: %s %s", r.Method, r.URL.Path)
 		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
+			t.Errorf("Authorization=%q, want bearer test key", got)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "" {
+			t.Errorf("X-Api-Key must be removed, got %q", got)
+		}
+		if r.Header.Get("User-Agent") != codexUserAgent || r.Header.Get("Originator") != "codex-tui" {
+			t.Errorf("Codex identity headers=%v", r.Header)
+		}
+		if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state" {
+			t.Errorf("X-Codex-Turn-State=%q, want allowed websocket header", got)
+		}
+		if r.Header.Get("X-Arbitrary-Client") != "" || r.Header.Get("Accept") != "" || r.Header.Get("Content-Type") != "" {
+			t.Errorf("unapproved HTTP headers leaked into websocket handshake: %v", r.Header)
+		}
+		if r.Header.Get("Session_id") == "" || r.Header.Get("Conversation_id") == "" {
+			t.Errorf("Codex websocket session headers are incomplete: %v", r.Header)
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("升级 WebSocket: %v", err)
@@ -225,6 +320,10 @@ func TestChannelTestCodexUsesNativeWebsocketWhenEnabled(t *testing.T) {
 		ClientProtocol: "codex",
 		Stream:         true,
 		Content:        "hello",
+		Headers: map[string]string{
+			"X-Codex-Turn-State": "turn-state",
+			"X-Arbitrary-Client": "must-not-leak",
+		},
 	})
 
 	if success, _ := result["success"].(bool); !success {
@@ -298,6 +397,18 @@ func TestHandleChannelWebsocketProbeDetectsSupportedUpstream(t *testing.T) {
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-probe" {
 			t.Errorf("Authorization=%q, want bearer probe key", got)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "" {
+			t.Errorf("X-Api-Key must be removed, got %q", got)
+		}
+		if r.Header.Get("User-Agent") != codexUserAgent || r.Header.Get("Originator") != "codex-tui" {
+			t.Errorf("Codex identity headers=%v", r.Header)
+		}
+		if r.Header.Get("Accept") != "" || r.Header.Get("Content-Type") != "" {
+			t.Errorf("HTTP-only headers leaked into websocket probe: %v", r.Header)
+		}
+		if r.Header.Get("Session_id") == "" || r.Header.Get("Conversation_id") == "" {
+			t.Errorf("Codex websocket session headers are incomplete: %v", r.Header)
 		}
 		if beta := r.Header.Get("OpenAI-Beta"); !strings.Contains(beta, "responses_websockets=") {
 			t.Errorf("OpenAI-Beta=%q, want responses_websockets feature", beta)
@@ -419,6 +530,111 @@ func TestTestChannelAPI_MultiURL5xxDoesNotFallbackOrCooldownURL(t *testing.T) {
 	}
 	if srv.urlSelector.IsCooledDown(cfg.ID, failUpstream.URL) {
 		t.Fatalf("model-scoped 5xx must not cool URL, url=%s", failUpstream.URL)
+	}
+}
+
+func TestTestChannelAPI_MultiURLStreamFailureDoesNotFallbackOrCooldownURL(t *testing.T) {
+	tests := []struct {
+		name             string
+		wantStatus       int
+		configureTimeout func(*Server)
+		serveFailure     func(http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:       "first_valid_content_timeout",
+			wantStatus: util.StatusFirstByteTimeout,
+			configureTimeout: func(srv *Server) {
+				srv.firstByteTimeout = 25 * time.Millisecond
+			},
+			serveFailure: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher, _ := w.(http.Flusher)
+				ticker := time.NewTicker(5 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-ticker.C:
+						_, _ = io.WriteString(w, ": keep-alive\n\n")
+						flusher.Flush()
+					}
+				}
+			},
+		},
+		{
+			name:       "stream_incomplete",
+			wantStatus: util.StatusStreamIncomplete,
+			configureTimeout: func(srv *Server) {
+				srv.firstByteTimeout = time.Second
+				srv.streamTimeout = 25 * time.Millisecond
+			},
+			serveFailure: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				<-r.Context().Done()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var failureCalls atomic.Int32
+			var fallbackCalls atomic.Int32
+
+			failureUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				failureCalls.Add(1)
+				tt.serveFailure(w, r)
+			}))
+			defer failureUpstream.Close()
+
+			fallbackUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fallbackCalls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"}}]}\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			}))
+			defer fallbackUpstream.Close()
+
+			srv := newInMemoryServer(t)
+			tt.configureTimeout(srv)
+			cfg := &model.Config{
+				ID:           9528,
+				Name:         "multi-url-stream-failure-test",
+				URLs:         channelURLsForTest(failureUpstream.URL, fallbackUpstream.URL),
+				Priority:     1,
+				ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
+				Enabled:      true,
+			}
+
+			// 强制第一跳命中流故障 URL。模型级流故障不应改打同渠道的第二个 URL。
+			srv.urlSelector.CooldownURL(cfg.ID, fallbackUpstream.URL)
+			result := srv.testChannelAPI(context.Background(), cfg, "sk-test", &testutil.TestChannelRequest{
+				Model:          "gpt-4o-mini",
+				ClientProtocol: "openai",
+				Content:        "hello",
+				Stream:         true,
+			})
+
+			if statusCode, _ := getResultInt(result["status_code"]); statusCode != tt.wantStatus {
+				t.Fatalf("status_code=%d, want %d, result=%+v", statusCode, tt.wantStatus, result)
+			}
+			if got := failureCalls.Load(); got != 1 {
+				t.Fatalf("failure URL calls=%d, want 1", got)
+			}
+			if got := fallbackCalls.Load(); got != 0 {
+				t.Fatalf("model-scoped stream failure retried another URL: calls=%d", got)
+			}
+			if srv.urlSelector.IsCooledDown(cfg.ID, failureUpstream.URL) {
+				t.Fatalf("model-scoped stream failure must not cool URL, status=%d url=%s", tt.wantStatus, failureUpstream.URL)
+			}
+		})
 	}
 }
 
@@ -942,6 +1158,299 @@ func TestHandleChannelTest_NoAPIKey(t *testing.T) {
 	}
 }
 
+func TestHandleChannelTest_CodexOAuthWithoutAPIKey(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer at-admin-test" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-admin-test" {
+			t.Errorf("ChatGPT-Account-ID = %q", got)
+		}
+		if r.Header.Get("X-Api-Key") != "" {
+			t.Errorf("X-Api-Key must be removed: %q", r.Header.Get("X-Api-Key"))
+		}
+		if r.Header.Get("User-Agent") != codexUserAgent || r.Header.Get("Originator") != "codex-tui" ||
+			(r.Header.Get("Session_id") == "" && r.Header.Get("Session-Id") == "") {
+			t.Errorf("incomplete Codex OAuth headers: %v", r.Header)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_admin\",\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	channelID := fmt.Sprintf("%d", created.ID)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model":           "gpt-5.6-sol",
+		"client_protocol": "codex",
+		"stream":          true,
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := resp.Data["success"].(bool); !resp.Success || !success {
+		t.Fatalf("Codex OAuth channel test failed: %+v", resp)
+	}
+	if got, _ := resp.Data["total_keys"].(float64); got != 0 {
+		t.Fatalf("total_keys=%v, want 0", resp.Data["total_keys"])
+	}
+	if got, _ := resp.Data["tested_key_index"].(float64); got != -1 {
+		t.Fatalf("tested_key_index=%v, want -1", resp.Data["tested_key_index"])
+	}
+}
+
+func TestHandleChannelTest_AntigravityOAuthWithoutAPIKey(t *testing.T) {
+	var upstreamBody []byte
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1internal:generateContent" || r.Header.Get("Authorization") != "Bearer at-gravity-admin" {
+			t.Errorf("unexpected Antigravity request: %s %v", r.URL.String(), r.Header)
+		}
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"gravity test answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}}}`)
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createAntigravityOAuthChannelForAdminTest(t, srv, upstream.URL)
+	channelID := fmt.Sprintf("%d", created.ID)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model": "gemini-3-flash", "client_protocol": "openai", "stream": false, "content": "hello",
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := resp.Data["success"].(bool); !resp.Success || !success {
+		t.Fatalf("Antigravity OAuth channel test failed: %+v", resp)
+	}
+	if got, _ := resp.Data["response_text"].(string); got != "gravity test answer" {
+		t.Fatalf("response_text=%q data=%+v", got, resp.Data)
+	}
+	if gjson.GetBytes(upstreamBody, "project").String() != "gravity-admin-project" || gjson.GetBytes(upstreamBody, "request.contents").Array() == nil {
+		t.Fatalf("invalid Antigravity request envelope: %s", upstreamBody)
+	}
+	if got, _ := resp.Data["total_keys"].(float64); got != 0 {
+		t.Fatalf("total_keys=%v, want 0", resp.Data["total_keys"])
+	}
+}
+
+func TestHandleChannelTest_XAIOAuthWithoutAPIKeyUsesProviderWire(t *testing.T) {
+	var upstreamBody []byte
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("upstream path = %q, want /v1/responses", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer at-xai-admin" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get(xaiauth.CLITokenAuthHeader); got != xaiauth.CLITokenAuthValue {
+			t.Errorf("%s = %q", xaiauth.CLITokenAuthHeader, got)
+		}
+		if r.Header.Get("X-Api-Key") != "" || r.Header.Get("ChatGPT-Account-ID") != "" ||
+			r.Header.Get("Session-Id") != "" || r.Header.Get("Session_id") != "" {
+			t.Errorf("conflicting authentication headers were not removed: %v", r.Header)
+		}
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Errorf("Accept = %q", got)
+		}
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"xai test answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_xai_admin\",\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createXAIOAuthChannelForAdminTest(t, srv, upstream.URL+"/v1")
+	channelID := fmt.Sprintf("%d", created.ID)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model": "grok-4.5", "client_protocol": "codex", "stream": false, "content": "hello",
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := resp.Data["success"].(bool); !resp.Success || !success {
+		t.Fatalf("xAI OAuth channel test failed: %+v", resp)
+	}
+	if got, _ := resp.Data["response_text"].(string); got != "xai test answer" {
+		t.Fatalf("response_text=%q data=%+v", got, resp.Data)
+	}
+	if got, _ := resp.Data["total_keys"].(float64); got != 0 {
+		t.Fatalf("total_keys=%v, want 0", resp.Data["total_keys"])
+	}
+	if got, _ := resp.Data["tested_key_index"].(float64); got != -1 {
+		t.Fatalf("tested_key_index=%v, want -1", resp.Data["tested_key_index"])
+	}
+	if !gjson.GetBytes(upstreamBody, "stream").Bool() || gjson.GetBytes(upstreamBody, "model").String() != "grok-4.5" ||
+		gjson.GetBytes(upstreamBody, "prompt_cache_key").String() == "" {
+		t.Fatalf("xAI request was not finalized: %s", upstreamBody)
+	}
+}
+
+func TestHandleChannelTest_CodexOAuthUsageLimitCoolsModel(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":7260}}`)
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	updated := created.Clone()
+	updated.ModelEntries = append(updated.ModelEntries, model.ModelEntry{Model: "gpt-5.4"})
+	created, err := srv.store.UpdateConfig(context.Background(), created.ID, updated)
+	if err != nil {
+		t.Fatalf("add unaffected Codex model: %v", err)
+	}
+
+	channelID := fmt.Sprintf("%d", created.ID)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model":           "gpt-5.6-sol",
+		"client_protocol": "codex",
+		"stream":          true,
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if got, _ := resp.Data["cooldown_action"].(string); got != "model_cooldown_applied" {
+		t.Fatalf("cooldown_action=%q, want model_cooldown_applied, data=%+v", got, resp.Data)
+	}
+	cooldowns, err := srv.store.GetAllModelCooldowns(context.Background())
+	if err != nil {
+		t.Fatalf("get model cooldowns: %v", err)
+	}
+	until := cooldowns[created.ID]["gpt-5.6-sol"]
+	if remaining := time.Until(until); remaining < 7250*time.Second || remaining > 7270*time.Second {
+		t.Fatalf("model cooldown remaining=%v, want about 7260s", remaining)
+	}
+	if _, exists := cooldowns[created.ID]["gpt-5.4"]; exists {
+		t.Fatal("unaffected Codex model must not be cooled")
+	}
+}
+
+func TestHandleChannelTest_CodexOAuthTransformsOpenAIWithoutSSEContentType(t *testing.T) {
+	var upstreamBody []byte
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses" {
+			t.Errorf("upstream path = %q", r.URL.Path)
+		}
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"translated answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	updated := created.Clone()
+	updated.ProtocolTransformMode = model.ProtocolTransformModeLocal
+	created, err := srv.store.UpdateConfig(context.Background(), created.ID, updated)
+	if err != nil {
+		t.Fatalf("enable local protocol transform: %v", err)
+	}
+	channelID := fmt.Sprintf("%d", created.ID)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model":           "gpt-5.6-sol",
+		"client_protocol": "openai",
+		"stream":          true,
+		"content":         "which header carries the API key?",
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := resp.Data["success"].(bool); !resp.Success || !success {
+		t.Fatalf("OpenAI -> Codex OAuth channel test failed: %+v", resp)
+	}
+	if got, _ := resp.Data["response_text"].(string); got != "translated answer" {
+		t.Fatalf("response_text=%q, want translated answer; data=%+v", got, resp.Data)
+	}
+	if len(upstreamBody) == 0 || strings.Contains(string(upstreamBody), `"messages"`) || !strings.Contains(string(upstreamBody), `"input"`) {
+		t.Fatalf("request was not converted to Codex Responses: %s", upstreamBody)
+	}
+	if got := gjson.GetBytes(upstreamBody, "reasoning.effort").String(); got != "medium" {
+		t.Fatalf("default Codex reasoning.effort=%q, want medium; body=%s", got, upstreamBody)
+	}
+}
+
+func TestHandleChannelTest_CodexOAuthForcesStreamingUpstreamForNonStreamTest(t *testing.T) {
+	var upstreamBody []byte
+	var upstreamAccept string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+		}
+		upstreamAccept = r.Header.Get("Accept")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"forced stream answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_forced\",\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	channelID := fmt.Sprintf("%d", created.ID)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model":           "gpt-5.6-sol",
+		"client_protocol": "codex",
+		"stream":          false,
+		"content":         "hello",
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := resp.Data["success"].(bool); !resp.Success || !success {
+		t.Fatalf("Codex OAuth non-stream channel test failed: %+v", resp)
+	}
+	if !gjson.GetBytes(upstreamBody, "stream").Bool() {
+		t.Fatalf("upstream stream must be true: %s", upstreamBody)
+	}
+	if upstreamAccept != "text/event-stream" {
+		t.Fatalf("upstream Accept=%q, want text/event-stream", upstreamAccept)
+	}
+	if got, _ := resp.Data["response_text"].(string); got != "forced stream answer" {
+		t.Fatalf("response_text=%q, want forced stream answer; data=%+v", got, resp.Data)
+	}
+}
+
 // TestHandleChannelTest_UnsupportedModel 渠道存在、有 Key，但模型不支持
 func TestHandleChannelTest_UnsupportedModel(t *testing.T) {
 	srv := newInMemoryServer(t)
@@ -1157,6 +1666,7 @@ func TestHandleChannelTest_UsesSelectedOpenAIProtocol(t *testing.T) {
 func TestHandleChannelTest_UsesSelectedCodexProtocolWithBasePathPrefix(t *testing.T) {
 	var gotPath string
 	var gotBody string
+	var gotHeaders http.Header
 
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -1165,6 +1675,7 @@ func TestHandleChannelTest_UsesSelectedCodexProtocolWithBasePathPrefix(t *testin
 		}
 		gotPath = r.URL.Path
 		gotBody = string(body)
+		gotHeaders = r.Header.Clone()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -1202,6 +1713,11 @@ func TestHandleChannelTest_UsesSelectedCodexProtocolWithBasePathPrefix(t *testin
 		"model":           "claude-3-5-sonnet",
 		"client_protocol": "codex",
 		"content":         "hello",
+		"headers": map[string]string{
+			"X-Client-Request-Id": "admin-test-request",
+			"X-Codex-Turn-State":  "must-not-leak-over-http",
+			"X-Arbitrary-Client":  "must-not-leak",
+		},
 	}))
 	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", created.ID)}}
 
@@ -1218,6 +1734,21 @@ func TestHandleChannelTest_UsesSelectedCodexProtocolWithBasePathPrefix(t *testin
 	}
 	if gotPath != "/anthropic/v1/responses" {
 		t.Fatalf("path=%q, want %q", gotPath, "/anthropic/v1/responses")
+	}
+	if got := gotHeaders.Get("Authorization"); got != "Bearer sk-test-key" {
+		t.Fatalf("Authorization=%q, want bearer channel key", got)
+	}
+	if gotHeaders.Get("X-Api-Key") != "" || gotHeaders.Get("X-Arbitrary-Client") != "" || gotHeaders.Get("X-Codex-Turn-State") != "" {
+		t.Fatalf("unapproved Codex HTTP headers leaked upstream: %v", gotHeaders)
+	}
+	if gotHeaders.Get("User-Agent") != codexUserAgent || gotHeaders.Get("Originator") != "codex-tui" {
+		t.Fatalf("Codex identity headers=%v", gotHeaders)
+	}
+	if got := gotHeaders.Get("X-Client-Request-Id"); got != "admin-test-request" {
+		t.Fatalf("X-Client-Request-Id=%q, want allowed downstream value", got)
+	}
+	if gotHeaders.Get("Content-Type") != "application/json" || gotHeaders.Get("Accept") != "application/json" || gotHeaders.Get("Connection") != "Keep-Alive" {
+		t.Fatalf("Codex HTTP transport headers=%v", gotHeaders)
 	}
 	if !strings.Contains(gotBody, `"input"`) {
 		t.Fatalf("expected codex request body, body=%s", gotBody)
@@ -1330,6 +1861,75 @@ func TestHandleChannelTest_UsesSelectedProtocolEndpoint(t *testing.T) {
 	}
 	if apiResp["type"] != "message" {
 		t.Fatalf("expected anthropic api_response, got=%+v", apiResp)
+	}
+}
+
+func TestHandleChannelTest_AutoModePrioritizesAutomaticURLBeforeDeclaredConversion(t *testing.T) {
+	var automaticHits atomic.Int64
+	automatic := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		automaticHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"message":"endpoint not found"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_auto","object":"response","status":"completed","model":"shared-model","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"direct"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer automatic.Close()
+
+	var declaredHits atomic.Int64
+	declared := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		declaredHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"converted"}],"model":"shared-model","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer declared.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = automatic.Client()
+	srv.urlSelector = nil
+	ctx := context.Background()
+	created, err := srv.store.CreateConfig(ctx, &model.Config{
+		Name: "channel-test-auto-original-first",
+		URLs: model.ChannelURLs{
+			{URL: declared.URL, Protocols: []string{"anthropic"}},
+			{URL: automatic.URL},
+		},
+		Priority:              1,
+		ProtocolTransformMode: model.ProtocolTransformModeAuto,
+		ModelEntries:          []model.ModelEntry{{Model: "shared-model"}},
+		Enabled:               true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-test-key",
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, fmt.Sprintf("/admin/channels/%d/test", created.ID), map[string]any{
+		"model":           "shared-model",
+		"client_protocol": "codex",
+		"content":         "hello",
+	}))
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", created.ID)}}
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := resp.Data["success"].(bool); !success {
+		t.Fatalf("expected data.success=true, data=%+v", resp.Data)
+	}
+	if got := automaticHits.Load(); got != 1 {
+		t.Fatalf("automatic URL hits=%d, want one native Codex request", got)
+	}
+	if got := declaredHits.Load(); got != 0 {
+		t.Fatalf("declared conversion URL hits=%d, want 0 when automatic URL accepts Codex", got)
 	}
 }
 
@@ -1971,6 +2571,11 @@ func TestHandleChannelTest_SuccessfulAPI(t *testing.T) {
 	if !dataSuccess {
 		t.Fatalf("data.success 应为 true（API 调用成功）, data=%+v", resp.Data)
 	}
+
+	stats := srv.urlSelector.GetURLStats(created.ID, created.GetURLs())
+	if len(stats) != 1 || stats[0].Requests != 1 || stats[0].Failures != 0 {
+		t.Fatalf("模型测试成功应计入 URL 调用统计: %+v", stats)
+	}
 }
 
 func TestHandleChannelTest_OpenAIRequestIncludesSessionID(t *testing.T) {
@@ -2107,6 +2712,11 @@ func TestHandleChannelTest_FailedAPI(t *testing.T) {
 			t.Fatal("失败时应有冷却决策记录")
 		}
 		t.Logf("冷却决策: %s", action)
+	}
+
+	stats := srv.urlSelector.GetURLStats(created.ID, created.GetURLs())
+	if len(stats) != 1 || stats[0].Requests != 0 || stats[0].Failures != 1 {
+		t.Fatalf("模型测试失败应计入 URL 调用统计: %+v", stats)
 	}
 }
 

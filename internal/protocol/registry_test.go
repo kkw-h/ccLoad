@@ -9,6 +9,8 @@ import (
 
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/protocol/builtin"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestRegistry_TranslateRequest_OpenAIToGemini(t *testing.T) {
@@ -103,36 +105,76 @@ func TestRegistry_TranslateRequest_AnthropicToGemini3_UsesThinkingLevel(t *testi
 	reg := protocol.NewRegistry()
 	builtin.Register(reg)
 
-	raw := []byte(`{
-		"model":"gpt-5",
-		"messages":[{"role":"user","content":[{"type":"text","text":"think hard"}]}],
-		"thinking":{"type":"adaptive","display":"summarized"},
-		"output_config":{"effort":"max"}
-	}`)
-	got, err := reg.TranslateRequest(protocol.Anthropic, protocol.Gemini, "gemini-3.5-flash", raw, true)
-	if err != nil {
-		t.Fatalf("TranslateRequest failed: %v", err)
+	tests := []struct {
+		name     string
+		model    string
+		adaptive bool
+		effort   string
+		want     string
+	}{
+		{name: "missing stays absent", model: "gemini-3.6-flash-high"},
+		{name: "adaptive without effort stays absent", model: "gemini-3.6-flash-high", adaptive: true},
+		{name: "minimal stays minimal when supported", model: "gemini-3.6-flash-high", effort: "minimal", want: "minimal"},
+		{name: "low stays low", model: "gemini-3.6-flash-high", effort: "low", want: "low"},
+		{name: "medium stays medium", model: "gemini-3.6-flash-high", effort: "medium", want: "medium"},
+		{name: "high stays high", model: "gemini-3.6-flash-high", effort: "high", want: "high"},
+		{name: "xhigh clamps to maximum", model: "gemini-3.6-flash-high", effort: "xhigh", want: "high"},
+		{name: "max clamps to maximum", model: "gemini-3.6-flash-high", effort: "max", want: "high"},
+		{name: "pro minimal clamps to minimum", model: "gemini-3.1-pro-low", effort: "minimal", want: "low"},
+		{name: "missing middle level uses lower on tie", model: "gemini-3-pro", effort: "medium", want: "low"},
 	}
-	var body map[string]any
-	if err := json.Unmarshal(got, &body); err != nil {
-		t.Fatalf("unmarshal translated request failed: %v", err)
-	}
-	generationConfig, ok := body["generationConfig"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected generationConfig, got: %s", got)
-	}
-	thinkingConfig, ok := generationConfig["thinkingConfig"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected thinkingConfig, got: %s", got)
-	}
-	if thinkingConfig["thinkingLevel"] != "high" {
-		t.Fatalf("thinkingLevel=%v, want high; body=%s", thinkingConfig["thinkingLevel"], got)
-	}
-	if _, ok := thinkingConfig["thinkingBudget"]; ok {
-		t.Fatalf("Gemini 3 thinkingConfig must not include thinkingBudget: %s", got)
-	}
-	if thinkingConfig["includeThoughts"] != true {
-		t.Fatalf("expected includeThoughts=true, body=%s", got)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request := map[string]any{
+				"model": "claude-client-model",
+				"messages": []any{map[string]any{
+					"role": "user", "content": []any{map[string]any{"type": "text", "text": "think hard"}},
+				}},
+			}
+			if tc.adaptive || tc.effort != "" {
+				request["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
+			}
+			if tc.effort != "" {
+				request["output_config"] = map[string]any{"effort": tc.effort}
+			}
+			raw, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := reg.TranslateRequest(protocol.Anthropic, protocol.Gemini, tc.model, raw, true)
+			if err != nil {
+				t.Fatalf("TranslateRequest failed: %v", err)
+			}
+			var body struct {
+				GenerationConfig struct {
+					ThinkingConfig *struct {
+						ThinkingLevel   string `json:"thinkingLevel"`
+						ThinkingBudget  *int   `json:"thinkingBudget"`
+						IncludeThoughts bool   `json:"includeThoughts"`
+					} `json:"thinkingConfig"`
+				} `json:"generationConfig"`
+			}
+			if err := json.Unmarshal(got, &body); err != nil {
+				t.Fatalf("unmarshal translated request failed: %v", err)
+			}
+			thinkingConfig := body.GenerationConfig.ThinkingConfig
+			if tc.want == "" {
+				if thinkingConfig != nil {
+					t.Fatalf("thinkingConfig=%+v, want absent; body=%s", thinkingConfig, got)
+				}
+				return
+			}
+			if thinkingConfig == nil || thinkingConfig.ThinkingLevel != tc.want {
+				t.Fatalf("thinkingConfig=%+v, want level %q; body=%s", thinkingConfig, tc.want, got)
+			}
+			if thinkingConfig.ThinkingBudget != nil {
+				t.Fatalf("Gemini 3 thinkingConfig must not include thinkingBudget: %s", got)
+			}
+			if !thinkingConfig.IncludeThoughts {
+				t.Fatalf("expected includeThoughts=true, body=%s", got)
+			}
+		})
 	}
 }
 
@@ -1370,6 +1412,34 @@ func TestRegistry_TranslateRequest_OpenAIToCodex_BuiltinWebSearch(t *testing.T) 
 	}
 }
 
+func TestRegistry_TranslateRequest_OpenAIToCodex_WebSearchOptions(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+
+	raw := []byte(`{"model":"gpt-5.4-mini","web_search_options":{"search_context_size":"high","user_location":{"type":"approximate","country":"US"}},"messages":[{"role":"user","content":"hello"}]}`)
+	got, err := reg.TranslateRequest(protocol.OpenAI, protocol.Codex, "gpt-5.4-mini", raw, true)
+	if err != nil {
+		t.Fatalf("TranslateRequest failed: %v", err)
+	}
+	var req struct {
+		Tools            []map[string]any `json:"tools"`
+		WebSearchOptions map[string]any   `json:"web_search_options"`
+	}
+	if err := json.Unmarshal(got, &req); err != nil {
+		t.Fatalf("unmarshal translated request: %v", err)
+	}
+	if len(req.Tools) != 1 || req.Tools[0]["type"] != "web_search" || req.Tools[0]["search_context_size"] != "high" {
+		t.Fatalf("unexpected web search tool: %+v", req.Tools)
+	}
+	location, _ := req.Tools[0]["user_location"].(map[string]any)
+	if location["country"] != "US" {
+		t.Fatalf("unexpected web search location: %+v", location)
+	}
+	if req.WebSearchOptions != nil {
+		t.Fatalf("web_search_options leaked into Codex request: %+v", req.WebSearchOptions)
+	}
+}
+
 func TestRegistry_TranslateResponseNonStream_CodexToOpenAI(t *testing.T) {
 	reg := protocol.NewRegistry()
 	builtin.Register(reg)
@@ -1396,11 +1466,22 @@ func TestRegistry_TranslateResponseNonStream_CodexToOpenAI_ReasoningAndUsageDeta
 	if err != nil {
 		t.Fatalf("TranslateResponseNonStream failed: %v", err)
 	}
-	body := string(got)
-	if !strings.Contains(body, `"reasoning_content":"step by step"`) || !strings.Contains(body, `"encrypted_content":"enc_1"`) {
+	if reasoning := gjson.GetBytes(got, "choices.0.message.reasoning_content"); reasoning.String() != "step by step" {
 		t.Fatalf("unexpected reasoning translation: %s", got)
 	}
-	if !strings.Contains(body, `"cached_tokens":7`) || !strings.Contains(body, `"cache_creation_input_tokens":11`) || !strings.Contains(body, `"reasoning_tokens":13`) {
+	if encrypted := gjson.GetBytes(got, "choices.0.message.reasoning"); encrypted.Exists() {
+		t.Fatalf("Codex encrypted reasoning leaked into OpenAI response: %s", got)
+	}
+	if cached := gjson.GetBytes(got, "usage.prompt_tokens_details.cached_tokens"); cached.Int() != 7 {
+		t.Fatalf("unexpected cached token translation: %s", got)
+	}
+	if created := gjson.GetBytes(got, "usage.prompt_tokens_details.cached_creation_tokens"); created.Int() != 11 {
+		t.Fatalf("unexpected cache creation token translation: %s", got)
+	}
+	if legacy := gjson.GetBytes(got, "usage.cache_creation_input_tokens"); legacy.Exists() {
+		t.Fatalf("legacy cache creation field leaked into OpenAI response: %s", got)
+	}
+	if reasoningTokens := gjson.GetBytes(got, "usage.completion_tokens_details.reasoning_tokens"); reasoningTokens.Int() != 13 {
 		t.Fatalf("unexpected usage translation: %s", got)
 	}
 }

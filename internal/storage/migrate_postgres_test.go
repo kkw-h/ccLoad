@@ -290,6 +290,141 @@ func TestPostgres(t *testing.T) {
 		}
 	})
 
+	t.Run("AuthTokenRestrictionColumnsUseText", func(t *testing.T) {
+		cleanupPostgresTables(t, env.db)
+
+		store, err := CreatePostgresStoreForTest(env.dsn)
+		if err != nil {
+			t.Fatalf("初始迁移失败: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+
+		token := &model.AuthToken{
+			Token:             "pg-large-restrictions",
+			Description:       "验证 PostgreSQL 无损扩展限制列表",
+			CreatedAt:         time.Now(),
+			IsActive:          true,
+			AllowedModels:     []string{"legacy-model"},
+			AllowedChannelIDs: []int64{42},
+		}
+		if err := store.CreateAuthToken(ctx, token); err != nil {
+			t.Fatalf("创建迁移夹具失败: %v", err)
+		}
+
+		for _, column := range []string{"allowed_models", "allowed_channel_ids"} {
+			if _, err := env.db.ExecContext(ctx, fmt.Sprintf(
+				"ALTER TABLE auth_tokens ALTER COLUMN %s TYPE VARCHAR(2000)", column,
+			)); err != nil {
+				t.Fatalf("构造旧列 %s 失败: %v", column, err)
+			}
+		}
+
+		if err := migratePostgres(ctx, env.db); err != nil {
+			t.Fatalf("迁移旧 auth_tokens 限制列失败: %v", err)
+		}
+
+		for _, column := range []string{"allowed_models", "allowed_channel_ids"} {
+			var dataType string
+			if err := env.db.QueryRowContext(ctx, `
+				SELECT data_type
+				FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'auth_tokens' AND column_name = $1
+			`, column).Scan(&dataType); err != nil {
+				t.Fatalf("读取 %s 类型失败: %v", column, err)
+			}
+			if dataType != "text" {
+				t.Fatalf("auth_tokens.%s 类型=%q，期望 text", column, dataType)
+			}
+		}
+
+		got, err := store.GetAuthToken(ctx, token.ID)
+		if err != nil {
+			t.Fatalf("读取迁移后的令牌失败: %v", err)
+		}
+		if len(got.AllowedModels) != 1 || got.AllowedModels[0] != "legacy-model" ||
+			len(got.AllowedChannelIDs) != 1 || got.AllowedChannelIDs[0] != 42 {
+			t.Fatalf("迁移损坏已有值: models=%v channels=%v", got.AllowedModels, got.AllowedChannelIDs)
+		}
+
+		got.AllowedModels = make([]string, 300)
+		got.AllowedChannelIDs = make([]int64, 1000)
+		for i := range got.AllowedModels {
+			got.AllowedModels[i] = fmt.Sprintf("model-%04d", i)
+		}
+		for i := range got.AllowedChannelIDs {
+			got.AllowedChannelIDs[i] = int64(i + 1)
+		}
+		if err := store.UpdateAuthToken(ctx, got); err != nil {
+			t.Fatalf("更新超过 2000 字符的限制列表失败: %v", err)
+		}
+		if err := migratePostgres(ctx, env.db); err != nil {
+			t.Fatalf("重复迁移失败: %v", err)
+		}
+
+		got, err = store.GetAuthToken(ctx, token.ID)
+		if err != nil {
+			t.Fatalf("读取大限制列表失败: %v", err)
+		}
+		if len(got.AllowedModels) != 300 || len(got.AllowedChannelIDs) != 1000 {
+			t.Fatalf("大限制列表未完整持久化: models=%d channels=%d", len(got.AllowedModels), len(got.AllowedChannelIDs))
+		}
+	})
+
+	t.Run("ChannelModelDisabledRoundTrip", func(t *testing.T) {
+		cleanupPostgresTables(t, env.db)
+
+		store, err := CreatePostgresStoreForTest(env.dsn)
+		if err != nil {
+			t.Fatalf("迁移失败: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+
+		created, err := store.CreateConfig(ctx, &model.Config{
+			Name:    "pg-model-disabled-round-trip",
+			URLs:    model.ChannelURLs{{URL: "https://api.example.com"}},
+			Enabled: true,
+			ModelEntries: []model.ModelEntry{
+				{Model: "enabled-model"},
+				{Model: "disabled-model", Disabled: true},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig: %v", err)
+		}
+		assertDisabled := func(entries []model.ModelEntry, want map[string]bool) {
+			t.Helper()
+			if len(entries) != len(want) {
+				t.Fatalf("ModelEntries len=%d want=%d: %+v", len(entries), len(want), entries)
+			}
+			for _, entry := range entries {
+				disabled, ok := want[entry.Model]
+				if !ok {
+					t.Fatalf("unexpected model %q", entry.Model)
+				}
+				if entry.Disabled != disabled {
+					t.Fatalf("model %q Disabled=%v want=%v", entry.Model, entry.Disabled, disabled)
+				}
+			}
+		}
+		assertDisabled(created.ModelEntries, map[string]bool{
+			"enabled-model":  false,
+			"disabled-model": true,
+		})
+
+		created.ModelEntries = []model.ModelEntry{
+			{Model: "enabled-model", Disabled: true},
+			{Model: "disabled-model"},
+		}
+		updated, err := store.UpdateConfig(ctx, created.ID, created)
+		if err != nil {
+			t.Fatalf("UpdateConfig: %v", err)
+		}
+		assertDisabled(updated.ModelEntries, map[string]bool{
+			"enabled-model":  true,
+			"disabled-model": false,
+		})
+	})
+
 	t.Run("CRUD_Settings_Channel_Token_Log", func(t *testing.T) {
 		cleanupPostgresTables(t, env.db)
 
@@ -885,8 +1020,8 @@ func TestPostgres(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("AddDebugLog: %v", err)
 			}
-			if err := store.CleanupDebugLogsBefore(ctx, now.Add(-time.Hour)); err != nil {
-				t.Fatalf("CleanupDebugLogsBefore: %v", err)
+			if deleted, err := store.CleanupDebugLogsBatch(ctx, now.Add(time.Hour), 1); err != nil || deleted != 1 {
+				t.Fatalf("CleanupDebugLogsBatch: deleted=%d err=%v", deleted, err)
 			}
 			if err := store.TruncateDebugLogs(ctx); err != nil {
 				t.Fatalf("TruncateDebugLogs: %v", err)
@@ -1207,6 +1342,8 @@ func TestPostgres(t *testing.T) {
 				id BIGSERIAL PRIMARY KEY,
 				name VARCHAR(191) NOT NULL UNIQUE,
 				url TEXT NOT NULL,
+				channel_type VARCHAR(64) NOT NULL DEFAULT 'anthropic',
+				codex_credential TEXT,
 				priority INT NOT NULL DEFAULT 0,
 				enabled SMALLINT NOT NULL DEFAULT 1,
 				cooldown_until BIGINT NOT NULL DEFAULT 0,
@@ -1218,6 +1355,12 @@ func TestPostgres(t *testing.T) {
 			)
 		`); err != nil {
 			t.Fatalf("create legacy channels table: %v", err)
+		}
+		if _, err := env.db.Exec(`
+			INSERT INTO channels(name, url, channel_type, models, model_redirects, created_at, updated_at)
+			VALUES('legacy-codex-column', 'https://legacy.example.com', 'codex', '[]', '{}', 1, 1)
+		`); err != nil {
+			t.Fatalf("insert legacy channel: %v", err)
 		}
 
 		store, err := CreatePostgresStoreForTest(env.dsn)
@@ -1238,6 +1381,52 @@ func TestPostgres(t *testing.T) {
 			if nullable != "YES" {
 				t.Fatalf("channels.%s is_nullable=%q, want YES", column, nullable)
 			}
+		}
+
+		var channelID int64
+		var channelType, authType string
+		var credential sql.NullString
+		if err := env.db.QueryRow(`
+			SELECT id, channel_type, auth_type, oauth_credential
+			FROM channels WHERE name = 'legacy-codex-column'
+		`).Scan(&channelID, &channelType, &authType, &credential); err != nil {
+			t.Fatalf("read migrated legacy channel: %v", err)
+		}
+		if channelType != "codex" || authType != model.AuthTypeAPIKey || credential.Valid {
+			t.Fatalf("migrated auth fields=(%q, %q, %v)", channelType, authType, credential)
+		}
+
+		var credentialNullable string
+		var credentialDefault sql.NullString
+		if err := env.db.QueryRow(`
+			SELECT is_nullable, column_default
+			FROM information_schema.columns
+			WHERE table_schema=current_schema() AND table_name='channels' AND column_name='oauth_credential'
+		`).Scan(&credentialNullable, &credentialDefault); err != nil {
+			t.Fatalf("read oauth_credential definition: %v", err)
+		}
+		if credentialNullable != "YES" || credentialDefault.Valid {
+			t.Fatalf("oauth_credential nullable=%q default=%v, want nullable without default", credentialNullable, credentialDefault)
+		}
+		var legacyColumnCount int
+		if err := env.db.QueryRow(`
+			SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_schema=current_schema() AND table_name='channels' AND column_name='codex_credential'
+		`).Scan(&legacyColumnCount); err != nil {
+			t.Fatalf("check legacy credential column: %v", err)
+		}
+		if legacyColumnCount != 0 {
+			t.Fatalf("codex_credential column still exists")
+		}
+		loaded, err := store.GetConfig(ctx, channelID)
+		if err != nil {
+			t.Fatalf("load migrated channel through store: %v", err)
+		}
+		if loaded.OAuthCredential != "" {
+			t.Fatalf("store OAuthCredential=%q, want empty", loaded.OAuthCredential)
+		}
+		if err := migratePostgres(ctx, env.db); err != nil {
+			t.Fatalf("second legacy channels migration: %v", err)
 		}
 
 		created, err := store.CreateConfig(ctx, &model.Config{

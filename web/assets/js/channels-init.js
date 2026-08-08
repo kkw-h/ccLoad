@@ -33,6 +33,7 @@ function saveChannelsFilters() {
   try {
     localStorage.setItem(CHANNELS_FILTER_KEY, JSON.stringify({
       status: filters.status,
+      authType: filters.authType,
       model: filters.model,
       modelExact: filters.modelExact,
       search: filters.search,
@@ -117,8 +118,8 @@ function initChannelsPageActions() {
   if (typeof initChannelEditorActions === 'function') {
     initChannelEditorActions();
   }
-  if (typeof initBatchRefreshOptions === 'function') {
-    initBatchRefreshOptions();
+  if (typeof setupOAuthActions === 'function') {
+    setupOAuthActions();
   }
 
   if (typeof window.initDelegatedActions === 'function') {
@@ -133,9 +134,11 @@ function initChannelsPageActions() {
         'batch-enable-channels': () => batchEnableSelectedChannels(),
         'batch-disable-channels': () => batchDisableSelectedChannels(),
         'batch-delete-channels': () => batchDeleteSelectedChannels(),
+        'batch-refresh-oauth-usage': () => batchRefreshSelectedOAuthUsage(),
         'batch-refresh-channels-merge': () => batchRefreshSelectedChannelsMerge(),
         'batch-refresh-channels-replace': () => batchRefreshSelectedChannelsReplace(),
         'batch-set-protocol-mode': () => batchSetSelectedChannelsProtocolMode(),
+        'batch-set-cost-multiplier': () => batchSetSelectedChannelsCostMultiplier(),
         'clear-selected-channels': () => clearSelectedChannels(),
         'close-test-modal': () => closeTestModal(),
         'run-channel-test': () => runChannelTest(),
@@ -164,28 +167,37 @@ function initChannelsPageActions() {
     jumpPageInput.dataset.bound = '1';
   }
 
-  // 每页显示数量选择器
-  const pageSizeSelect = document.getElementById('channels_page_size');
-  if (pageSizeSelect && !pageSizeSelect.dataset.bound) {
-    pageSizeSelect.value = String(channelsPageSize);
-    pageSizeSelect.addEventListener('change', (event) => {
-      const newSize = parseInt(event.target.value, 10);
-      if (newSize > 0) {
-        channelsPageSize = newSize;
-        localStorage.setItem('channels.pageSize', String(newSize));
-        channelsCurrentPage = 1;
-        saveChannelsFilters();
-        loadChannels();
+  // 每页显示数量输入框
+  const pageSizeInput = document.getElementById('channels_page_size');
+  if (pageSizeInput && !pageSizeInput.dataset.bound) {
+    const applyPageSize = () => {
+      const newSize = normalizeChannelsPageSize(pageSizeInput.value);
+      pageSizeInput.value = String(newSize);
+      localStorage.setItem('channels.pageSize', String(newSize));
+      if (newSize === channelsPageSize) return;
+
+      channelsPageSize = newSize;
+      channelsCurrentPage = 1;
+      saveChannelsFilters();
+      loadChannels();
+    };
+
+    pageSizeInput.value = String(channelsPageSize);
+    pageSizeInput.addEventListener('change', applyPageSize);
+    pageSizeInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        applyPageSize();
       }
     });
-    pageSizeSelect.dataset.bound = '1';
+    pageSizeInput.dataset.bound = '1';
   }
 }
 
 function applyChannelsAccessMode() {
   const readOnly = isTokenChannelsReadOnly();
   document.body.classList.toggle('channels-readonly', readOnly);
-  for (const id of ['addChannelBtn', 'exportCsvBtn', 'importCsvBtn', 'batchFloatingMenu']) {
+  for (const id of ['addChannelBtn', 'oauthLoginBtn', 'oauthCredentialImportBtn', 'exportCsvBtn', 'importCsvBtn', 'batchFloatingMenu']) {
     const el = document.getElementById(id);
     if (el) el.hidden = readOnly;
   }
@@ -220,12 +232,19 @@ window.initPageBootstrap({
     const urlChannelId = new URLSearchParams(location.search).get('id');
     if (urlChannelId) {
       filters.status = 'all';
+      filters.authType = 'all';
       filters.model = 'all';
       filters.modelExact = false;
       filters.search = targetChannel?.name || '';
       filters.searchExact = Boolean(filters.search);
       channelsCurrentPage = 1;
       document.getElementById('statusFilter').value = 'all';
+      if (typeof channelAuthTypeFilterCombobox !== 'undefined' && channelAuthTypeFilterCombobox) {
+        channelAuthTypeFilterCombobox.setValue('all', channelAuthTypeFilterLabel('all'));
+      } else {
+        const authTypeFilterEl = document.getElementById('channelAuthTypeFilter');
+        if (authTypeFilterEl) authTypeFilterEl.value = channelAuthTypeFilterLabel('all');
+      }
       if (typeof modelFilterCombobox !== 'undefined' && modelFilterCombobox) {
         modelFilterCombobox.setValue('all', modelFilterInputValueFromFilterValue('all'));
       } else {
@@ -239,11 +258,18 @@ window.initPageBootstrap({
       }
     } else if (savedFilters) {
       filters.status = savedFilters.status || 'all';
+      filters.authType = ['api_key', 'codex_oauth', 'antigravity_oauth', 'xai_oauth'].includes(savedFilters.authType) ? savedFilters.authType : 'all';
       filters.model = savedFilters.model || 'all';
       filters.modelExact = filters.model !== 'all' && savedFilters.modelExact !== false;
       filters.search = savedFilters.search || '';
       filters.searchExact = savedFilters.searchExact === true;
       document.getElementById('statusFilter').value = filters.status;
+      if (typeof channelAuthTypeFilterCombobox !== 'undefined' && channelAuthTypeFilterCombobox) {
+        channelAuthTypeFilterCombobox.setValue(filters.authType, channelAuthTypeFilterLabel(filters.authType));
+      } else {
+        const authTypeFilterEl = document.getElementById('channelAuthTypeFilter');
+        if (authTypeFilterEl) authTypeFilterEl.value = channelAuthTypeFilterLabel(filters.authType);
+      }
       if (typeof modelFilterCombobox !== 'undefined' && modelFilterCombobox) {
         modelFilterCombobox.setValue(filters.model, modelFilterInputValueFromFilterValue(filters.model));
       } else {
@@ -276,6 +302,7 @@ window.initPageBootstrap({
 
     window.i18n.onLocaleChange(() => {
       renderChannels();
+      updateChannelAuthTypeOptions();
       updateModelOptions();
       updateChannelsPagination();
     });

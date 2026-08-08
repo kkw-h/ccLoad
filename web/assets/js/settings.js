@@ -7,13 +7,50 @@ let runtimeMetricsPreviousFocus = null;
 let globalCooldownRulesPreviousFocus = null;
 
 const globalCooldownRulesSettingKey = 'global_cooldown_detection_rules';
+const containerImageManagedDisabledReason = 'container_image_managed';
+const advancedSettingKeys = new Set([
+  globalCooldownRulesSettingKey,
+  'auto_refresh_interval_seconds',
+  'model_catalog_sync_interval_hours',
+  'model_fuzzy_match'
+]);
 
 const byteSettingKeys = new Set([
   'max_body_bytes',
   'max_image_body_bytes',
   'responses_ws_max_transcript_bytes'
 ]);
+const oauthBaseURLSettingKeys = new Set([
+  'codex_base_url',
+  'xai_base_url',
+  'antigravity_url'
+]);
+const oauthBaseURLPlaceholders = new Map([
+  ['CODEX_BASE_URL', 'https://chatgpt.com/backend-api/codex/responses'],
+  ['XAI_BASE_URL', 'https://cli-chat-proxy.grok.com/v1'],
+  ['ANTIGRAVITY_URL', 'https://daily-cloudcode-pa.googleapis.com']
+]);
 const bytesPerM = 1024 * 1024;
+
+const selectSettingOptions = new Map([
+  ['auto_update_channel', [
+    { value: 'stable', labelKey: 'settings.updateChannel.stable' },
+    { value: 'preview', labelKey: 'settings.updateChannel.preview' }
+  ]],
+  ['channel_stats_range', [
+    { value: 'today', labelKey: 'index.timeRange.today' },
+    { value: 'yesterday', labelKey: 'index.timeRange.yesterday' },
+    { value: 'day_before_yesterday', labelKey: 'index.timeRange.dayBeforeYesterday' },
+    { value: 'this_week', labelKey: 'index.timeRange.thisWeek' },
+    { value: 'last_week', labelKey: 'index.timeRange.lastWeek' },
+    { value: 'this_month', labelKey: 'index.timeRange.thisMonth' },
+    { value: 'last_month', labelKey: 'index.timeRange.lastMonth' }
+  ]],
+  ['log_channel_click_action', [
+    { value: 'edit', labelKey: 'settings.logChannelClickAction.edit' },
+    { value: 'navigate', labelKey: 'settings.logChannelClickAction.navigate' }
+  ]]
+]);
 
 function settingValueForDisplay(key, value) {
   const normalizedValue = String(value ?? '');
@@ -430,9 +467,10 @@ function getSettingGroupInfo(key) {
   const k = String(key || '').toLowerCase();
 
   const defs = [
+    { id: 'advanced', nameKey: 'settings.group.advanced', order: 70, match: () => advancedSettingKeys.has(k) },
     { id: 'channel', nameKey: 'settings.group.channel', order: 10, match: () => k.startsWith('channel_') || k === 'max_key_retries' },
     { id: 'model', nameKey: 'settings.group.model', order: 15, match: () => k.startsWith('model_') },
-    { id: 'upstream-connection', nameKey: 'settings.group.upstreamConnection', order: 19, match: () => k === 'upstream_connection_reuse_limit_seconds' },
+    { id: 'upstream-connection', nameKey: 'settings.group.upstreamConnection', order: 19, match: () => k === 'upstream_connection_reuse_limit_seconds' || oauthBaseURLSettingKeys.has(k) },
     { id: 'websocket', nameKey: 'settings.group.websocket', order: 25, match: () => k.startsWith('responses_ws_') },
     { id: 'stream-timeout', nameKey: 'settings.group.streamTimeout', order: 20, match: () => k === 'stream_timeout' || k.endsWith('_first_byte_timeout') },
     { id: 'non-stream-timeout', nameKey: 'settings.group.nonStreamTimeout', order: 21, match: () => k === 'non_stream_timeout' || k.endsWith('_non_stream_timeout') },
@@ -441,7 +479,7 @@ function getSettingGroupInfo(key) {
     { id: 'cooldown', nameKey: 'settings.group.cooldown', order: 40, match: () => k.startsWith('cooldown_') },
     { id: 'log', nameKey: 'settings.group.log', order: 50, match: () => k.startsWith('log_') || k.startsWith('debug_') },
     { id: 'access', nameKey: 'settings.group.access', order: 60, match: () => k.includes('auth_') },
-    { id: 'advanced', nameKey: 'settings.group.advanced', order: 70, match: () => k === globalCooldownRulesSettingKey },
+    { id: 'update', nameKey: 'settings.group.update', order: 65, match: () => k.startsWith('auto_update_') },
   ];
 
   for (const d of defs) {
@@ -453,6 +491,9 @@ function getSettingGroupInfo(key) {
 function getSettingOrder(key) {
   const orders = {
     upstream_connection_reuse_limit_seconds: 90,
+    codex_base_url: 91,
+    xai_base_url: 92,
+    antigravity_url: 93,
     upstream_first_byte_timeout: 100,
     stream_timeout: 101,
     non_stream_timeout: 102,
@@ -557,7 +598,8 @@ function renderSettings(settings) {
   for (const g of groups) {
     const groupRow = TemplateEngine.render('tpl-setting-group-row', {
       groupId: g.id,
-      groupName: g.name
+      groupName: g.name,
+      groupNoticeHtml: renderSettingGroupNotice(g)
     });
     if (groupRow) tbody.appendChild(groupRow);
 
@@ -572,6 +614,7 @@ function renderSettings(settings) {
         key: s.key,
         description: description,
         inputHtml: renderInput({ ...s, value: displayValue }),
+        resetDisabledAttributes: settingDisabledAttributes(s),
         mobileLabelDescription: t('settings.configItem'),
         mobileLabelValue: t('settings.currentValue'),
         mobileLabelActions: t('common.actions')
@@ -579,6 +622,28 @@ function renderSettings(settings) {
       if (row) tbody.appendChild(row);
     }
   }
+}
+
+function renderSettingGroupNotice(group) {
+  const containerManaged = group.id === 'update' && group.settings.some((setting) => (
+    setting.editable === false && setting.disabled_reason === containerImageManagedDisabledReason
+  ));
+  if (!containerManaged) return '';
+
+  return `
+    <div class="settings-group-notice" role="note">
+      <p>${escapeHtml(t('settings.update.containerManaged'))}</p>
+      <ul>
+        <li>${escapeHtml(t('settings.update.stableImage'))}: <code>ghcr.io/caidaoli/ccload:latest</code></li>
+        <li>${escapeHtml(t('settings.update.betaImage'))}: <code>ghcr.io/caidaoli/ccload:beta</code></li>
+      </ul>
+      <p>${escapeHtml(t('settings.update.applyImage'))}</p>
+      <code class="settings-group-notice-command">docker compose pull &amp;&amp; docker compose up -d</code>
+    </div>`;
+}
+
+function settingDisabledAttributes(setting) {
+  return setting.editable === false ? 'disabled' : '';
 }
 
 // 初始化事件委托（替代 inline onclick）
@@ -602,7 +667,7 @@ function initSettingsEventDelegation() {
 
   // 输入变更
   tbody.addEventListener('change', (e) => {
-    const input = e.target.closest('input');
+    const input = e.target.closest('input, select');
     if (input) markChanged(input);
   });
 }
@@ -610,13 +675,17 @@ function initSettingsEventDelegation() {
 function renderInput(setting) {
   const safeKey = escapeHtml(setting.key);
   const safeValue = escapeHtml(setting.value);
+  const placeholder = oauthBaseURLPlaceholders.get(setting.key);
+  const placeholderAttribute = placeholder ? `placeholder="${escapeHtml(placeholder)}"` : '';
+  const wideTextInput = setting.key === 'channel_test_content' || oauthBaseURLPlaceholders.has(setting.key);
+  const disabledAttributes = settingDisabledAttributes(setting);
 
   if (setting.key === globalCooldownRulesSettingKey) {
     const count = globalCooldownRuleCount(setting.value);
     return `
       <div class="global-cooldown-rules-control">
         <input type="hidden" id="${safeKey}" value="${safeValue}">
-        <button type="button" class="btn btn-secondary" data-action="edit-global-cooldown-rules">
+        <button type="button" class="btn btn-secondary" data-action="edit-global-cooldown-rules" ${disabledAttributes}>
           ${escapeHtml(t('settings.globalCooldownRules.edit'))}
         </button>
         <span id="global-cooldown-rules-summary" class="global-cooldown-rules-summary">
@@ -625,12 +694,19 @@ function renderInput(setting) {
       </div>`;
   }
 
-  if (byteSettingKeys.has(setting.key)) {
+  const selectOptions = selectSettingOptions.get(setting.key);
+  if (selectOptions) {
+    const optionsHtml = selectOptions.map(({ value, labelKey }) => (
+      `<option value="${value}" ${setting.value === value ? 'selected' : ''}>${escapeHtml(t(labelKey))}</option>`
+    )).join('');
     return `
-      <span class="settings-input-with-unit">
-        <input type="number" step="any" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number">
-        <span class="settings-input-unit">M</span>
-      </span>`;
+      <select id="${safeKey}" class="settings-input settings-input--select" ${disabledAttributes}>
+        ${optionsHtml}
+      </select>`;
+  }
+
+  if (byteSettingKeys.has(setting.key)) {
+    return `<input type="number" step="any" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${disabledAttributes}>`;
   }
 
   switch (setting.value_type) {
@@ -639,19 +715,19 @@ function renderInput(setting) {
       return `
         <div class="settings-bool-group">
           <label class="settings-bool-option">
-            <input type="radio" name="${safeKey}" value="true" ${isTrue ? 'checked' : ''}> ${t('common.enable')}
+            <input type="radio" name="${safeKey}" value="true" ${isTrue ? 'checked' : ''} ${disabledAttributes}> ${t('common.enable')}
           </label>
           <label class="settings-bool-option">
-            <input type="radio" name="${safeKey}" value="false" ${!isTrue ? 'checked' : ''}> ${t('common.disable')}
+            <input type="radio" name="${safeKey}" value="false" ${!isTrue ? 'checked' : ''} ${disabledAttributes}> ${t('common.disable')}
           </label>
         </div>`;
     case 'int':
     case 'duration':
-      return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number">`;
+      return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${disabledAttributes}>`;
     case 'float':
-      return `<input type="number" step="any" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number">`;
+      return `<input type="number" step="any" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${disabledAttributes}>`;
     default:
-      return `<input type="text" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--text">`;
+      return `<input type="text" id="${safeKey}" value="${safeValue}" ${placeholderAttribute} class="settings-input settings-input--text${wideTextInput ? ' settings-input--wide' : ''}" ${disabledAttributes}>`;
   }
 }
 

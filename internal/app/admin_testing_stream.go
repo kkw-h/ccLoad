@@ -48,13 +48,10 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 		writeChatErrorEvent(c, "failed to load api keys")
 		return
 	}
-	requestAPIKey := strings.TrimSpace(testReq.APIKey)
-	if len(apiKeys) == 0 && requestAPIKey == "" {
-		writeChatErrorEvent(c, "渠道未配置有效的 API Key")
-		return
-	}
-
-	keySelection, err := s.selectChannelTestKey(apiKeys, testReq.KeyIndex, requestAPIKey)
+	persistedCfg := cfg
+	cfg, keySelection, err := s.prepareChannelTestAuth(
+		c.Request.Context(), cfg, apiKeys, testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
+	)
 	if err != nil {
 		writeChatErrorEvent(c, err.Error())
 		return
@@ -83,7 +80,10 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 		selector = s.urlSelector
 	}
 	orderedURLs := orderURLsWithSelector(selector, cfg.ID, urls)
-	if cfg.GetProtocolTransformMode() == model.ProtocolTransformModeLocal {
+	switch cfg.GetProtocolTransformMode() {
+	case model.ProtocolTransformModeAuto:
+		orderedURLs = prioritizeAutomaticProtocolURLs(orderedURLs, cfg.URLs)
+	case model.ProtocolTransformModeLocal:
 		orderedURLs = prioritizeDeclaredProtocolURLs(orderedURLs, cfg.URLs)
 	}
 
@@ -111,11 +111,11 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 		capabilityExhausted := false
 		for protocolIdx, upstreamProtocol := range upstreamProtocols {
 			attempt := s.streamChatWithURLForProtocol(
-				c, cfg, keySelection.apiKey, &testReq, clientProtocol, upstreamProtocol, entry.url, originalModel,
+				c, cfg, keySelection.requestCredential, &testReq, clientProtocol, upstreamProtocol, entry.url, originalModel,
 			)
 			if attempt.handled {
 				// Write chat log from stream result
-				s.writeChatStreamLog(c, cfg, &testReq, keySelection.apiKey, attempt.streamResult, originalModel)
+				s.writeChatStreamLog(c, persistedCfg, &testReq, keySelection.apiKey, attempt.streamResult, originalModel)
 				return
 			}
 			lastResult = attempt.result
@@ -142,7 +142,7 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 
 	if lastResult != nil {
 		writeChatErrorEvent(c, chatErrorMessageFromResult(lastResult))
-		s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, channelTestActualModel(lastResult, testReq.Model), keySelection.apiKey, c.ClientIP(), testReq.ThinkingEffort, lastResult))
+		s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(persistedCfg, model.LogSourceManualChat, originalModel, channelTestActualModel(lastResult, testReq.Model), keySelection.apiKey, c.ClientIP(), testReq.ThinkingEffort, lastResult))
 		return
 	}
 	writeChatErrorEvent(c, "渠道测试失败: 未找到可用URL")
@@ -269,7 +269,7 @@ func (s *Server) streamChatWithURLForProtocol(
 	}
 
 	contentType := resp.Header.Get("Content-Type")
-	isSSE := strings.Contains(strings.ToLower(contentType), "text/event-stream")
+	isSSE := responseIsSSE(resp, requestPlan.upstreamStreaming)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
@@ -316,7 +316,7 @@ func (s *Server) streamChatWithURLForProtocol(
 	}
 
 	var streamErr error
-	if clientProtocol == requestPlan.upstreamProtocol {
+	if clientProtocol == requestPlan.upstreamProtocol && !requestPlan.antigravityOAuth {
 		// 原生协议：直接透传 SSE，提取 delta 文本
 		streamErr = streamChatNativeWithFirstContent(c, resp.Body, markFirstContent, sr)
 	} else {
@@ -607,19 +607,39 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 	src := readerWithCloser{Reader: resp.Body, Closer: resp.Body}
 	return streamTransformSSEEvents(ctx, src, c.Writer,
 		func(rawEvent []byte) error {
+			parserEvent := rawEvent
+			if requestPlan.antigravityOAuth {
+				var err error
+				parserEvent, err = unwrapAntigravitySSEEvent(rawEvent)
+				if err != nil {
+					return err
+				}
+			}
 			if sr != nil && sr.usageParser != nil {
-				_ = sr.usageParser.Feed(rawEvent)
+				_ = sr.usageParser.Feed(parserEvent)
 			}
 			return nil
 		},
 		func(rawEvent []byte) ([][]byte, error) {
+			translatedRequestBody := requestPlan.requestBody
+			if requestPlan.antigravityOAuth {
+				var err error
+				rawEvent, err = unwrapAntigravitySSEEvent(rawEvent)
+				if err != nil {
+					return nil, err
+				}
+				translatedRequestBody, err = unwrapAntigravityRequest(requestPlan.requestBody)
+				if err != nil {
+					return nil, err
+				}
+			}
 			translated, err := s.protocolRegistry.TranslateResponseStream(
 				ctx,
 				protocol.Protocol(requestPlan.upstreamProtocol),
 				protocol.Protocol(requestPlan.clientProtocol),
 				testReq.Model,
 				requestPlan.clientBody,
-				requestPlan.requestBody,
+				translatedRequestBody,
 				rawEvent,
 				&state,
 			)

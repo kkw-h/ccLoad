@@ -32,7 +32,7 @@ const (
 	responsesWebsocketRetryCode          = "upstream_unavailable"
 	responsesWebsocketRetryMessage       = "upstream channel failed before response output; retry the request"
 	responsesWebsocketInterruptedCode    = "upstream_stream_interrupted"
-	responsesWebsocketInterruptedMessage = "upstream response was interrupted after a complete tool call; reconnect and replay the full conversation state"
+	responsesWebsocketInterruptedMessage = "upstream response was interrupted; reconnect and replay the full conversation state"
 )
 
 // responsesWebsocketUpgradePaths lists every downstream path that terminates a
@@ -200,15 +200,19 @@ func (s *Server) HandleResponsesWebsocket(c *gin.Context) {
 				continue
 			}
 			turnResult, errTurn := s.executeResponsesWebsocketTurn(
-				connectionCtx, c, conn, requestBody, nativeRequestBody, executionSession.upstream, allowLocalPrewarm,
+				connectionCtx, c, conn, requestBody, nativeRequestBody, executionSession, allowLocalPrewarm,
 			)
 			if errTurn != nil {
 				if turnResult.interrupted {
 					s.responsesExecutionSessions.commit(executionSession, requestBody, turnResult)
 				}
-				executionSession.releaseTurn()
 				var retryErr *responsesWebsocketClientRetryError
-				if errors.As(errTurn, &retryErr) {
+				clientRetry := errors.As(errTurn, &retryErr)
+				if clientRetry {
+					executionSession.transcript.requireReplacementReplay()
+				}
+				executionSession.releaseTurn()
+				if clientRetry {
 					if errWrite := writeResponsesWebsocketClientRetryError(conn, retryErr); errWrite != nil {
 						return
 					}
@@ -358,9 +362,10 @@ func (s *Server) executeResponsesWebsocketTurn(
 	conn *websocket.Conn,
 	requestBody []byte,
 	nativeRequestBody []byte,
-	nativeCodexWS *codexUpstreamWebsocketSession,
+	executionSession *responsesExecutionSession,
 	allowLocalPrewarm bool,
 ) (responsesWebsocketTurnResult, error) {
+	nativeCodexWS := executionSession.upstream
 	modelName := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
 	if modelName == "" {
 		return responsesWebsocketTurnResult{}, errors.New("missing model in normalized websocket request")
@@ -406,8 +411,8 @@ func (s *Server) executeResponsesWebsocketTurn(
 	if len(candidates) == 0 {
 		return responsesWebsocketTurnResult{}, errors.New("no available upstream")
 	}
-	if pinnedTarget, ok := nativeCodexWS.affinitySnapshot(); ok {
-		candidates = prioritizePinnedCodexChannel(candidates, pinnedTarget.channelID)
+	if channelID, ok := executionSession.routeChannelSnapshot(); ok {
+		candidates = prioritizePinnedCodexChannel(candidates, channelID)
 	}
 	if allowLocalPrewarm && responsesWebsocketGenerateDisabled(requestBody) &&
 		!isNativeCodexWebsocketCandidate(candidates[0]) {
@@ -436,6 +441,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 		clientIP:        c.ClientIP(),
 		startTime:       startTime,
 		thinkingEffort:  thinkingEffort,
+		routingSession:  executionSession,
 		nativeCodexWS:   nativeCodexWS,
 		nativeCodexBody: bytes.Clone(nativeRequestBody),
 	}
@@ -489,17 +495,20 @@ func (s *Server) executeResponsesWebsocketTurn(
 			}
 			interruptedOutput := bridgeWriter.collectedOutput()
 			pendingToolCallIDs := responsesWebsocketPendingToolCallIDs(interruptedOutput)
+			turnResult := responsesWebsocketTurnResult{}
 			if len(pendingToolCallIDs) > 0 {
-				return responsesWebsocketTurnResult{
-						completedOutput:    interruptedOutput,
-						pendingToolCallIDs: pendingToolCallIDs,
-						interrupted:        true,
-					}, &responsesWebsocketClientRetryError{
-						code:    responsesWebsocketInterruptedCode,
-						message: responsesWebsocketInterruptedMessage,
-					}
+				// Preserve completed tool calls in the execution transcript so the
+				// client's matching tool output is not orphaned on reconnect.
+				turnResult = responsesWebsocketTurnResult{
+					completedOutput:    interruptedOutput,
+					pendingToolCallIDs: pendingToolCallIDs,
+					interrupted:        true,
+				}
 			}
-			return responsesWebsocketTurnResult{}, errors.New("upstream stream closed before response.completed")
+			return turnResult, &responsesWebsocketClientRetryError{
+				code:    responsesWebsocketInterruptedCode,
+				message: responsesWebsocketInterruptedMessage,
+			}
 		}
 		return responsesWebsocketTurnResult{
 			completedOutput:     bytes.Clone(bridgeWriter.completedOutput),
@@ -534,7 +543,7 @@ func responsesWebsocketGenerateDisabled(payload []byte) bool {
 }
 
 func isNativeCodexWebsocketCandidate(candidate *model.Config) bool {
-	return candidate != nil && candidate.Websockets &&
+	return candidate != nil && candidate.Websockets && !candidate.UsesXAIOAuth() &&
 		configCanUseUpstreamProtocol(candidate, protocol.Codex)
 }
 

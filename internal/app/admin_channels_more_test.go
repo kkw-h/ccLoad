@@ -2,16 +2,144 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
+	"ccLoad/internal/xaiauth"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestXAIChannelResponsesExposeOnlySafeOAuthMetadata(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	credential := &xaiauth.Credential{
+		Type: xaiauth.ChannelType, AuthKind: "oauth",
+		AccessToken: "xai-access-secret", RefreshToken: "xai-refresh-secret", IDToken: "xai-id-secret",
+		Expired: "2030-01-01T00:00:00Z", Email: "safe@example.com", Subject: "private-subject",
+		SubscriptionTier: "supergrok", EntitlementStatus: "active",
+	}
+	credentialJSON, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "xAI safe response", AuthType: model.AuthTypeXAIOAuth, OAuthCredential: credentialJSON,
+		URLs:    model.ChannelURLs{{URL: "https://cli-chat-proxy.grok.com", Protocols: []string{"codex"}}},
+		Enabled: true, ModelEntries: []model.ModelEntry{{Model: "grok-4.5"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertSafe := func(name, body string) {
+		t.Helper()
+		for _, secret := range []string{"xai-access-secret", "xai-refresh-secret", "xai-id-secret", "private-subject", credentialJSON} {
+			if strings.Contains(body, secret) {
+				t.Fatalf("%s leaked %q: %s", name, secret, body)
+			}
+		}
+	}
+
+	listContext, listResponse := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+	server.HandleChannels(listContext)
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", listResponse.Code, listResponse.Body.String())
+	}
+	assertSafe("list", listResponse.Body.String())
+	list := mustParseAPIResponse[[]ChannelWithCooldown](t, listResponse.Body.Bytes())
+	if len(list.Data) != 1 || list.Data[0].XAIEmail != "safe@example.com" ||
+		list.Data[0].GetAuthType() != model.AuthTypeXAIOAuth ||
+		list.Data[0].XAISubscriptionTier != "supergrok" || list.Data[0].XAIEntitlementStatus != "active" {
+		t.Fatalf("list metadata=%+v", list.Data)
+	}
+
+	path := fmt.Sprintf("/admin/channels/%d", created.ID)
+	detailContext, detailResponse := newTestContext(t, newRequest(http.MethodGet, path, nil))
+	detailContext.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", created.ID)}}
+	server.HandleChannelByID(detailContext)
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detailResponse.Code, detailResponse.Body.String())
+	}
+	assertSafe("detail", detailResponse.Body.String())
+	detail := mustParseAPIResponse[ChannelWithCooldown](t, detailResponse.Body.Bytes())
+	if detail.Data.GetAuthType() != model.AuthTypeXAIOAuth || detail.Data.XAIEmail != "safe@example.com" ||
+		detail.Data.XAISubscriptionTier != "supergrok" || detail.Data.XAIEntitlementStatus != "active" {
+		t.Fatalf("detail metadata=%+v", detail.Data)
+	}
+
+	editorContext, editorResponse := newTestContext(t, newRequest(http.MethodGet, path+"/editor", nil))
+	editorContext.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", created.ID)}}
+	server.HandleChannelEditor(editorContext)
+	if editorResponse.Code != http.StatusOK {
+		t.Fatalf("editor status=%d body=%s", editorResponse.Code, editorResponse.Body.String())
+	}
+	editor := mustParseAPIResponse[struct {
+		Channel         ChannelWithCooldown `json:"channel"`
+		Keys            []*model.APIKey     `json:"keys"`
+		OAuthCredential json.RawMessage     `json:"oauth_credential"`
+	}](t, editorResponse.Body.Bytes())
+	if editor.Data.Keys == nil || len(editor.Data.Keys) != 0 {
+		t.Fatalf("editor keys=%#v, want []", editor.Data.Keys)
+	}
+	if string(editor.Data.OAuthCredential) != credentialJSON {
+		t.Fatalf("editor oauth_credential=%s, want canonical credential %s", editor.Data.OAuthCredential, credentialJSON)
+	}
+	if editor.Data.Channel.GetAuthType() != model.AuthTypeXAIOAuth || editor.Data.Channel.XAIEmail != "safe@example.com" ||
+		editor.Data.Channel.XAISubscriptionTier != "supergrok" || editor.Data.Channel.XAIEntitlementStatus != "active" {
+		t.Fatalf("editor metadata=%+v", editor.Data.Channel)
+	}
+
+	update := map[string]any{
+		"name": "xAI safe response updated", "auth_type": model.AuthTypeXAIOAuth,
+		"oauth_credential": `{"access_token":"replacement-secret"}`,
+		"urls":             []map[string]any{{"url": "https://cli-chat-proxy.grok.com", "protocols": []string{"codex"}}},
+		"models":           []map[string]any{{"model": "grok-4.5"}}, "enabled": true,
+	}
+	updateContext, updateResponse := newTestContext(t, newJSONRequest(t, http.MethodPut, path, update))
+	updateContext.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", created.ID)}}
+	server.HandleChannelByID(updateContext)
+	if updateResponse.Code != http.StatusConflict {
+		t.Fatalf("credential update status=%d body=%s", updateResponse.Code, updateResponse.Body.String())
+	}
+	persisted, err := store.GetConfig(context.Background(), created.ID)
+	if err != nil || persisted.OAuthCredential != credentialJSON {
+		t.Fatalf("persisted credential changed: err=%v config=%+v", err, persisted)
+	}
+}
+
+func TestXAIChannelEditorRejectsMalformedCredential(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	created, err := store.CreateConfig(context.Background(), &model.Config{
+		Name:            "xAI malformed credential",
+		AuthType:        model.AuthTypeXAIOAuth,
+		OAuthCredential: `{"type":"xai","access_token":`,
+		URLs:            model.ChannelURLs{{URL: "https://cli-chat-proxy.grok.com", Protocols: []string{"codex"}}},
+		Enabled:         true,
+		ModelEntries:    []model.ModelEntry{{Model: "grok-4.5"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := fmt.Sprintf("/admin/channels/%d/editor", created.ID)
+	editorContext, editorResponse := newTestContext(t, newRequest(http.MethodGet, path, nil))
+	editorContext.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", created.ID)}}
+	server.HandleChannelEditor(editorContext)
+	if editorResponse.Code != http.StatusInternalServerError {
+		t.Fatalf("editor status=%d body=%s", editorResponse.Code, editorResponse.Body.String())
+	}
+}
 
 func TestHandleDeleteAPIKey(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
@@ -397,7 +525,7 @@ func TestHandleBatchSetEnabled(t *testing.T) {
 	})
 }
 
-func TestHandleBatchSetProtocolTransformMode(t *testing.T) {
+func TestHandleBatchPatchChannels(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
@@ -421,56 +549,86 @@ func TestHandleBatchSetProtocolTransformMode(t *testing.T) {
 	c3 := createChannel("protocol-upstream", model.ProtocolTransformModeUpstream)
 
 	t.Run("invalid json", func(t *testing.T) {
-		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/channels/batch-protocol-mode", []byte(`{`)))
+		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/channels/batch-advanced", []byte(`{`)))
 
-		server.HandleBatchSetProtocolTransformMode(c)
+		server.HandleBatchPatchChannels(c)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
 		}
 	})
 
-	t.Run("missing mode", func(t *testing.T) {
-		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-protocol-mode", map[string]any{
+	t.Run("empty patch", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
 			"channel_ids": []int64{c1.ID},
 		}))
 
-		server.HandleBatchSetProtocolTransformMode(c)
+		server.HandleBatchPatchChannels(c)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
 		}
 	})
 
 	t.Run("invalid mode", func(t *testing.T) {
-		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-protocol-mode", map[string]any{
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
 			"channel_ids":             []int64{c1.ID},
 			"protocol_transform_mode": "invalid",
 		}))
 
-		server.HandleBatchSetProtocolTransformMode(c)
+		server.HandleBatchPatchChannels(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("negative cost multiplier", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
+			"channel_ids":     []int64{c1.ID},
+			"cost_multiplier": -0.01,
+		}))
+
+		server.HandleBatchPatchChannels(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("invalid model import", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
+			"channel_ids": []int64{c1.ID},
+			"models":      []model.ModelEntry{{Model: "new-model"}},
+		}))
+
+		server.HandleBatchPatchChannels(c)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
 		}
 	})
 
 	t.Run("empty channel ids", func(t *testing.T) {
-		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-protocol-mode", map[string]any{
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
 			"channel_ids":             []int64{},
 			"protocol_transform_mode": model.ProtocolTransformModeUpstream,
 		}))
 
-		server.HandleBatchSetProtocolTransformMode(c)
+		server.HandleBatchPatchChannels(c)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
 		}
 	})
 
 	t.Run("updates selected channels", func(t *testing.T) {
-		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-protocol-mode", map[string]any{
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
 			"channel_ids":             []int64{c1.ID, c2.ID, c3.ID, c2.ID, 99999},
 			"protocol_transform_mode": model.ProtocolTransformModeUpstream,
+			"cost_multiplier":         0.25,
+			"model_import_mode":       model.ModelImportModeAppend,
+			"models": []model.ModelEntry{
+				{Model: "m", RedirectModel: "ignored-duplicate"},
+				{Model: "new-model", RedirectModel: "upstream-model"},
+			},
 		}))
 
-		server.HandleBatchSetProtocolTransformMode(c)
+		server.HandleBatchPatchChannels(c)
 		if w.Code != http.StatusOK {
 			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
 		}
@@ -478,19 +636,18 @@ func TestHandleBatchSetProtocolTransformMode(t *testing.T) {
 		var resp struct {
 			Success bool `json:"success"`
 			Data    struct {
-				Mode          string  `json:"protocol_transform_mode"`
 				Total         int     `json:"total"`
-				Updated       int64   `json:"updated"`
+				Updated       int     `json:"updated"`
 				Unchanged     int     `json:"unchanged"`
 				NotFound      []int64 `json:"not_found"`
 				NotFoundCount int     `json:"not_found_count"`
 			} `json:"data"`
 		}
 		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
-		if !resp.Success || resp.Data.Mode != model.ProtocolTransformModeUpstream {
+		if !resp.Success {
 			t.Fatalf("unexpected response: %+v", resp)
 		}
-		if resp.Data.Total != 4 || resp.Data.Updated != 2 || resp.Data.Unchanged != 1 || resp.Data.NotFoundCount != 1 {
+		if resp.Data.Total != 4 || resp.Data.Updated != 3 || resp.Data.Unchanged != 0 || resp.Data.NotFoundCount != 1 {
 			t.Fatalf("unexpected summary: %+v", resp.Data)
 		}
 		if len(resp.Data.NotFound) != 1 || resp.Data.NotFound[0] != 99999 {
@@ -505,6 +662,74 @@ func TestHandleBatchSetProtocolTransformMode(t *testing.T) {
 			if cfg.GetProtocolTransformMode() != model.ProtocolTransformModeUpstream {
 				t.Fatalf("channel %d mode=%q, want %q", channelID, cfg.GetProtocolTransformMode(), model.ProtocolTransformModeUpstream)
 			}
+			if cfg.CostMultiplier != 0.25 {
+				t.Fatalf("channel %d cost_multiplier=%v, want 0.25", channelID, cfg.CostMultiplier)
+			}
+			if len(cfg.ModelEntries) != 2 || cfg.ModelEntries[1].Model != "new-model" || cfg.ModelEntries[1].RedirectModel != "upstream-model" {
+				t.Fatalf("channel %d models=%+v", channelID, cfg.ModelEntries)
+			}
+		}
+	})
+
+	t.Run("replace models", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
+			"channel_ids":       []int64{c1.ID, c2.ID},
+			"model_import_mode": model.ModelImportModeReplace,
+			"models":            []model.ModelEntry{{Model: "replacement"}},
+		}))
+
+		server.HandleBatchPatchChannels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		for _, channelID := range []int64{c1.ID, c2.ID} {
+			cfg, err := store.GetConfig(ctx, channelID)
+			if err != nil {
+				t.Fatalf("GetConfig(%d): %v", channelID, err)
+			}
+			if len(cfg.ModelEntries) != 1 || cfg.ModelEntries[0].Model != "replacement" {
+				t.Fatalf("channel %d models=%+v", channelID, cfg.ModelEntries)
+			}
+		}
+	})
+
+	t.Run("imports models into OAuth and API key channels", func(t *testing.T) {
+		const credential = `{"type":"antigravity","access_token":"winner","refresh_token":"winner-rt"}`
+		oauth, err := store.CreateConfig(ctx, &model.Config{
+			Name: "batch-oauth", AuthType: model.AuthTypeAntigravityOAuth, OAuthCredential: credential,
+			URLs: model.ChannelURLs{{URL: "https://batch-oauth.example.com"}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "oauth-existing"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		apiKey := createChannel("batch-api-key", model.ProtocolTransformModeAuto)
+
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
+			"channel_ids":       []int64{oauth.ID, apiKey.ID},
+			"model_import_mode": model.ModelImportModeAppend,
+			"models":            []model.ModelEntry{{Model: "imported-model", RedirectModel: "upstream-model"}},
+		}))
+
+		server.HandleBatchPatchChannels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		for _, channelID := range []int64{oauth.ID, apiKey.ID} {
+			persisted, getErr := store.GetConfig(ctx, channelID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if !persisted.SupportsModel("imported-model") {
+				t.Fatalf("channel %d models=%+v, want imported-model", channelID, persisted.ModelEntries)
+			}
+		}
+		persistedOAuth, err := store.GetConfig(ctx, oauth.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !persistedOAuth.UsesAntigravityOAuth() || persistedOAuth.OAuthCredential != credential {
+			t.Fatalf("OAuth identity changed: auth_type=%q credential=%q", persistedOAuth.GetAuthType(), persistedOAuth.OAuthCredential)
 		}
 	})
 }

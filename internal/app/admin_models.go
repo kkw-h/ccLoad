@@ -24,9 +24,11 @@ var fetchModelsHTTPStatusPattern = regexp.MustCompile(`HTTP\s+(\d{3})`)
 
 // FetchModelsRequest 获取模型列表请求参数
 type FetchModelsRequest struct {
-	URLs     model.ChannelURLs `json:"urls" binding:"required,min=1"`
-	Protocol string            `json:"protocol,omitempty"`
-	APIKey   string            `json:"api_key" binding:"required"`
+	URLs                   model.ChannelURLs `json:"urls" binding:"required,min=1"`
+	Protocol               string            `json:"protocol,omitempty"`
+	APIKeys                []string          `json:"api_keys" binding:"required,min=1"`
+	LowercaseModels        bool              `json:"lowercase_models,omitempty"`
+	StripModelSourcePrefix bool              `json:"strip_model_source_prefix,omitempty"`
 }
 
 // FetchModelsResponse 获取模型列表响应
@@ -88,19 +90,7 @@ func (s *Server) HandleFetchModels(c *gin.Context) {
 		return
 	}
 
-	// 3. 获取第一个已启用的 API Key（用于调用 Models API）
-	keys, err := s.store.GetAPIKeys(c.Request.Context(), channelID)
-	if err != nil {
-		RespondErrorMsg(c, http.StatusBadRequest, "该渠道没有可用的API Key")
-		return
-	}
-	apiKey := firstEnabledAPIKey(keys)
-	if apiKey == "" {
-		RespondErrorMsg(c, http.StatusBadRequest, "该渠道没有已启用的API Key")
-		return
-	}
-
-	response, err := s.fetchModelsWithURLFallback(c.Request.Context(), channel.ID, channel.URLs, c.Query("protocol"), apiKey)
+	response, err := s.fetchModelsForChannel(c.Request.Context(), channel, c.Query("protocol"))
 	if err != nil {
 		// [INFO] 修复：统一返回200，通过success字段区分成功/失败（上游错误是预期内的）
 		RespondErrorMsg(c, http.StatusOK, err.Error())
@@ -120,9 +110,9 @@ func (s *Server) HandleFetchModelsPreview(c *gin.Context) {
 	}
 
 	req.Protocol = strings.TrimSpace(req.Protocol)
-	req.APIKey = strings.TrimSpace(req.APIKey)
-	if req.APIKey == "" {
-		RespondErrorMsg(c, http.StatusBadRequest, "urls、api_key为必填字段")
+	req.APIKeys = normalizeModelFetchKeys(req.APIKeys)
+	if len(req.APIKeys) == 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "urls、api_keys为必填字段")
 		return
 	}
 
@@ -133,11 +123,17 @@ func (s *Server) HandleFetchModelsPreview(c *gin.Context) {
 		return
 	}
 
-	response, err := s.fetchModelsWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, req.APIKey)
+	response, err := s.fetchModelsWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, req.APIKeys)
 	if err != nil {
 		// [INFO] 修复：统一返回200，通过success字段区分成功/失败（上游错误是预期内的）
 		RespondErrorMsg(c, http.StatusOK, err.Error())
 		return
+	}
+	if req.LowercaseModels || req.StripModelSourcePrefix {
+		response.Models = normalizeModelEntriesForSave(response.Models, modelNormalizationOptions{
+			lowercaseModels:        req.LowercaseModels,
+			stripModelSourcePrefix: req.StripModelSourcePrefix,
+		})
 	}
 	RespondJSON(c, http.StatusOK, response)
 }
@@ -192,25 +188,7 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 		}
 		item.ChannelName = cfg.Name
 
-		keys, err := s.store.GetAPIKeys(ctx, channelID)
-		if err != nil {
-			item.Status = "failed"
-			item.Error = "该渠道没有可用的API Key"
-			failed++
-			results = append(results, item)
-			continue
-		}
-
-		apiKey := firstEnabledAPIKey(keys)
-		if apiKey == "" {
-			item.Status = "failed"
-			item.Error = "该渠道没有已启用的API Key"
-			failed++
-			results = append(results, item)
-			continue
-		}
-
-		resp, err := s.fetchModelsWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, apiKey)
+		resp, err := s.fetchModelsForChannel(ctx, cfg, overrideProtocol)
 		if err != nil {
 			item.Status = "failed"
 			item.Error = err.Error()
@@ -285,16 +263,245 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 	})
 }
 
-func firstEnabledAPIKey(keys []*model.APIKey) string {
+func availableModelFetchKeys(keys []*model.APIKey, now time.Time) []string {
+	apiKeys := make([]string, 0, len(keys))
+	var cooldownFallback *model.APIKey
 	for _, key := range keys {
-		if key == nil || key.Disabled {
+		if key == nil || key.Disabled || strings.TrimSpace(key.APIKey) == "" {
 			continue
 		}
-		if apiKey := strings.TrimSpace(key.APIKey); apiKey != "" {
-			return apiKey
+		if key.IsCoolingDown(now) {
+			if cooldownFallback == nil ||
+				key.CooldownUntil < cooldownFallback.CooldownUntil ||
+				(key.CooldownUntil == cooldownFallback.CooldownUntil && key.KeyIndex < cooldownFallback.KeyIndex) {
+				cooldownFallback = key
+			}
+			continue
+		}
+		apiKeys = append(apiKeys, key.APIKey)
+	}
+	apiKeys = normalizeModelFetchKeys(apiKeys)
+	if len(apiKeys) > 0 {
+		return apiKeys
+	}
+	if cooldownFallback != nil {
+		return []string{strings.TrimSpace(cooldownFallback.APIKey)}
+	}
+	return apiKeys
+}
+
+func normalizeModelFetchKeys(apiKeys []string) []string {
+	seen := make(map[string]struct{}, len(apiKeys))
+	normalized := make([]string, 0, len(apiKeys))
+	for _, apiKey := range apiKeys {
+		apiKey = strings.TrimSpace(apiKey)
+		if apiKey == "" {
+			continue
+		}
+		if _, exists := seen[apiKey]; exists {
+			continue
+		}
+		seen[apiKey] = struct{}{}
+		normalized = append(normalized, apiKey)
+	}
+	return normalized
+}
+
+func (s *Server) fetchModelsForChannel(ctx context.Context, cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("渠道不存在")
+	}
+	cfg = s.withOAuthBaseURLOverride(cfg)
+	if cfg.UsesXAIOAuth() {
+		return fetchXAIOAuthModels(cfg, overrideProtocol)
+	}
+	if cfg.UsesAntigravityOAuth() {
+		return s.fetchAntigravityModelsWithURLFallback(ctx, cfg, overrideProtocol)
+	}
+	if cfg.UsesCodexOAuth() {
+		return s.fetchCodexOAuthModels(ctx, cfg, overrideProtocol)
+	}
+
+	keys, err := s.store.GetAPIKeys(ctx, cfg.ID)
+	if err != nil {
+		return nil, fmt.Errorf("该渠道没有可用的API Key")
+	}
+	apiKeys := availableModelFetchKeys(keys, time.Now())
+	if len(apiKeys) == 0 {
+		return nil, fmt.Errorf("该渠道没有可用的API Key")
+	}
+	return s.fetchModelsWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, apiKeys)
+}
+
+func fetchXAIOAuthModels(cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
+	overrideProtocol = strings.ToLower(strings.TrimSpace(overrideProtocol))
+	if overrideProtocol != "" {
+		if !protocol.IsValid(protocol.Protocol(overrideProtocol)) {
+			return nil, fmt.Errorf("不支持的上游协议: %s", overrideProtocol)
+		}
+		if util.NormalizeProtocol(overrideProtocol) != util.ProtocolCodex {
+			return nil, fmt.Errorf("模型发现: xAI 仅支持 codex 协议")
 		}
 	}
-	return ""
+	models := make([]model.ModelEntry, len(xaiOAuthDefaultModels))
+	for i, name := range xaiOAuthDefaultModels {
+		models[i] = model.ModelEntry{Model: name, RedirectModel: name}
+	}
+	channelURL := ""
+	if len(cfg.URLs) > 0 {
+		channelURL = cfg.URLs[0].RuntimeURL()
+	}
+	return &FetchModelsResponse{
+		Models: models, Protocol: util.ProtocolCodex, Source: "predefined",
+		Debug: &FetchModelsDebug{
+			NormalizedProtocol: util.ProtocolCodex,
+			Fetcher:            "xai_oauth_catalog",
+			ChannelURL:         channelURL,
+		},
+	}, nil
+}
+
+// Antigravity 和 Codex 是产品名称；注释与用户可见文本必须保持首字母大写。
+func (s *Server) fetchCodexOAuthModels(
+	ctx context.Context,
+	cfg *model.Config,
+	overrideProtocol string,
+) (*FetchModelsResponse, error) {
+	if s == nil || s.codexCredentials == nil {
+		return nil, fmt.Errorf("模型发现: Codex 凭证服务不可用")
+	}
+	overrideProtocol = strings.ToLower(strings.TrimSpace(overrideProtocol))
+	if overrideProtocol != "" {
+		if !protocol.IsValid(protocol.Protocol(overrideProtocol)) {
+			return nil, fmt.Errorf("不支持的上游协议: %s", overrideProtocol)
+		}
+		if util.NormalizeProtocol(overrideProtocol) != util.ProtocolCodex {
+			return nil, fmt.Errorf("模型发现: Codex 仅支持 codex 协议")
+		}
+	}
+
+	credential, err := s.codexCredentials.credential(ctx, cfg, false)
+	if err != nil {
+		return nil, fmt.Errorf("获取 Codex 凭证失败: %w", err)
+	}
+	catalog := codexOAuthModelEntries(credential.PlanType)
+	if len(catalog) == 0 {
+		return nil, fmt.Errorf("模型发现: Codex 订阅计划没有可用模型")
+	}
+	models := make([]model.ModelEntry, len(catalog))
+	for i, entry := range catalog {
+		models[i] = model.ModelEntry{Model: entry.Model, RedirectModel: entry.Model}
+	}
+	channelURL := ""
+	if len(cfg.URLs) > 0 {
+		channelURL = cfg.URLs[0].RuntimeURL()
+	}
+	return &FetchModelsResponse{
+		Models: models, Protocol: util.ProtocolCodex, Source: "predefined",
+		Debug: &FetchModelsDebug{
+			NormalizedProtocol: util.ProtocolCodex,
+			Fetcher:            "codex_oauth_catalog",
+			ChannelURL:         channelURL,
+		},
+	}, nil
+}
+
+func (s *Server) fetchAntigravityModelsWithURLFallback(
+	ctx context.Context,
+	cfg *model.Config,
+	overrideProtocol string,
+) (*FetchModelsResponse, error) {
+	if s == nil || s.antigravityCredentials == nil || s.antigravityService == nil {
+		return nil, fmt.Errorf("模型发现: Antigravity 服务不可用")
+	}
+	if len(cfg.URLs) == 0 {
+		return nil, fmt.Errorf("渠道URL为空")
+	}
+	overrideProtocol = strings.ToLower(strings.TrimSpace(overrideProtocol))
+	if overrideProtocol != "" {
+		if !protocol.IsValid(protocol.Protocol(overrideProtocol)) {
+			return nil, fmt.Errorf("不支持的上游协议: %s", overrideProtocol)
+		}
+		if util.NormalizeProtocol(overrideProtocol) != util.ProtocolGemini {
+			return nil, fmt.Errorf("模型发现: Antigravity 仅支持 gemini 协议")
+		}
+	}
+
+	credential, err := s.antigravityCredentials.credential(ctx, cfg, false)
+	if err != nil {
+		return nil, fmt.Errorf("获取 Antigravity 凭证失败: %w", err)
+	}
+	service := *s.antigravityService
+	if client := s.getClientForChannel(cfg); client != nil {
+		service.Client = client
+	}
+
+	selectorEnabled := s.urlSelector != nil && cfg.ID > 0
+	var selector *URLSelector
+	if selectorEnabled {
+		selector = s.urlSelector
+	}
+	runtimeURLs := make([]string, len(cfg.URLs))
+	for i := range cfg.URLs {
+		runtimeURLs[i] = cfg.URLs[i].RuntimeURL()
+	}
+	sortedURLs := orderURLsWithSelector(selector, cfg.ID, runtimeURLs)
+	sortedURLs = prioritizeDeclaredProtocolURLs(sortedURLs, cfg.URLs)
+
+	var lastErr error
+	for _, sorted := range sortedURLs {
+		if sorted.idx < 0 || sorted.idx >= len(cfg.URLs) {
+			continue
+		}
+		entry := cfg.URLs[sorted.idx]
+		if len(entry.Protocols) > 0 && !entry.SupportsProtocol(util.ProtocolGemini) {
+			continue
+		}
+		if overrideProtocol != "" && !entry.SupportsProtocol(overrideProtocol) {
+			continue
+		}
+
+		start := time.Now()
+		modelNames, fetchErr := service.FetchAvailableModels(ctx, sorted.url, credential)
+		if fetchErr == nil {
+			modelNames = antigravityOAuthAvailableModels(modelNames)
+			if len(modelNames) == 0 {
+				fetchErr = fmt.Errorf("上游未返回受支持的 Antigravity 模型")
+			}
+		}
+		if fetchErr == nil {
+			if selectorEnabled {
+				latency := time.Since(start)
+				if latency <= 0 {
+					latency = time.Millisecond
+				}
+				s.urlSelector.RecordLatency(cfg.ID, sorted.url, latency)
+			}
+			models := make([]model.ModelEntry, len(modelNames))
+			for i, name := range modelNames {
+				models[i] = model.ModelEntry{Model: name, RedirectModel: name}
+			}
+			return &FetchModelsResponse{
+				Models: models, Protocol: util.ProtocolGemini, Source: "api",
+				Debug: &FetchModelsDebug{
+					NormalizedProtocol: util.ProtocolGemini,
+					Fetcher:            "antigravity_oauth",
+					ChannelURL:         sorted.url,
+				},
+			}, nil
+		}
+		lastErr = fmt.Errorf(
+			"获取模型列表失败(上游协议:%s, 规范化协议:%s, 数据来源:api): %w",
+			util.ProtocolGemini, util.ProtocolGemini, fetchErr,
+		)
+		if selectorEnabled && shouldCooldownURLOnFetchModelsError(lastErr) {
+			s.urlSelector.CooldownURL(cfg.ID, sorted.url)
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("获取模型列表失败: 未找到可用URL")
 }
 
 // fetchModelsWithURLFallback 按URL排序顺序抓取模型列表。
@@ -303,10 +510,15 @@ func (s *Server) fetchModelsWithURLFallback(
 	ctx context.Context,
 	channelID int64,
 	configuredURLs model.ChannelURLs,
-	overrideProtocol, apiKey string,
+	overrideProtocol string,
+	apiKeys []string,
 ) (*FetchModelsResponse, error) {
 	if len(configuredURLs) == 0 {
 		return nil, fmt.Errorf("渠道URL为空")
+	}
+	apiKeys = normalizeModelFetchKeys(apiKeys)
+	if len(apiKeys) == 0 {
+		return nil, fmt.Errorf("API Key为空")
 	}
 	overrideProtocol = strings.ToLower(strings.TrimSpace(overrideProtocol))
 	if overrideProtocol != "" && !protocol.IsValid(protocol.Protocol(overrideProtocol)) {
@@ -344,22 +556,32 @@ func (s *Server) fetchModelsWithURLFallback(
 				protocols[i] = string(candidate)
 			}
 		}
+		urlFailed := false
 		for _, upstreamProtocol := range protocols {
-			start := time.Now()
-			resp, err := fetchModelsForConfig(ctx, upstreamProtocol, sorted.url, apiKey)
-			if err == nil {
-				if selectorEnabled {
-					latency := time.Since(start)
-					if latency <= 0 {
-						latency = time.Millisecond
+			for _, apiKey := range apiKeys {
+				start := time.Now()
+				resp, err := fetchModelsForConfig(ctx, upstreamProtocol, sorted.url, apiKey)
+				if err == nil {
+					if selectorEnabled {
+						latency := time.Since(start)
+						if latency <= 0 {
+							latency = time.Millisecond
+						}
+						s.urlSelector.RecordLatency(channelID, sorted.url, latency)
 					}
-					s.urlSelector.RecordLatency(channelID, sorted.url, latency)
+					return resp, nil
 				}
-				return resp, nil
+				lastErr = err
+				if shouldTryNextKeyOnFetchModelsError(err) {
+					continue
+				}
+				if selectorEnabled && shouldCooldownURLOnFetchModelsError(err) {
+					s.urlSelector.CooldownURL(channelID, sorted.url)
+					urlFailed = true
+				}
+				break
 			}
-			lastErr = err
-			if selectorEnabled && shouldCooldownURLOnFetchModelsError(err) {
-				s.urlSelector.CooldownURL(channelID, sorted.url)
+			if urlFailed {
 				break
 			}
 		}
@@ -369,6 +591,18 @@ func (s *Server) fetchModelsWithURLFallback(
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("获取模型列表失败: 未找到可用URL")
+}
+
+func shouldTryNextKeyOnFetchModelsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	statusCode, body, ok := parseFetchModelsStatus(err.Error())
+	if !ok {
+		return false
+	}
+	classification := util.ClassifyHTTPResponseWithMeta(statusCode, nil, []byte(body))
+	return classification.Level == util.ErrorLevelKey
 }
 
 func shouldCooldownURLOnFetchModelsError(err error) bool {

@@ -14,6 +14,8 @@ function normalizeProtocolTransformMode(value) {
 let protocolTransformModeCombobox = null;
 let quickAddChannelTrigger = null;
 let quickAddChannelRequestVersion = 0;
+let modelImportTrigger = null;
+let modelImportTarget = 'channel';
 
 function getProtocolTransformModeOptions() {
   return [
@@ -80,26 +82,28 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
   });
 }
 
-async function syncScheduledCheckVisibility() {
+async function syncScheduledCheckVisibility(enabledOverride) {
   const scheduledCheckWrapper = document.getElementById('channelScheduledCheckEnabledWrapper');
   const scheduledCheckModelWrapper = document.getElementById('channelScheduledCheckModelWrapper');
   if (!scheduledCheckWrapper) return false;
 
-  let scheduledCheckEnabledByConfig = false;
-  try {
-    const setting = await fetchDataWithAuth('/admin/settings/channel_check_interval_hours');
-    const intervalHours = Number(setting && setting.value);
-    scheduledCheckEnabledByConfig = Number.isFinite(intervalHours) && intervalHours > 0;
-  } catch (error) {
-    console.warn('Failed to load channel check interval setting', error);
+  let enabled = enabledOverride === true;
+  if (typeof enabledOverride !== 'boolean') {
+    try {
+      const setting = await fetchDataWithAuth('/admin/settings/channel_check_interval_hours');
+      const intervalHours = Number(setting && setting.value);
+      enabled = Number.isFinite(intervalHours) && intervalHours > 0;
+    } catch (error) {
+      console.warn('Failed to load channel check interval setting', error);
+    }
   }
 
-  scheduledCheckWrapper.hidden = !scheduledCheckEnabledByConfig;
+  scheduledCheckWrapper.hidden = !enabled;
   if (scheduledCheckModelWrapper) {
-    scheduledCheckModelWrapper.hidden = !scheduledCheckEnabledByConfig;
+    scheduledCheckModelWrapper.hidden = !enabled;
   }
   syncScheduledCheckModelState();
-  return scheduledCheckEnabledByConfig;
+  return enabled;
 }
 
 function setScheduledCheckModelHint(i18nKey) {
@@ -278,16 +282,6 @@ async function detectChannelWebsocketSupport(button) {
   }
 }
 
-async function resolveEditableChannel(id) {
-  const cachedChannel = Array.isArray(channels) ? channels.find(c => c.id === id) : null;
-  try {
-    return await fetchDataWithAuth(`/admin/channels/${id}`);
-  } catch (error) {
-    console.error('Failed to fetch channel', error);
-    return cachedChannel || null;
-  }
-}
-
 async function handleChannelSaveSuccess({ isNewChannel, savedChannelId, response }) {
   if (window.ChannelModalHooks && typeof window.ChannelModalHooks.afterSave === 'function') {
     await window.ChannelModalHooks.afterSave({
@@ -340,7 +334,10 @@ function initChannelEditorActions() {
         'fetch-models-from-api': () => invokeChannelEditorAction('fetchModelsFromAPI'),
         'fetch-sub2api-rate': () => invokeChannelEditorAction('fetchSub2APIRate'),
         'add-redirect-row': () => invokeChannelEditorAction('addRedirectRow'),
+        'export-channel-models': () => invokeChannelEditorAction('exportChannelModels'),
+        'open-batch-model-import': () => invokeChannelEditorAction('openBatchModelImportModal'),
         'batch-lowercase-models': () => invokeChannelEditorAction('batchLowercaseSelectedModels'),
+        'batch-strip-model-source-prefix': () => invokeChannelEditorAction('batchStripSelectedModelSourcePrefixes'),
         'batch-delete-models': () => invokeChannelEditorAction('batchDeleteSelectedModels'),
         'close-delete-modal': () => invokeChannelEditorAction('closeDeleteModal'),
         'confirm-delete-channel': () => invokeChannelEditorAction('confirmDelete'),
@@ -369,6 +366,7 @@ function initChannelEditorActions() {
         'toggle-select-all-keys': (actionTarget) => invokeChannelEditorAction('toggleSelectAllKeys', actionTarget.checked),
         'filter-keys-by-status': (actionTarget) => invokeChannelEditorAction('filterKeysByStatus', actionTarget.value),
         'toggle-select-all-models': (actionTarget) => invokeChannelEditorAction('toggleSelectAllModels', actionTarget.checked),
+        'switch-model-import-format': (actionTarget) => invokeChannelEditorAction('switchModelImportFormat', actionTarget.value),
         'update-export-preview': () => invokeChannelEditorAction('updateExportPreview')
       },
       input: {
@@ -395,24 +393,39 @@ function initChannelEditorActions() {
 
   initCommonModelsModalEvents();
   initQuickAddChannelModalEvents();
+  initModelNormalizationOptions();
+
+  const retryOtherKeysCheckbox = document.getElementById('channelRetryOtherKeysOnFailure');
+  if (retryOtherKeysCheckbox && !retryOtherKeysCheckbox.dataset.bound) {
+    retryOtherKeysCheckbox.addEventListener('change', () => {
+      if (typeof markChannelFormDirty === 'function') {
+        markChannelFormDirty();
+      }
+    });
+    retryOtherKeysCheckbox.dataset.bound = '1';
+  }
   ensureScheduledCheckModelCombobox();
 }
 
-function setQuickAddChannelButtonVisible(visible) {
-  const button = document.getElementById('quickAddChannelBtn');
-  if (button) button.hidden = !visible;
+function resetModalKeyStatusFilter() {
+  if (typeof currentKeyStatusFilter !== 'undefined') currentKeyStatusFilter = 'all';
+  const filter = document.getElementById('keyStatusFilter');
+  if (filter) filter.value = 'all';
 }
 
 async function showAddModal() {
   editingChannelId = null;
+  editingChannelAuthType = 'api_key';
   currentChannelKeyCooldowns = [];
-  setQuickAddChannelButtonVisible(true);
+  resetModalKeyStatusFilter();
   await syncScheduledCheckVisibility();
 
   setChannelModalTitle('channels.addChannel');
   document.getElementById('channelForm').reset();
   document.getElementById('channelEnabled').checked = true;
   document.getElementById('channelScheduledCheckEnabled').checked = false;
+  const retryOtherKeysCheckbox = document.getElementById('channelRetryOtherKeysOnFailure');
+  if (retryOtherKeysCheckbox) retryOtherKeysCheckbox.checked = false;
   const websocketCheckbox = document.getElementById('channelWebsockets');
   if (websocketCheckbox) websocketCheckbox.checked = false;
   document.getElementById('channelScheduledCheckModel').value = '';
@@ -438,6 +451,7 @@ async function showAddModal() {
   document.getElementById('inlineEyeIcon').style.display = 'none';
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
   renderInlineKeyTable();
+  if (typeof applyChannelAuthEditorMode === 'function') applyChannelAuthEditorMode(editingChannelAuthType, null);
 
   invokeChannelEditorAction('resetCustomRulesState', null);
   invokeChannelEditorAction('resetCooldownDetectionState', null);
@@ -448,31 +462,56 @@ async function showAddModal() {
 }
 
 async function editChannel(id) {
-  const channel = await resolveEditableChannel(id);
-  if (!channel) return;
+  let editorData;
+  try {
+    editorData = await fetchDataWithAuth(`/admin/channels/${id}/editor`);
+  } catch (error) {
+    console.error('Failed to fetch channel editor data', error);
+    if (window.showError) window.showError(window.t('channels.loadChannelsFailed'));
+    return;
+  }
 
-  const scheduledVisibilityPromise = syncScheduledCheckVisibility();
-  const apiKeysPromise = fetchEditableChannelKeys(id);
-  const modelStatsPromise = fetchEditableChannelModelStats(id);
+  const channel = editorData && editorData.channel;
+  const apiKeys = editorData && Array.isArray(editorData.keys) ? editorData.keys : null;
+  if (!channel || apiKeys === null) {
+    console.error('Invalid channel editor data', editorData);
+    if (window.showError) window.showError(window.t('channels.loadChannelsFailed'));
+    return;
+  }
+
+  const modelStatsData = editorData.model_stats || {};
+  const modelStats = modelStatsData.available === false
+    ? null
+    : new Map((Array.isArray(modelStatsData.items) ? modelStatsData.items : []).map(entry => [
+      normalizeModelStatsKey(entry.model),
+      entry
+    ]));
+  const urlStats = editorData.url_stats && Array.isArray(editorData.url_stats.items)
+    ? editorData.url_stats.items
+    : [];
+  const scheduledCheckEnabled = Boolean(
+    editorData.features && editorData.features.scheduled_check_enabled
+  );
+
+  resetModalKeyStatusFilter();
+
+  const scheduledVisibilityPromise = syncScheduledCheckVisibility(scheduledCheckEnabled);
   const protocolModeRenderPromise = ensureProtocolTransformModeCombobox(channel.protocol_transform_mode);
 
   editingChannelId = id;
-  setQuickAddChannelButtonVisible(false);
+  editingChannelAuthType = ['codex_oauth', 'antigravity_oauth', 'xai_oauth'].includes(channel.auth_type)
+    ? channel.auth_type
+    : 'api_key';
   clearChannelDuplicateHint();
 
   setChannelModalTitle('channels.editChannel');
   document.getElementById('channelName').value = channel.name;
   setInlineURLTableData(channel.urls);
+  applyURLStats(urlStats);
 
-  // 所有已保存 URL 都有独立统计；单 URL 也必须加载。
-  const urlStatsPromise = fetchURLStats(id);
-
-  const [apiKeys, modelStats] = await Promise.all([
-    apiKeysPromise,
-    modelStatsPromise,
+  await Promise.all([
     scheduledVisibilityPromise,
-    protocolModeRenderPromise,
-    urlStatsPromise
+    protocolModeRenderPromise
   ]);
 
   const now = Date.now();
@@ -495,6 +534,14 @@ async function editChannel(id) {
   document.getElementById('inlineEyeIcon').style.display = 'none';
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
   renderInlineKeyTable();
+  if (typeof applyChannelAuthEditorMode === 'function') {
+    applyChannelAuthEditorMode(
+      editingChannelAuthType,
+      editorData.oauth_credential || null,
+      channel,
+      editorData.oauth_credential_info || null
+    );
+  }
 
   const keyStrategy = channel.key_strategy || 'sequential';
   const strategyRadio = document.querySelector(`input[name="keyStrategy"][value="${keyStrategy}"]`);
@@ -511,6 +558,8 @@ async function editChannel(id) {
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
+  const retryOtherKeysCheckbox = document.getElementById('channelRetryOtherKeysOnFailure');
+  if (retryOtherKeysCheckbox) retryOtherKeysCheckbox.checked = !!channel.retry_other_keys_on_failure;
 
   // 加载模型配置（新格式：models是 {model, redirect_model} 数组）
   const modelCooldowns = new Map(
@@ -550,30 +599,8 @@ async function editChannel(id) {
   scheduleChannelEditorTableSizingSync();
 }
 
-async function fetchEditableChannelKeys(id) {
-  try {
-    return (await fetchDataWithAuth(`/admin/channels/${id}/keys`)) || [];
-  } catch (e) {
-    console.error('Failed to fetch API Keys', e);
-    return [];
-  }
-}
-
 function normalizeModelStatsKey(modelName) {
   return String(modelName || '').trim().toLowerCase();
-}
-
-async function fetchEditableChannelModelStats(id) {
-  try {
-    const stats = await fetchDataWithAuth(`/admin/channels/${id}/model-stats`);
-    return new Map((Array.isArray(stats) ? stats : []).map(entry => [
-      normalizeModelStatsKey(entry.model),
-      entry
-    ]));
-  } catch (error) {
-    console.error('Failed to fetch channel model stats', error);
-    return null;
-  }
 }
 
 function closeModal() {
@@ -744,9 +771,10 @@ async function saveChannel(event) {
     return;
   }
 
-  const validKeyRows = getValidInlineKeyRows();
+  const isOAuth = ['codex_oauth', 'antigravity_oauth', 'xai_oauth'].includes(editingChannelAuthType);
+  const validKeyRows = isOAuth ? [] : getValidInlineKeyRows();
   const validKeys = validKeyRows.map(row => row.api_key);
-  if (validKeyRows.length === 0) {
+  if (!isOAuth && validKeyRows.length === 0) {
     alert(window.t('channels.atLeastOneKey'));
     return;
   }
@@ -780,11 +808,11 @@ async function saveChannel(event) {
 
   const formData = {
     name: document.getElementById('channelName').value.trim(),
+    auth_type: isOAuth ? editingChannelAuthType : 'api_key',
     urls: validURLConfigs,
     api_key: validKeys.join(','),
-		api_keys: validKeyRows.map(row => ({ api_key: row.api_key, note: row.note || '' })),
-		protocol_transform_mode: getProtocolTransformMode(),
-    key_strategy: keyStrategy,
+    api_keys: validKeyRows.map(row => ({ api_key: row.api_key, note: row.note || '' })),
+    protocol_transform_mode: getProtocolTransformMode(),
     priority: parseInt(document.getElementById('channelPriority').value) || 0,
     rpm_limit: parseInt(document.getElementById('channelRPMLimit').value) || 0,
     max_concurrency: parseInt(document.getElementById('channelMaxConcurrency').value) || 0,
@@ -800,10 +828,12 @@ async function saveChannel(event) {
     scheduled_check_model: document.getElementById('channelScheduledCheckModel').value.trim(),
     custom_request_rules: invokeChannelEditorAction('collectCustomRulesForSubmit') || null,
     cooldown_detection_rules: invokeChannelEditorAction('collectCooldownDetectionRulesForSubmit') || null,
-    proxy_url: (document.getElementById('channelProxyURL')?.value || '').trim()
+    proxy_url: (document.getElementById('channelProxyURL')?.value || '').trim(),
+    retry_other_keys_on_failure: !!document.getElementById('channelRetryOtherKeysOnFailure')?.checked
   };
+  if (!isOAuth) formData.key_strategy = keyStrategy;
 
-  if (!formData.name || formData.urls.length === 0 || !formData.api_key || formData.models.length === 0) {
+  if (!formData.name || formData.urls.length === 0 || (!isOAuth && !formData.api_key) || formData.models.length === 0) {
     if (window.showError) window.showError(window.t('channels.fillAllRequired'));
     return;
   }
@@ -1057,6 +1087,7 @@ function updateBatchChannelSelectionUI() {
   });
 
   const floatingMenu = document.getElementById('batchFloatingMenu');
+  const batchBusy = floatingMenu?.getAttribute?.('aria-busy') === 'true';
   if (floatingMenu) {
     const visible = selectedCount > 0;
     floatingMenu.classList.toggle('is-visible', visible);
@@ -1065,6 +1096,8 @@ function updateBatchChannelSelectionUI() {
     if (!visible) {
       const refreshOptions = document.getElementById('batchRefreshOptions');
       if (refreshOptions) refreshOptions.open = false;
+      const advancedOptions = document.getElementById('batchAdvancedOptions');
+      if (advancedOptions) advancedOptions.open = false;
     }
   }
 
@@ -1108,17 +1141,22 @@ function updateBatchChannelSelectionUI() {
     'batchEnableChannelsBtn',
     'batchDisableChannelsBtn',
     'batchDeleteChannelsBtn',
+    'batchRefreshOAuthUsageBtn',
     'batchRefreshMergeBtn',
     'batchRefreshReplaceBtn',
-    'batchApplyProtocolBtn'
+    'batchApplyProtocolBtn',
+    'batchApplyCostMultiplierBtn',
+    'batchImportModelsBtn'
   ];
   actionBtnIDs.forEach((id) => {
     const btn = document.getElementById(id);
-    if (btn) btn.disabled = selectedCount === 0;
+    if (btn) btn.disabled = selectedCount === 0 || batchBusy || btn.getAttribute?.('aria-busy') === 'true';
   });
 
   const protocolMode = document.getElementById('batchProtocolTransformMode');
-  if (protocolMode) protocolMode.disabled = selectedCount === 0;
+  if (protocolMode) protocolMode.disabled = selectedCount === 0 || batchBusy;
+  const costMultiplier = document.getElementById('batchCostMultiplier');
+  if (costMultiplier) costMultiplier.disabled = selectedCount === 0 || batchBusy;
 }
 
 function selectAllVisibleChannels() {
@@ -1212,9 +1250,30 @@ async function batchSetSelectedChannelsEnabled(enabled) {
   }
 }
 
-async function batchSetSelectedChannelsProtocolMode() {
+async function requestBatchAdvancedPatch(patch) {
   const channelIDs = getSelectedChannelIDs();
   if (channelIDs.length === 0) {
+    if (window.showWarning) window.showWarning(window.t('channels.batchNoSelection'));
+    return null;
+  }
+
+  const resp = await fetchAPIWithAuth('/admin/channels/batch-advanced', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel_ids: channelIDs, ...patch })
+  });
+  if (!resp.success) throw new Error(resp.error || window.t('common.failed'));
+  return resp.data || {};
+}
+
+async function finishBatchAdvancedUpdate() {
+  selectedChannelIds.clear();
+  if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
+  await reloadChannelsList();
+}
+
+async function batchSetSelectedChannelsProtocolMode() {
+  if (getSelectedChannelIDs().length === 0) {
     if (window.showWarning) window.showWarning(window.t('channels.batchNoSelection'));
     return;
   }
@@ -1231,20 +1290,9 @@ async function batchSetSelectedChannelsProtocolMode() {
   if (modeSelect) modeSelect.disabled = true;
 
   try {
-    const resp = await fetchAPIWithAuth('/admin/channels/batch-protocol-mode', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        channel_ids: channelIDs,
-        protocol_transform_mode: mode
-      })
-    });
-    if (!resp.success) throw new Error(resp.error || window.t('common.failed'));
-
-    const data = resp.data || {};
-    selectedChannelIds.clear();
-    if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-    await reloadChannelsList();
+    const data = await requestBatchAdvancedPatch({ protocol_transform_mode: mode });
+    if (!data) return;
+    await finishBatchAdvancedUpdate();
 
     if (window.showSuccess) {
       window.showSuccess(window.t('channels.batchProtocolModeSummary', {
@@ -1256,6 +1304,59 @@ async function batchSetSelectedChannelsProtocolMode() {
     }
   } catch (e) {
     console.error('Batch set protocol transform mode failed', e);
+    if (window.showError) window.showError(window.t('channels.batchOperationFailed', { error: e.message }));
+  } finally {
+    updateBatchChannelSelectionUI();
+  }
+}
+
+async function batchSetSelectedChannelsCostMultiplier() {
+  if (getSelectedChannelIDs().length === 0) {
+    if (window.showWarning) window.showWarning(window.t('channels.batchNoSelection'));
+    return;
+  }
+
+  const input = document.getElementById('batchCostMultiplier');
+  const applyButton = document.getElementById('batchApplyCostMultiplierBtn');
+  const error = document.getElementById('batchCostMultiplierError');
+  const rawMultiplier = String(input?.value ?? '').trim();
+  const multiplier = Number(rawMultiplier);
+  if (rawMultiplier === '' || !Number.isFinite(multiplier) || multiplier < 0) {
+    const message = window.t('channels.batchCostMultiplierInvalid');
+    if (input) {
+      input.setAttribute('aria-invalid', 'true');
+      input.focus();
+    }
+    if (error) {
+      error.textContent = message;
+      error.hidden = false;
+    }
+    return;
+  }
+  if (error) {
+    error.textContent = '';
+    error.hidden = true;
+  }
+  if (input) {
+    input.setAttribute('aria-invalid', 'false');
+    input.disabled = true;
+  }
+  if (applyButton) applyButton.disabled = true;
+
+  try {
+    const data = await requestBatchAdvancedPatch({ cost_multiplier: multiplier });
+    if (!data) return;
+    await finishBatchAdvancedUpdate();
+    if (window.showSuccess) {
+      window.showSuccess(window.t('channels.batchCostMultiplierSummary', {
+        multiplier,
+        updated: data.updated || 0,
+        unchanged: data.unchanged || 0,
+        notFound: data.not_found_count || 0
+      }));
+    }
+  } catch (e) {
+    console.error('Batch set cost multiplier failed', e);
     if (window.showError) window.showError(window.t('channels.batchOperationFailed', { error: e.message }));
   } finally {
     updateBatchChannelSelectionUI();
@@ -1333,16 +1434,30 @@ function setBatchRefreshRowResult(channelID, result) {
   }
 }
 
-const BATCH_REFRESH_OPTIONS_STORAGE_KEY = 'channels.batchRefreshOptions';
+const MODEL_NORMALIZATION_OPTIONS_STORAGE_KEY = 'channels.modelNormalizationOptions';
+const MODEL_NORMALIZATION_OPTION_INPUT_IDS = {
+  lowercase_models: [
+    'batchRefreshLowercaseModels',
+    'quickAddLowercaseModels',
+    'modelImportLowercaseModels'
+  ],
+  strip_model_source_prefix: [
+    'batchRefreshStripModelSourcePrefix',
+    'quickAddStripModelSourcePrefix',
+    'modelImportStripModelSourcePrefix'
+  ]
+};
 
-function getBatchRefreshOptionInputs() {
-  return {
-    lowercaseModels: document.getElementById('batchRefreshLowercaseModels'),
-    stripModelSourcePrefix: document.getElementById('batchRefreshStripModelSourcePrefix')
-  };
+function getModelNormalizationOptionInputs() {
+  return Object.fromEntries(
+    Object.entries(MODEL_NORMALIZATION_OPTION_INPUT_IDS).map(([option, ids]) => [
+      option,
+      ids.map(id => document.getElementById(id)).filter(Boolean)
+    ])
+  );
 }
 
-function resolveBatchRefreshOptionsStorage(storage) {
+function resolveModelNormalizationOptionsStorage(storage) {
   if (storage) return storage;
   try {
     return window.localStorage;
@@ -1351,13 +1466,13 @@ function resolveBatchRefreshOptionsStorage(storage) {
   }
 }
 
-function readBatchRefreshOptions(storage) {
+function readModelNormalizationOptions(storage) {
   const fallback = { lowercase_models: false, strip_model_source_prefix: false };
-  const target = resolveBatchRefreshOptionsStorage(storage);
+  const target = resolveModelNormalizationOptionsStorage(storage);
   if (!target) return fallback;
 
   try {
-    const saved = JSON.parse(target.getItem(BATCH_REFRESH_OPTIONS_STORAGE_KEY));
+    const saved = JSON.parse(target.getItem(MODEL_NORMALIZATION_OPTIONS_STORAGE_KEY));
     return {
       lowercase_models: saved?.lowercase_models === true,
       strip_model_source_prefix: saved?.strip_model_source_prefix === true
@@ -1367,33 +1482,57 @@ function readBatchRefreshOptions(storage) {
   }
 }
 
-function saveBatchRefreshOptions(storage) {
-  const inputs = getBatchRefreshOptionInputs();
-  const options = {
-    lowercase_models: inputs.lowercaseModels?.checked === true,
-    strip_model_source_prefix: inputs.stripModelSourcePrefix?.checked === true
-  };
-  const target = resolveBatchRefreshOptionsStorage(storage);
-  if (!target) return options;
-
-  try {
-    target.setItem(BATCH_REFRESH_OPTIONS_STORAGE_KEY, JSON.stringify(options));
-  } catch (_) { /* 浏览器禁用本地存储时保留当前页面状态 */ }
+function applyModelNormalizationOptions(options) {
+  const inputs = getModelNormalizationOptionInputs();
+  Object.entries(inputs).forEach(([option, optionInputs]) => {
+    optionInputs.forEach(input => { input.checked = options[option] === true; });
+  });
   return options;
 }
 
-function initBatchRefreshOptions(storage) {
-  const inputs = getBatchRefreshOptionInputs();
-  const options = readBatchRefreshOptions(storage);
-  if (inputs.lowercaseModels) inputs.lowercaseModels.checked = options.lowercase_models;
-  if (inputs.stripModelSourcePrefix) inputs.stripModelSourcePrefix.checked = options.strip_model_source_prefix;
+function saveModelNormalizationOptions(options, storage) {
+  const normalized = {
+    lowercase_models: options?.lowercase_models === true,
+    strip_model_source_prefix: options?.strip_model_source_prefix === true
+  };
+  const target = resolveModelNormalizationOptionsStorage(storage);
+  if (!target) return normalized;
 
-  for (const input of [inputs.lowercaseModels, inputs.stripModelSourcePrefix]) {
-    if (!input || input.dataset.batchRefreshOptionsBound === '1') continue;
-    input.addEventListener('change', () => saveBatchRefreshOptions(storage));
-    input.dataset.batchRefreshOptionsBound = '1';
-  }
+  try {
+    target.setItem(MODEL_NORMALIZATION_OPTIONS_STORAGE_KEY, JSON.stringify(normalized));
+  } catch (_) { /* 浏览器禁用本地存储时保留当前页面状态 */ }
+  return normalized;
+}
+
+function syncModelNormalizationOptions(storage) {
+  return applyModelNormalizationOptions(readModelNormalizationOptions(storage));
+}
+
+function initModelNormalizationOptions(storage) {
+  const options = syncModelNormalizationOptions(storage);
+  const inputs = getModelNormalizationOptionInputs();
+
+  Object.entries(inputs).forEach(([option, optionInputs]) => {
+    optionInputs.forEach(input => {
+      if (input.dataset.modelNormalizationOptionsBound === '1') return;
+      input.addEventListener('change', () => {
+        const next = readModelNormalizationOptions(storage);
+        next[option] = input.checked === true;
+        applyModelNormalizationOptions(saveModelNormalizationOptions(next, storage));
+        updateModelImportPreview();
+      });
+      input.dataset.modelNormalizationOptionsBound = '1';
+    });
+  });
   return options;
+}
+
+function modelNormalizationOptionsForRequest(storage) {
+  const options = readModelNormalizationOptions(storage);
+  return {
+    lowercaseModels: options.lowercase_models,
+    stripModelSourcePrefix: options.strip_model_source_prefix
+  };
 }
 
 async function batchRefreshSelectedChannels(mode) {
@@ -1407,15 +1546,16 @@ async function batchRefreshSelectedChannels(mode) {
     return;
   }
 
-  const lowercaseModels = document.getElementById('batchRefreshLowercaseModels')?.checked === true;
-  const stripModelSourcePrefix = document.getElementById('batchRefreshStripModelSourcePrefix')?.checked === true;
+  const normalizationOptions = readModelNormalizationOptions();
+  const lowercaseModels = normalizationOptions.lowercase_models;
+  const stripModelSourcePrefix = normalizationOptions.strip_model_source_prefix;
 
   if (typeof clearAllBatchRefreshResults === 'function') {
     clearAllBatchRefreshResults();
   }
 
   // 禁用批量操作按钮
-  const actionBtnIDs = ['batchRefreshMergeBtn', 'batchRefreshReplaceBtn', 'batchEnableChannelsBtn', 'batchDisableChannelsBtn', 'batchDeleteChannelsBtn', 'batchApplyProtocolBtn'];
+  const actionBtnIDs = ['batchRefreshMergeBtn', 'batchRefreshReplaceBtn', 'batchRefreshOAuthUsageBtn', 'batchEnableChannelsBtn', 'batchDisableChannelsBtn', 'batchDeleteChannelsBtn', 'batchApplyProtocolBtn'];
   actionBtnIDs.forEach(id => { const btn = document.getElementById(id); if (btn) btn.disabled = true; });
   const protocolModeSelect = document.getElementById('batchProtocolTransformMode');
   if (protocolModeSelect) protocolModeSelect.disabled = true;
@@ -1572,6 +1712,7 @@ async function copyChannel(id, name) {
   editingChannelId = null;
   clearChannelDuplicateHint();
   currentChannelKeyCooldowns = [];
+  resetModalKeyStatusFilter();
   setChannelModalTitle('channels.copyChannel');
   document.getElementById('channelName').value = copiedName;
   setInlineURLTableData(channel.urls);
@@ -1607,6 +1748,8 @@ async function copyChannel(id, name) {
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
+  const retryOtherKeysCheckbox = document.getElementById('channelRetryOtherKeysOnFailure');
+  if (retryOtherKeysCheckbox) retryOtherKeysCheckbox.checked = !!channel.retry_other_keys_on_failure;
 
   // 加载模型配置（新格式：models是 {model, redirect_model} 数组）
   redirectTableData = (channel.models || []).map(m => ({
@@ -1649,35 +1792,155 @@ function generateCopyName(originalName) {
   return proposedName;
 }
 
-function parseModels(input) {
-  return window.ModelEntryParser.parseModelEntries(input);
+function getModelImportFormat() {
+  return document.querySelector('input[name="modelImportFormat"]:checked')?.value === 'json'
+    ? 'json'
+    : 'text';
+}
+
+function parseModels(input, format = getModelImportFormat()) {
+  const entries = format === 'json'
+    ? window.ModelEntryParser.parseJSONModelEntries(input)
+    : window.ModelEntryParser.parseModelEntries(input);
+  const options = readModelNormalizationOptions();
+  if (!options.lowercase_models && !options.strip_model_source_prefix) return entries;
+  return window.ModelEntryParser.normalizeModelEntries(entries, options);
+}
+
+function setModelImportError(message = '') {
+  const textarea = document.getElementById('modelImportTextarea');
+  const error = document.getElementById('modelImportError');
+  const hasError = Boolean(message);
+  if (textarea) textarea.setAttribute('aria-invalid', hasError ? 'true' : 'false');
+  if (!error) return;
+  error.textContent = message;
+  error.hidden = !hasError;
+}
+
+function modelImportErrorMessage(error) {
+  const item = Number.isInteger(error?.index) ? error.index + 1 : 0;
+  const keys = {
+    invalid_json: 'channels.modelImportJsonInvalid',
+    array_required: 'channels.modelImportJsonArrayRequired',
+    invalid_entry: 'channels.modelImportJsonEntryInvalid',
+    model_required: 'channels.modelImportJsonModelRequired',
+    gateway_model_required: 'channels.modelImportJsonGatewayModelRequired',
+    invalid_model: 'channels.modelImportJsonModelInvalid',
+    invalid_redirect_model: 'channels.modelImportJsonRedirectInvalid',
+    invalid_disabled: 'channels.modelImportJsonDisabledInvalid'
+  };
+  const key = keys[error?.code];
+  return key
+    ? window.t(key, { item })
+    : window.t('channels.modelImportJsonInvalid');
+}
+
+function switchModelImportFormat(format) {
+  const normalizedFormat = format === 'json' ? 'json' : 'text';
+  const textarea = document.getElementById('modelImportTextarea');
+  const label = document.getElementById('modelImportInputLabel');
+  const hint = document.getElementById('modelImportInputHint');
+  const textHelp = document.getElementById('modelImportTextHelp');
+  const jsonHelp = document.getElementById('modelImportJSONHelp');
+  const formatInput = document.querySelector(`input[name="modelImportFormat"][value="${normalizedFormat}"]`);
+
+  if (formatInput) formatInput.checked = true;
+  if (label) {
+    const key = normalizedFormat === 'json' ? 'channels.inputModelJSON' : 'channels.inputModelNames';
+    label.setAttribute('data-i18n', key);
+    label.textContent = window.t(key);
+  }
+  if (hint) {
+    const key = normalizedFormat === 'json' ? 'channels.modelJSONHint' : 'channels.modelSeparatorHint';
+    hint.setAttribute('data-i18n', key);
+    hint.textContent = window.t(key);
+  }
+  if (textarea) {
+    const key = normalizedFormat === 'json'
+      ? 'channels.modelImportJSONPlaceholder'
+      : 'channels.modelImportPlaceholder';
+    textarea.setAttribute('data-i18n-placeholder', key);
+    textarea.placeholder = window.t(key);
+  }
+  if (textHelp) textHelp.hidden = normalizedFormat === 'json';
+  if (jsonHelp) jsonHelp.hidden = normalizedFormat !== 'json';
+
+  setModelImportError();
+  updateModelImportPreview();
 }
 
 function addRedirectRow() {
   openModelImportModal();
 }
 
-function openModelImportModal() {
+function setModelImportText(element, key) {
+  if (!element) return;
+  element.setAttribute('data-i18n', key);
+  element.textContent = window.t(key);
+}
+
+function openModelImportModal(target = 'channel') {
+  modelImportTarget = target === 'batch' ? 'batch' : 'channel';
+  modelImportTrigger = document.activeElement;
+  syncModelNormalizationOptions();
   document.getElementById('modelImportTextarea').value = '';
   document.getElementById('modelImportPreviewContent').classList.add('hidden');
-  document.getElementById('modelImportModal').classList.add('show');
+  const batchImport = modelImportTarget === 'batch';
+  const modeFieldset = document.getElementById('modelImportModeFieldset');
+  if (modeFieldset) modeFieldset.hidden = !batchImport;
+  const appendMode = document.querySelector('input[name="modelImportMode"][value="append"]');
+  if (appendMode) appendMode.checked = true;
+  setModelImportText(document.getElementById('modelImportTitle'), batchImport
+    ? 'channels.batchImportModelsTitle'
+    : 'channels.importModelsTitle');
+  setModelImportText(document.getElementById('modelImportPreviewLabel'), batchImport
+    ? 'channels.batchParseSuccessModel'
+    : 'channels.parseSuccessModel');
+  setModelImportText(document.getElementById('modelImportConfirmBtn'), batchImport
+    ? 'channels.batchImportModelsConfirm'
+    : 'channels.confirmAdd');
+  switchModelImportFormat('text');
+  const modal = document.getElementById('modelImportModal');
+  if (batchImport) {
+    document.querySelector('.app-container')?.setAttribute('inert', '');
+  } else {
+    document.getElementById('channelModal')?.setAttribute('inert', '');
+  }
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
   setTimeout(() => document.getElementById('modelImportTextarea').focus(), 100);
 }
 
-function closeModelImportModal() {
-  document.getElementById('modelImportModal').classList.remove('show');
+function closeModelImportModal(restoreFocus = true) {
+  const modal = document.getElementById('modelImportModal');
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  document.getElementById('channelModal')?.removeAttribute('inert');
+  document.querySelector('.app-container')?.removeAttribute('inert');
+  if (restoreFocus) modelImportTrigger?.focus?.();
+  modelImportTrigger = null;
+  modelImportTarget = 'channel';
 }
 
-function setupModelImportPreview() {
+function openBatchModelImportModal() {
+  if (getSelectedChannelIDs().length === 0) {
+    if (window.showWarning) window.showWarning(window.t('channels.batchNoSelection'));
+    return;
+  }
+  openModelImportModal('batch');
+}
+
+function updateModelImportPreview() {
   const textarea = document.getElementById('modelImportTextarea');
   if (!textarea) return;
 
-  textarea.addEventListener('input', () => {
-    const input = textarea.value.trim();
-    const previewContent = document.getElementById('modelImportPreviewContent');
-    const countSpan = document.getElementById('modelImportCount');
+  const input = textarea.value.trim();
+  const previewContent = document.getElementById('modelImportPreviewContent');
+  const countSpan = document.getElementById('modelImportCount');
 
-    if (input) {
+  setModelImportError();
+  if (input) {
+    try {
       const models = parseModels(input);
       if (models.length > 0) {
         countSpan.textContent = models.length;
@@ -1685,24 +1948,116 @@ function setupModelImportPreview() {
       } else {
         previewContent.classList.add('hidden');
       }
-    } else {
+    } catch (_) {
       previewContent.classList.add('hidden');
     }
-  });
+  } else {
+    previewContent.classList.add('hidden');
+  }
 }
 
-function confirmModelImport() {
+function setupModelImportPreview() {
+  const textarea = document.getElementById('modelImportTextarea');
+  if (!textarea || textarea.dataset.modelImportPreviewBound === '1') return;
+
+  textarea.addEventListener('input', updateModelImportPreview);
+  textarea.dataset.modelImportPreviewBound = '1';
+
+  const modal = document.getElementById('modelImportModal');
+  if (!modal || modal.dataset.modelImportEventsBound === '1') return;
+  modal.addEventListener('click', event => {
+    if (event.target === modal) closeModelImportModal();
+  });
+  document.addEventListener('keydown', event => {
+    if (!modal.classList.contains('show')) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeModelImportModal();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+
+    const focusable = Array.from(modal.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled])'
+    )).filter(element => !element.closest('[hidden]'));
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, true);
+  modal.dataset.modelImportEventsBound = '1';
+}
+
+async function confirmModelImport() {
   const textarea = document.getElementById('modelImportTextarea');
   const input = textarea.value.trim();
 
   if (!input) {
-    window.showNotification(window.t('channels.enterModelName'), 'warning');
+    setModelImportError(window.t('channels.modelImportInputRequired'));
+    textarea.focus();
     return;
   }
 
-  const newModels = parseModels(input);
+  let newModels;
+  try {
+    newModels = parseModels(input);
+    setModelImportError();
+  } catch (error) {
+    setModelImportError(modelImportErrorMessage(error));
+    textarea.focus();
+    return;
+  }
   if (newModels.length === 0) {
-    window.showNotification(window.t('channels.noValidModelParsed'), 'warning');
+    setModelImportError(window.t('channels.noValidModelParsed'));
+    textarea.focus();
+    return;
+  }
+
+  if (modelImportTarget === 'batch') {
+    const mode = document.querySelector('input[name="modelImportMode"]:checked')?.value === 'replace'
+      ? 'replace'
+      : 'append';
+    const channelCount = getSelectedChannelIDs().length;
+    if (mode === 'replace' && !confirm(window.t('channels.batchModelImportReplaceConfirm', { count: channelCount }))) {
+      return;
+    }
+
+    const confirmButton = document.getElementById('modelImportConfirmBtn');
+    if (confirmButton) confirmButton.disabled = true;
+    textarea.disabled = true;
+    try {
+      const data = await requestBatchAdvancedPatch({
+        model_import_mode: mode,
+        models: newModels
+      });
+      if (!data) return;
+      closeModelImportModal(false);
+      await finishBatchAdvancedUpdate();
+      document.getElementById('visibleSelectionCheckbox')?.focus();
+      if (window.showSuccess) {
+        window.showSuccess(window.t('channels.batchModelImportSummary', {
+          mode: window.t(`channels.batchModelImportModeValue.${mode}`),
+          updated: data.updated || 0,
+          unchanged: data.unchanged || 0,
+          notFound: data.not_found_count || 0
+        }));
+      }
+    } catch (error) {
+      console.error('Batch import models failed', error);
+      setModelImportError(window.t('channels.batchOperationFailed', { error: error.message }));
+    } finally {
+      textarea.disabled = false;
+      if (confirmButton) confirmButton.disabled = false;
+      if (document.getElementById('modelImportModal')?.classList.contains('show')) textarea.focus();
+      updateBatchChannelSelectionUI();
+    }
     return;
   }
 
@@ -1717,7 +2072,11 @@ function confirmModelImport() {
   newModels.forEach(entry => {
     const modelKey = entry.model.toLowerCase();
     if (!existingModels.has(modelKey)) {
-      redirectTableData.push({ model: entry.model, redirect_model: entry.redirect_model });
+      redirectTableData.push({
+        model: entry.model,
+        redirect_model: entry.redirect_model,
+        disabled: !!entry.disabled
+      });
       existingModels.add(modelKey);
       addedCount++;
     }
@@ -1736,6 +2095,26 @@ function confirmModelImport() {
   } else {
     window.showNotification(window.t('channels.allModelsExist'), 'info');
   }
+}
+
+function exportChannelModels() {
+  const models = collectModelsForSubmit(redirectTableData);
+  const text = window.ModelEntryParser.serializeModelEntries(models);
+  if (!text) {
+    if (window.showWarning) window.showWarning(window.t('channels.noModelsToExport'));
+    return;
+  }
+
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'channel-models.txt';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  if (window.showSuccess) window.showSuccess(window.t('channels.modelsExported', { count: models.length }));
 }
 
 function deleteRedirectRow(index) {
@@ -2234,6 +2613,7 @@ function toggleSelectAllModels(checked) {
 function updateModelBatchDeleteButton() {
   const deleteBtn = document.getElementById('batchDeleteModelsBtn');
   const lowercaseBtn = document.getElementById('batchLowercaseModelsBtn');
+  const stripPrefixBtn = document.getElementById('batchStripModelSourcePrefixBtn');
   const count = selectedModelIndices.size;
 
   // 更新删除按钮
@@ -2258,55 +2638,51 @@ function updateModelBatchDeleteButton() {
     }
   }
 
-  // 更新转小写按钮
-  if (lowercaseBtn) {
-    const textSpan = lowercaseBtn.querySelector('span');
-    if (count > 0) {
-      lowercaseBtn.disabled = false;
-      if (textSpan) textSpan.textContent = window.t('channels.lowercaseSelectedCount', { count });
-      lowercaseBtn.style.cursor = 'pointer';
-      lowercaseBtn.style.opacity = '1';
-      lowercaseBtn.style.background = 'linear-gradient(135deg, #eff6ff 0%, #bfdbfe 100%)';
-      lowercaseBtn.style.borderColor = '#93c5fd';
-      lowercaseBtn.style.color = '#2563eb';
-    } else {
-      lowercaseBtn.disabled = true;
-      if (textSpan) textSpan.textContent = window.t('channels.lowercaseSelected');
-      lowercaseBtn.style.cursor = '';
-      lowercaseBtn.style.opacity = '0.5';
-      lowercaseBtn.style.background = '';
-      lowercaseBtn.style.borderColor = '';
-      lowercaseBtn.style.color = '';
+  [
+    [lowercaseBtn, 'channels.lowercaseSelected', 'channels.lowercaseSelectedCount'],
+    [stripPrefixBtn, 'channels.stripSourcePrefixSelected', 'channels.stripSourcePrefixSelectedCount']
+  ].forEach(([button, emptyLabel, countLabel]) => {
+    if (!button) return;
+    const textSpan = button.querySelector('span');
+    button.disabled = count === 0;
+    if (textSpan) {
+      textSpan.textContent = count > 0 ? window.t(countLabel, { count }) : window.t(emptyLabel);
     }
-  }
+    button.style.cursor = count > 0 ? 'pointer' : '';
+    button.style.opacity = count > 0 ? '1' : '0.5';
+    button.style.background = count > 0 ? 'linear-gradient(135deg, #eff6ff 0%, #bfdbfe 100%)' : '';
+    button.style.borderColor = count > 0 ? '#93c5fd' : '';
+    button.style.color = count > 0 ? '#2563eb' : '';
+  });
 }
 
-/**
- * 批量转换选中模型为小写
- */
-function batchLowercaseSelectedModels() {
+function normalizeSelectedModels(options) {
   const count = selectedModelIndices.size;
   if (count === 0) return;
 
   let changedCount = 0;
-
-  // 转换选中的模型为小写
   selectedModelIndices.forEach(index => {
-    if (redirectTableData[index]) {
-      const current = redirectTableData[index].model || '';
-      const lowercased = current.toLowerCase();
-      if (current !== lowercased) {
-        redirectTableData[index].model = lowercased;
-        changedCount++;
-      }
-    }
+    const current = redirectTableData[index];
+    if (!current) return;
+    const normalized = window.ModelEntryParser.normalizeModelEntry(current, options);
+    if (!normalized) return;
+    if (current.model === normalized.model && current.redirect_model === normalized.redirect_model) return;
+    redirectTableData[index] = normalized;
+    changedCount++;
   });
 
-  // 清除选择并刷新表格
   selectedModelIndices.clear();
   updateModelBatchDeleteButton();
   renderRedirectTable();
   if (changedCount > 0) markChannelFormDirty();
+}
+
+function batchLowercaseSelectedModels() {
+  normalizeSelectedModels({ lowercase_models: true });
+}
+
+function batchStripSelectedModelSourcePrefixes() {
+  normalizeSelectedModels({ strip_model_source_prefix: true });
 }
 
 /**
@@ -2540,8 +2916,10 @@ function parseQuickAddChannelInfo(input) {
   };
 }
 
-async function discoverQuickAddChannelSetup(input, request = fetchAPIWithAuth) {
+async function discoverQuickAddChannelSetup(input, request = fetchAPIWithAuth, options = {}) {
   const parsed = parseQuickAddChannelInfo(input);
+  const lowercaseModels = options?.lowercaseModels === true;
+  const stripModelSourcePrefix = options?.stripModelSourcePrefix === true;
   const failures = [];
   let response;
   for (const protocol of ['openai', 'anthropic']) {
@@ -2552,7 +2930,9 @@ async function discoverQuickAddChannelSetup(input, request = fetchAPIWithAuth) {
         body: JSON.stringify({
           urls: [{ url: parsed.url, exact: false, protocols: [] }],
           protocol,
-          api_key: parsed.apiKey
+          api_keys: [parsed.apiKey],
+          lowercase_models: lowercaseModels,
+          strip_model_source_prefix: stripModelSourcePrefix
         })
       });
       if (candidate?.success) {
@@ -2619,9 +2999,13 @@ function setQuickAddChannelError(message = '') {
 
 function setQuickAddChannelBusy(busy) {
   const input = document.getElementById('quickAddChannelInput');
+  const lowercaseModels = document.getElementById('quickAddLowercaseModels');
+  const stripModelSourcePrefix = document.getElementById('quickAddStripModelSourcePrefix');
   const button = document.getElementById('quickAddChannelConfirmBtn');
   const status = document.getElementById('quickAddChannelStatus');
   if (input) input.disabled = busy;
+  if (lowercaseModels) lowercaseModels.disabled = busy;
+  if (stripModelSourcePrefix) stripModelSourcePrefix.disabled = busy;
   if (button) {
     button.disabled = busy;
     if (busy) button.setAttribute('aria-busy', 'true');
@@ -2643,13 +3027,13 @@ function quickAddChannelErrorMessage(error) {
 }
 
 function openQuickAddChannelModal(trigger) {
-  if (editingChannelId !== null) return false;
   const modal = document.getElementById('quickAddChannelModal');
   const input = document.getElementById('quickAddChannelInput');
   if (!modal || !input) return false;
 
   quickAddChannelRequestVersion++;
   quickAddChannelTrigger = trigger || document.activeElement;
+  syncModelNormalizationOptions();
   input.value = '';
   setQuickAddChannelError();
   setQuickAddChannelBusy(false);
@@ -2681,7 +3065,11 @@ async function confirmQuickAddChannel() {
   setQuickAddChannelError();
   setQuickAddChannelBusy(true);
   try {
-    const setup = await discoverQuickAddChannelSetup(input.value);
+    const setup = await discoverQuickAddChannelSetup(
+      input.value,
+      fetchAPIWithAuth,
+      modelNormalizationOptionsForRequest()
+    );
     if (requestVersion !== quickAddChannelRequestVersion) return false;
 
     applyQuickAddChannelSetup(setup);
@@ -2727,7 +3115,7 @@ function initQuickAddChannelModalEvents() {
     }
     if (event.key !== 'Tab') return;
 
-    const focusable = Array.from(modal.querySelectorAll('button:not([disabled]), textarea:not([disabled])'));
+    const focusable = Array.from(modal.querySelectorAll('button:not([disabled]), input:not([disabled]), textarea:not([disabled])'));
     if (focusable.length === 0) return;
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
@@ -2743,37 +3131,48 @@ function initQuickAddChannelModalEvents() {
 }
 
 async function fetchModelsFromAPI() {
-  const urls = getValidInlineURLConfigs();
-  const channelUrl = urls[0]?.url || '';
-  const firstValidKey = selectFirstEnabledInlineKey(getInlineKeyRows(), currentChannelKeyCooldowns);
-
-  if (!channelUrl) {
-    if (window.showError) {
-      window.showError(window.t('channels.fillApiUrlFirst'));
-    } else {
-      alert(window.t('channels.fillApiUrlFirst'));
+  let endpoint;
+  let fetchOptions;
+  if (['antigravity_oauth', 'codex_oauth', 'xai_oauth'].includes(editingChannelAuthType)) {
+    if (!editingChannelId) {
+      if (window.showError) window.showError(window.t('channels.saveBeforeModelTest'));
+      else alert(window.t('channels.saveBeforeModelTest'));
+      return;
     }
-    return;
-  }
+    endpoint = `/admin/channels/${editingChannelId}/models/fetch`;
+  } else {
+    const urls = getValidInlineURLConfigs();
+    const channelUrl = urls[0]?.url || '';
+    const availableKeys = selectModelFetchKeys(getInlineKeyRows(), currentChannelKeyCooldowns);
 
-  if (!firstValidKey) {
-    if (window.showError) {
-      window.showError(window.t('channels.addAtLeastOneEnabledKey'));
-    } else {
-      alert(window.t('channels.addAtLeastOneEnabledKey'));
+    if (!channelUrl) {
+      if (window.showError) {
+        window.showError(window.t('channels.fillApiUrlFirst'));
+      } else {
+        alert(window.t('channels.fillApiUrlFirst'));
+      }
+      return;
     }
-    return;
-  }
 
-  const endpoint = '/admin/channels/models/fetch';
-  const fetchOptions = {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      urls,
-      api_key: firstValidKey
-    })
-  };
+    if (availableKeys.length === 0) {
+      if (window.showError) {
+        window.showError(window.t('channels.addAtLeastOneEnabledKey'));
+      } else {
+        alert(window.t('channels.addAtLeastOneEnabledKey'));
+      }
+      return;
+    }
+
+    endpoint = '/admin/channels/models/fetch';
+    fetchOptions = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        urls,
+        api_keys: availableKeys
+      })
+    };
+  }
 
   try {
     const response = await fetchAPIWithAuth(endpoint, fetchOptions);
@@ -2913,7 +3312,9 @@ const COMMON_MODELS = {
     'gpt-5.5',
     'gpt-5.6-sol',
     'gpt-5.6-luna',
-    'gpt-5.6-terra'
+    'gpt-5.6-terra',
+    'gpt-5.3-codex-spark',
+    'codex-auto-review'
   ],
   gemini: [
     'gemini-3.6-flash',
@@ -3072,16 +3473,21 @@ if (typeof module !== 'undefined' && module.exports) {
     addCommonModels,
     addCommonModelsToRows,
     applyQuickAddChannelSetup,
+    batchSetSelectedChannelsCostMultiplier,
     batchSetSelectedChannelsProtocolMode,
     collectModelsForSubmit,
+    confirmModelImport,
     detectChannelWebsocketSupport,
     discoverQuickAddChannelSetup,
     editChannel,
+    exportChannelModels,
     fetchModelsFromAPI,
     fetchSub2APIRate,
-    initBatchRefreshOptions,
+    initModelNormalizationOptions,
     mergeModelRowsWithFetchedModels,
+    openBatchModelImportModal,
     parseQuickAddChannelInfo,
+    saveChannel,
     testRedirectModel,
     toggleModelDisabledState
   };
