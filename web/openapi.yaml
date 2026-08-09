@@ -10,6 +10,7 @@ servers:
     description: 当前 ccLoad 实例
 tags:
   - name: Session
+  - name: Models
   - name: Channels
   - name: OAuth
   - name: Observability
@@ -19,6 +20,41 @@ tags:
 security:
   - adminBearer: []
 paths:
+  /v1/models:
+    get:
+      tags: [Models]
+      operationId: listProxyModels
+      summary: 查询当前令牌可见的代理模型
+      description: |
+        返回当前 API 令牌可访问的公开模型。OpenAI 与 Codex 客户端使用 OpenAI 列表形态；带
+        `anthropic-version` 请求头或 Claude CLI User-Agent 时使用 Anthropic 列表形态。
+
+        `supported_reasoning_efforts` 根据可见渠道中该公开模型映射到的原模型名称计算。多个原模型
+        共享同一公开名称时返回能力交集；能力未知时省略字段，人工明确配置为空集合时返回 `[]`。
+        渠道中的 `redirect_model` 只参与服务端计算，不会在响应中暴露。
+      security:
+        - proxyBearer: []
+        - proxyAPIKey: []
+      responses:
+        '200':
+          description: OpenAI/Codex 或 Anthropic 模型列表
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - {$ref: '#/components/schemas/OpenAIModelList'}
+                  - {$ref: '#/components/schemas/AnthropicModelList'}
+              examples:
+                openai:
+                  value:
+                    object: list
+                    data:
+                      - id: sciland-3.0
+                        object: model
+                        created: 0
+                        owned_by: system
+                        supported_reasoning_efforts: [low, medium, high, xhigh]
+        '401': {$ref: '#/components/responses/Error'}
   /login:
     post:
       tags: [Session]
@@ -512,7 +548,14 @@ paths:
       tags: [Settings]
       operationId: batchUpdateSettings
       summary: 批量更新系统设置
-      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      description: |
+        设置值均以字符串提交。`model_reasoning_effort_overrides` 的值是 JSON 对象字符串，键为重定向后的
+        原模型名称，值为允许的推理强度数组；单独修改该设置时即时生效，无需重启。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SettingsBatchRequest'}
       responses:
         '200': {$ref: '#/components/responses/Success'}
   /admin/settings/{key}:
@@ -810,6 +853,14 @@ components:
       type: http
       scheme: bearer
       bearerFormat: ccLoad Web Session Token
+    proxyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: ccLoad API Token
+    proxyAPIKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
   parameters:
     ChannelID:
       name: id
@@ -1037,3 +1088,62 @@ components:
       required: [value]
       properties:
         value: {type: string}
+    ReasoningEffort:
+      type: string
+      enum: [none, minimal, low, medium, high, xhigh, max]
+    ModelReasoningEffortOverrides:
+      type: object
+      maxProperties: 500
+      description: 键为规范化后的原模型名称；空数组表示明确不暴露任何推理强度。
+      additionalProperties:
+        type: array
+        uniqueItems: true
+        items: {$ref: '#/components/schemas/ReasoningEffort'}
+      example:
+        gpt-5.6-sol: [low, medium, high, xhigh]
+    SettingsBatchRequest:
+      type: object
+      additionalProperties: {type: string}
+      properties:
+        model_reasoning_effort_overrides:
+          type: string
+          contentMediaType: application/json
+          description: 序列化后的 ModelReasoningEffortOverrides JSON 对象；保存后即时生效。
+          example: '{"gpt-5.6-sol":["low","high"]}'
+    SupportedReasoningEfforts:
+      type: array
+      description: 可用推理强度；能力未知时省略，明确禁用时返回空数组。
+      uniqueItems: true
+      items: {$ref: '#/components/schemas/ReasoningEffort'}
+    OpenAIModel:
+      type: object
+      required: [id, object, created, owned_by]
+      properties:
+        id: {type: string}
+        object: {type: string, const: model}
+        created: {type: integer, format: int64}
+        owned_by: {type: string}
+        supported_reasoning_efforts: {$ref: '#/components/schemas/SupportedReasoningEfforts'}
+    OpenAIModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object: {type: string, const: list}
+        data: {type: array, items: {$ref: '#/components/schemas/OpenAIModel'}}
+    AnthropicModel:
+      type: object
+      required: [id, display_name, type, created_at]
+      properties:
+        id: {type: string}
+        display_name: {type: string}
+        type: {type: string, const: model}
+        created_at: {type: string, format: date-time}
+        supported_reasoning_efforts: {$ref: '#/components/schemas/SupportedReasoningEfforts'}
+    AnthropicModelList:
+      type: object
+      required: [data, has_more]
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/AnthropicModel'}}
+        has_more: {type: boolean}
+        first_id: {type: string}
+        last_id: {type: string}
