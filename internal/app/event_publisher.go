@@ -67,7 +67,6 @@ func (s *Server) publishRequestUsageEvent(c *gin.Context, reqCtx *proxyRequestCo
 		Kind:        model.UsageEventRequest,
 		Time:        model.JSONTime{Time: time.Now()},
 		Environment: reqCtx.tokenEnvironment,
-		TokenHash:   reqCtx.tokenHash,
 		AuthTokenID: reqCtx.tokenID,
 		Model:       reqCtx.originalModel,
 		StatusCode:  c.Writer.Status(),

@@ -1013,7 +1013,6 @@ func buildAttemptUsageEvent(p logEntryParams, entry *model.LogEntry) *model.Usag
 		Kind:                     model.UsageEventAttempt,
 		Time:                     entry.Time,
 		Environment:              p.TokenEnvironment,
-		TokenHash:                p.TokenHash,
 		AuthTokenID:              entry.AuthTokenID,
 		ChannelID:                entry.ChannelID,
 		Model:                    entry.Model,
