@@ -374,6 +374,108 @@ func TestAdminCooldownBoundsUseFreshAtomicSnapshot(t *testing.T) {
 	}
 }
 
+func TestAdminReasoningEffortOverridesValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "valid", value: `{"gpt-5.6-sol":["low","high"]}`},
+		{name: "explicit empty", value: `{"no-reasoning":[]}`},
+		{name: "array top level", value: `[]`, wantErr: true},
+		{name: "unknown effort", value: `{"gpt-5.6-sol":["ultra"]}`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSettingValue(modelReasoningEffortOverridesSetting, "json", tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validate error = %v, wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestAdminReasoningEffortOverridesApplyLiveWithoutRestart(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelReasoningEffortOverridesSetting, map[string]string{
+		"value": `{"gpt-5.6-sol":["low","high"]}`,
+	}))
+	c.Params = gin.Params{{Key: "key", Value: modelReasoningEffortOverridesSetting}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", w.Code, w.Body.String())
+	}
+	got, known := resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"low", "high"}, true)
+	assertRestartNotTriggered(t, restarted)
+
+	c, w = newTestContext(t, newRequest(http.MethodPost, "/admin/settings/"+modelReasoningEffortOverridesSetting+"/reset", nil))
+	c.Params = gin.Params{{Key: "key", Value: modelReasoningEffortOverridesSetting}}
+	server.AdminResetSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset status=%d body=%s", w.Code, w.Body.String())
+	}
+	got, known = resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"low", "medium", "high", "xhigh"}, true)
+	assertRestartNotTriggered(t, restarted)
+}
+
+func TestAdminReasoningEffortOverridesMixedBatchAppliesLiveAndRestarts(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+		modelReasoningEffortOverridesSetting: `{"gpt-5.6-sol":["medium"]}`,
+		"log_retention_days":                 "14",
+	}))
+	server.AdminBatchUpdateSettings(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch status=%d body=%s", w.Code, w.Body.String())
+	}
+	got, known := resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"medium"}, true)
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected mixed batch restart")
+	}
+}
+
+func assertRestartNotTriggered(t testing.TB, restarted <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-restarted:
+		t.Fatal("reasoning-only setting update must not restart")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestAdminSettingsHandlers(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()

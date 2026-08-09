@@ -221,18 +221,26 @@ func (s *Server) AdminUpdateSetting(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.applyLiveSettings(updates); err != nil {
+		log.Printf("[ERROR] AdminUpdateSetting key=%s 热更新失败: %v", key, err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
 
-	// log.Printf("[INFO] Setting updated: %s = %s (restart required)", key, req.Value)
-
-	// 返回成功响应，告知需要重启
+	requiresRestart := settingsRequireRestart(updates)
+	message := "配置已保存并立即生效"
+	if requiresRestart {
+		message = "配置已保存，程序将在2秒后重启"
+	}
 	RespondJSON(c, http.StatusOK, gin.H{
-		"message": "配置已保存，程序将在2秒后重启",
+		"message": message,
 		"key":     key,
 		"value":   req.Value,
 	})
 
-	// 异步触发重启
-	go s.triggerRestart()
+	if requiresRestart {
+		go s.triggerRestart()
+	}
 }
 
 // AdminResetSetting 重置配置为默认值
@@ -271,17 +279,26 @@ func (s *Server) AdminResetSetting(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.applyLiveSettings(updates); err != nil {
+		log.Printf("[ERROR] AdminResetSetting key=%s 热更新失败: %v", key, err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
 
-	// log.Printf("[INFO] Setting reset to default: %s = %s (restart required)", key, setting.DefaultValue)
-
+	requiresRestart := settingsRequireRestart(updates)
+	message := "配置已重置为默认值并立即生效"
+	if requiresRestart {
+		message = "配置已重置为默认值，程序将在2秒后重启"
+	}
 	RespondJSON(c, http.StatusOK, gin.H{
-		"message": "配置已重置为默认值，程序将在2秒后重启",
+		"message": message,
 		"key":     key,
 		"value":   setting.DefaultValue,
 	})
 
-	// 异步触发重启
-	go s.triggerRestart()
+	if requiresRestart {
+		go s.triggerRestart()
+	}
 }
 
 // AdminBatchUpdateSettings 批量更新配置(事务保护)
@@ -325,15 +342,46 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.applyLiveSettings(updates); err != nil {
+		log.Printf("[ERROR] AdminBatchUpdateSettings 热更新失败: %v", err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
 
-	log.Printf("[INFO] 已批量更新 %d 项配置（需重启）", len(req))
+	requiresRestart := settingsRequireRestart(updates)
+	message := fmt.Sprintf("已保存 %d 项配置并立即生效", len(req))
+	if requiresRestart {
+		message = fmt.Sprintf("已保存 %d 项配置，程序将在2秒后重启", len(req))
+	}
+	log.Printf("[INFO] 已批量更新 %d 项配置（需要重启: %t）", len(req), requiresRestart)
 
 	RespondJSON(c, http.StatusOK, gin.H{
-		"message": fmt.Sprintf("已保存 %d 项配置，程序将在2秒后重启", len(req)),
+		"message": message,
 	})
 
-	// 异步触发重启
-	go s.triggerRestart()
+	if requiresRestart {
+		go s.triggerRestart()
+	}
+}
+
+func (s *Server) applyLiveSettings(updates map[string]string) error {
+	value, ok := updates[modelReasoningEffortOverridesSetting]
+	if !ok {
+		return nil
+	}
+	if s.modelReasoningCapabilities == nil {
+		return fmt.Errorf("model reasoning capability resolver is not initialized")
+	}
+	return s.modelReasoningCapabilities.SetOverrides(value)
+}
+
+func settingsRequireRestart(updates map[string]string) bool {
+	for key := range updates {
+		if key != modelReasoningEffortOverridesSetting {
+			return true
+		}
+	}
+	return false
 }
 
 // validateSettingValue 验证配置值的合法性
@@ -474,10 +522,15 @@ func validateSettingValue(key, valueType, value string) error {
 		}
 
 	case "json":
-		if key != "antigravity_sensitive_words" {
+		switch key {
+		case "antigravity_sensitive_words":
+			return validateJSONStringArray(value)
+		case modelReasoningEffortOverridesSetting:
+			_, err := parseModelReasoningEffortOverrides(value)
+			return err
+		default:
 			return fmt.Errorf("unknown JSON setting: %s", key)
 		}
-		return validateJSONStringArray(value)
 
 	default:
 		return fmt.Errorf("unknown value type: %s", valueType)

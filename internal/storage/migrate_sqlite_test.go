@@ -603,6 +603,27 @@ func TestMigrateSQLite_SeedsModelCatalogSyncIntervalSetting(t *testing.T) {
 	}
 }
 
+func TestMigrateSQLiteSeedsModelReasoningEffortOverridesSetting(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	var value, valueType, defaultValue string
+	if err := db.QueryRowContext(ctx, `
+		SELECT value, value_type, default_value
+		FROM system_settings
+		WHERE "key" = ?
+	`, "model_reasoning_effort_overrides").Scan(&value, &valueType, &defaultValue); err != nil {
+		t.Fatalf("get model_reasoning_effort_overrides: %v", err)
+	}
+	if value != "{}" || valueType != "json" || defaultValue != "{}" {
+		t.Fatalf("setting = value:%q type:%q default:%q, want value:{} type:json default:{}", value, valueType, defaultValue)
+	}
+}
+
 func TestMigrateSQLiteLeavesRemovedFingerprintTablesAlone(t *testing.T) {
 	t.Run("fresh database", func(t *testing.T) {
 		db := openTestDB(t)
