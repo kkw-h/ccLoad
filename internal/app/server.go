@@ -37,9 +37,11 @@ type Server struct {
 	// ============================================================================
 	// 服务层
 	// ============================================================================
-	authService   *AuthService   // 认证授权服务
-	logService    *LogService    // 日志管理服务
-	configService *ConfigService // 配置管理服务
+	authService          *AuthService   // 认证授权服务
+	logService           *LogService    // 日志管理服务
+	configService        *ConfigService // 配置管理服务
+	externalAuthService  *ExternalAuthService
+	externalAuthResolver externalAuthResolver
 
 	// ============================================================================
 	// 核心字段
@@ -332,6 +334,32 @@ func NewServer(store storage.Store) *Server {
 		store, // 传入store用于热更新令牌
 	)
 	s.authService.RegisterWebSessionRevokeHook(s.xaiOAuth.cancelByAdmin)
+
+	externalAuthCfg, err := externalAuthConfigFromConfigService(configService)
+	if err != nil {
+		log.Fatalf("[FATAL] 外部鉴权配置无效: %v", err)
+	}
+	externalAuthLoadCtx, externalAuthLoadCancel := newExternalAuthLoadContext()
+	externalAuthEnvironments, err := store.ListExternalAuthEnvironments(externalAuthLoadCtx)
+	externalAuthLoadCancel()
+	if err != nil {
+		log.Fatalf("[FATAL] 加载外部鉴权环境失败: %v", err)
+	}
+	externalAuthCfg.Environments, err = buildExternalAuthEnvironmentTargets(externalAuthEnvironments)
+	if err != nil {
+		log.Fatalf("[FATAL] 解析外部鉴权环境失败: %v", err)
+	}
+	s.externalAuthResolver = net.DefaultResolver
+	s.externalAuthService = newExternalAuthService(
+		externalAuthCfg,
+		newExternalAuthHTTPClient(s.externalAuthResolver),
+		nil,
+	)
+	if externalAuthCfg.Enabled {
+		log.Printf("[INFO] 外部鉴权已启用（活动环境: %d）", len(externalAuthCfg.Environments))
+	} else {
+		log.Print("[INFO] 外部鉴权未启用")
+	}
 
 	// 启动后台 worker（Token 统计 / Token 清理 / 状态清理）
 	s.startBackgroundWorkers()
@@ -1037,14 +1065,16 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 	// 公开访问的API（代理服务）- 需要 API 认证
 	// 透明代理：统一处理所有 /v1/* 端点，支持所有HTTP方法
 	apiV1 := r.Group("/v1")
-	apiV1.Use(s.authService.RequireAPIAuth())
 	apiV1.Use(captureClientRequestMetadata())
+	apiV1.Use(s.externalAuthService.Middleware())
+	apiV1.Use(s.authService.RequireAPIAuth())
 	{
 		apiV1.Any("/*path", s.HandleProxyRequest)
 	}
 	apiV1Beta := r.Group("/v1beta")
-	apiV1Beta.Use(s.authService.RequireAPIAuth())
 	apiV1Beta.Use(captureClientRequestMetadata())
+	apiV1Beta.Use(s.externalAuthService.Middleware())
+	apiV1Beta.Use(s.authService.RequireAPIAuth())
 	{
 		apiV1Beta.Any("/*path", s.HandleProxyRequest)
 	}
@@ -1053,8 +1083,9 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 	// codexDirect 路由组。只注册 WS 升级用到的 GET：非 WS 流量落到这条路径在
 	// DetectRequestFamily 下解析不出协议族，超出「对齐 WS 别名」的范围，不注册 POST。
 	codexDirect := r.Group("/backend-api/codex")
-	codexDirect.Use(s.authService.RequireAPIAuth())
 	codexDirect.Use(captureClientRequestMetadata())
+	codexDirect.Use(s.externalAuthService.Middleware())
+	codexDirect.Use(s.authService.RequireAPIAuth())
 	{
 		codexDirect.GET("/responses", s.HandleProxyRequest)
 	}

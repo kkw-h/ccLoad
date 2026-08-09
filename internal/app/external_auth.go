@@ -396,6 +396,25 @@ func (s *ExternalAuthService) ReplaceEnvironments(targets map[string]externalAut
 	s.environmentMu.Unlock()
 }
 
+func buildExternalAuthEnvironmentTargets(items []*model.ExternalAuthEnvironment) (map[string]externalAuthEnvironmentTarget, error) {
+	targets := make(map[string]externalAuthEnvironmentTarget)
+	for _, item := range items {
+		if item == nil || !item.IsActive {
+			continue
+		}
+		environment, err := model.NormalizeExternalAuthEnvironment(item.Environment)
+		if err != nil {
+			return nil, err
+		}
+		parsed, err := url.Parse(strings.TrimSpace(item.AuthzURL))
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+			return nil, fmt.Errorf("invalid external auth URL for environment %q", environment)
+		}
+		targets[environment] = externalAuthEnvironmentTarget{Environment: environment, AuthzURL: parsed}
+	}
+	return targets, nil
+}
+
 func unavailableExternalAuthError(msg string) error {
 	return &externalAuthError{kind: externalAuthErrorUnavailable, msg: msg}
 }
