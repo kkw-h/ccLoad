@@ -162,6 +162,7 @@ func (s *Server) handleListChannels(c *gin.Context) {
 	}
 
 	ectx := &channelEnrichmentContext{
+		server:              s,
 		now:                 now,
 		healthEnabled:       healthEnabled,
 		priorityMap:         priorityMap,
@@ -327,6 +328,7 @@ func paginateChannels(cfgs []*model.Config, c *gin.Context) []*model.Config {
 
 // channelEnrichmentContext 聚合 enrichChannel 所需的批量预计算数据，避免长参数列表。
 type channelEnrichmentContext struct {
+	server              *Server
 	now                 time.Time
 	healthEnabled       bool
 	priorityMap         map[int64]float64
@@ -343,6 +345,7 @@ func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWi
 	metadata := channelOAuthMetadataFromCredential(cfg)
 	oc := ChannelWithCooldown{
 		Config:                       cfg,
+		Models:                       ectx.server.adminChannelModelEntries(cfg.ModelEntries),
 		CodexPlanType:                metadata.planType,
 		CodexSubscriptionActiveUntil: metadata.subscriptionActiveUntil,
 		AnthropicPlanType:            metadata.anthropicPlanType,
@@ -388,6 +391,38 @@ func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWi
 	oc.KeyCooldowns = keyCooldowns
 	oc.ModelCooldowns = activeModelCooldownInfos(ectx.modelCooldownsMap[cfg.ID], ectx.now)
 	return oc
+}
+
+func (s *Server) adminChannelModelEntries(entries []model.ModelEntry) []AdminChannelModelEntry {
+	if entries == nil {
+		return nil
+	}
+
+	out := make([]AdminChannelModelEntry, 0, len(entries))
+	for _, entry := range entries {
+		redirectModel := entry.RedirectModel
+		if redirectModel == "" {
+			redirectModel = entry.Model
+		}
+
+		responseEntry := AdminChannelModelEntry{
+			Model:         entry.Model,
+			RedirectModel: redirectModel,
+			Disabled:      entry.Disabled,
+		}
+		originalModel := strings.TrimSpace(entry.RedirectModel)
+		if originalModel == "" {
+			originalModel = entry.Model
+		}
+		if s != nil && s.modelReasoningCapabilities != nil {
+			if efforts, known := s.modelReasoningCapabilities.Resolve(originalModel); known {
+				effortsCopy := append([]string{}, efforts...)
+				responseEntry.SupportedReasoningEfforts = &effortsCopy
+			}
+		}
+		out = append(out, responseEntry)
+	}
+	return out
 }
 
 type channelOAuthMetadata struct {
@@ -667,6 +702,7 @@ func (s *Server) buildChannelDetail(ctx context.Context, id int64, cfg *model.Co
 	metadata := channelOAuthMetadataFromCredential(cfg)
 	return ChannelWithCooldown{
 		Config:                       cfg,
+		Models:                       s.adminChannelModelEntries(cfg.ModelEntries),
 		CodexPlanType:                metadata.planType,
 		CodexSubscriptionActiveUntil: metadata.subscriptionActiveUntil,
 		AnthropicPlanType:            metadata.anthropicPlanType,

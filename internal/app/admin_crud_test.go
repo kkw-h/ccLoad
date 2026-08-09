@@ -103,6 +103,110 @@ func TestHandleListChannels(t *testing.T) {
 	}
 }
 
+type adminChannelReasoningModelResponse struct {
+	Model                     string    `json:"model"`
+	RedirectModel             string    `json:"redirect_model"`
+	SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts"`
+}
+
+type adminChannelReasoningResponse struct {
+	Models []adminChannelReasoningModelResponse `json:"models"`
+}
+
+func assertAdminChannelReasoningModels(t *testing.T, models []adminChannelReasoningModelResponse) {
+	t.Helper()
+	if len(models) != 3 {
+		t.Fatalf("models=%+v, want 3 entries", models)
+	}
+
+	byName := make(map[string]adminChannelReasoningModelResponse, len(models))
+	for _, entry := range models {
+		byName[entry.Model] = entry
+	}
+
+	sciland := byName["sciland-3.0"]
+	wantEfforts := []string{"low", "medium", "high", "xhigh"}
+	if sciland.RedirectModel != "gpt-5.6-sol" || sciland.SupportedReasoningEfforts == nil ||
+		!slices.Equal(*sciland.SupportedReasoningEfforts, wantEfforts) {
+		t.Fatalf("sciland-3.0=%+v, want redirect gpt-5.6-sol and efforts %v", sciland, wantEfforts)
+	}
+
+	unknown := byName["unknown-model"]
+	if unknown.RedirectModel != "unknown-model" || unknown.SupportedReasoningEfforts != nil {
+		t.Fatalf("unknown-model=%+v, want redirect fallback and omitted efforts", unknown)
+	}
+
+	noThinking := byName["no-thinking"]
+	if noThinking.RedirectModel != "disabled-thinking" || noThinking.SupportedReasoningEfforts == nil ||
+		len(*noThinking.SupportedReasoningEfforts) != 0 {
+		t.Fatalf("no-thinking=%+v, want explicit empty efforts", noThinking)
+	}
+}
+
+func TestAdminChannelResponsesIncludeReasoningEfforts(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	resolver, err := newModelReasoningCapabilityResolver(`{"disabled-thinking":[]}`)
+	if err != nil {
+		t.Fatalf("创建推理能力解析器失败: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	created, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "reasoning-capability-response",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+		ModelEntries: []model.ModelEntry{
+			{Model: "sciland-3.0", RedirectModel: "gpt-5.6-sol"},
+			{Model: "unknown-model"},
+			{Model: "no-thinking", RedirectModel: "disabled-thinking"},
+		},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("创建渠道失败: %v", err)
+	}
+
+	t.Run("list", func(t *testing.T) {
+		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+		server.HandleChannels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[[]adminChannelReasoningResponse](t, w.Body.Bytes())
+		if len(resp.Data) != 1 {
+			t.Fatalf("channels=%+v, want 1", resp.Data)
+		}
+		assertAdminChannelReasoningModels(t, resp.Data[0].Models)
+	})
+
+	t.Run("detail", func(t *testing.T) {
+		path := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+		c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+		server.HandleChannelByID(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[adminChannelReasoningResponse](t, w.Body.Bytes())
+		assertAdminChannelReasoningModels(t, resp.Data.Models)
+	})
+
+	t.Run("editor", func(t *testing.T) {
+		path := "/admin/channels/" + strconv.FormatInt(created.ID, 10) + "/editor"
+		c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+		server.HandleChannelEditor(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[struct {
+			Channel adminChannelReasoningResponse `json:"channel"`
+		}](t, w.Body.Bytes())
+		assertAdminChannelReasoningModels(t, resp.Data.Channel.Models)
+	})
+}
+
 func TestHandleListChannelsIncludesActiveModelCooldowns(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
