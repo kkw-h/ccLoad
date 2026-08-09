@@ -442,22 +442,32 @@ type ChannelModelStats struct {
 	AvgDurationSeconds      *float64 `json:"avg_duration_seconds,omitempty"`
 }
 
+// AdminChannelModelEntry 是管理接口的模型响应结构。
+// 推理强度是运行时能力，不属于渠道持久化配置，因此不放入 model.ModelEntry。
+type AdminChannelModelEntry struct {
+	Model                     string    `json:"model"`
+	RedirectModel             string    `json:"redirect_model,omitempty"`
+	Disabled                  bool      `json:"disabled,omitempty"`
+	SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
+}
+
 // ChannelWithCooldown 带冷却状态的渠道响应结构
 type ChannelWithCooldown struct {
 	*model.Config
-	CodexPlanType                string              `json:"codex_plan_type,omitempty"`
-	CodexSubscriptionActiveUntil *time.Time          `json:"codex_subscription_active_until,omitempty"`
-	AntigravityPaidTier          string              `json:"antigravity_paid_tier,omitempty"`
-	XAIEmail                     string              `json:"xai_email,omitempty"`
-	XAISubscriptionTier          string              `json:"xai_subscription_tier,omitempty"`
-	XAIEntitlementStatus         string              `json:"xai_entitlement_status,omitempty"`
-	KeyStrategy                  string              `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
-	CooldownUntil                *time.Time          `json:"cooldown_until,omitempty"`
-	CooldownRemainingMS          int64               `json:"cooldown_remaining_ms,omitempty"`
-	KeyCooldowns                 []KeyCooldownInfo   `json:"key_cooldowns,omitempty"`
-	ModelCooldowns               []ModelCooldownInfo `json:"model_cooldowns,omitempty"`
-	EffectivePriority            *float64            `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
-	SuccessRate                  *float64            `json:"success_rate,omitempty"`       // 成功率(0-1)
+	Models                       []AdminChannelModelEntry `json:"models"`
+	CodexPlanType                string                   `json:"codex_plan_type,omitempty"`
+	CodexSubscriptionActiveUntil *time.Time               `json:"codex_subscription_active_until,omitempty"`
+	AntigravityPaidTier          string                   `json:"antigravity_paid_tier,omitempty"`
+	XAIEmail                     string                   `json:"xai_email,omitempty"`
+	XAISubscriptionTier          string                   `json:"xai_subscription_tier,omitempty"`
+	XAIEntitlementStatus         string                   `json:"xai_entitlement_status,omitempty"`
+	KeyStrategy                  string                   `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
+	CooldownUntil                *time.Time               `json:"cooldown_until,omitempty"`
+	CooldownRemainingMS          int64                    `json:"cooldown_remaining_ms,omitempty"`
+	KeyCooldowns                 []KeyCooldownInfo        `json:"key_cooldowns,omitempty"`
+	ModelCooldowns               []ModelCooldownInfo      `json:"model_cooldowns,omitempty"`
+	EffectivePriority            *float64                 `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
+	SuccessRate                  *float64                 `json:"success_rate,omitempty"`       // 成功率(0-1)
 }
 
 // ChannelImportSummary 导入结果统计
