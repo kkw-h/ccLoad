@@ -1196,10 +1196,6 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.PUT("/settings/:key", s.AdminUpdateSetting)
 		admin.POST("/settings/:key/reset", s.AdminResetSetting)
 		admin.POST("/settings/batch", s.AdminBatchUpdateSettings)
-		admin.GET("/external-auth-environments", s.AdminListExternalAuthEnvironments)
-		admin.POST("/external-auth-environments", s.AdminCreateExternalAuthEnvironment)
-		admin.PUT("/external-auth-environments/:id", s.AdminUpdateExternalAuthEnvironment)
-		admin.DELETE("/external-auth-environments/:id", s.AdminDeleteExternalAuthEnvironment)
 
 		// 模型指纹
 		admin.GET("/fingerprints", s.HandleListFingerprints)
