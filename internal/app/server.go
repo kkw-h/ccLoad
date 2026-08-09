@@ -58,6 +58,7 @@ type Server struct {
 	channelBalancer               *SmoothWeightedRR          // 渠道负载均衡器（平滑加权轮询）
 	urlSelector                   *URLSelector               // URL选择器（多URL场景的延迟追踪与冷却）
 	protocolRegistry              *protocol.Registry
+	modelReasoningCapabilities    *modelReasoningCapabilityResolver
 	client                        *http.Client // HTTP客户端（全局默认）
 	xaiSSOClient                  *http.Client // xAI Web SSO 专用 HTTP/1.1 客户端
 	proxyTransports               sync.Map     // proxyURL → *http.Client（渠道级代理缓存）
@@ -180,11 +181,19 @@ func NewServer(store storage.Store) *Server {
 	logHostOverrides(getHostOverrides())
 
 	baseCtx, baseCancel := context.WithCancel(context.Background())
+	reasoningCapabilities, err := newModelReasoningCapabilityResolver(
+		configService.GetString(modelReasoningEffortOverridesSetting, "{}"),
+	)
+	if err != nil {
+		log.Printf("[WARN] 推理强度覆盖配置无效，已回退内置能力: %v", err)
+		reasoningCapabilities, _ = newModelReasoningCapabilityResolver("{}")
+	}
 
 	s := &Server{
-		store:            store,
-		configService:    configService,
-		loginRateLimiter: util.NewLoginRateLimiter(),
+		store:                      store,
+		configService:              configService,
+		loginRateLimiter:           util.NewLoginRateLimiter(),
+		modelReasoningCapabilities: reasoningCapabilities,
 
 		// 运行时配置（启动时加载，修改后重启生效）
 		maxKeyRetries:            runtimeCfg.MaxKeyRetries,

@@ -573,6 +573,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"cooldown_max_seconds", "1800", "int", "指数退避冷却上限(秒,>=1且必须>=cooldown_min_seconds)", "1800"},
 		{"cooldown_min_seconds", "10", "int", "指数退避冷却下限(秒,>=1且必须<=cooldown_max_seconds)", "10"},
 		{"global_cooldown_detection_rules", "{}", "json", "未配置渠道专属规则时继承的全局冷却探测规则", "{}"},
+		{"model_reasoning_effort_overrides", "{}", "json", "按原模型名称覆盖可用推理强度", "{}"},
 		{"antigravity_sensitive_words", config.DefaultAntigravitySensitiveWordsJSON, "json", "Antigravity systemInstruction 中使用零宽字符替换的敏感词 JSON 字符串数组", config.DefaultAntigravitySensitiveWordsJSON},
 		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
 		{"upstream_connection_reuse_limit_seconds", "0", "duration", "上游连接最长复用时间(秒,0=不限制;达到时限后不接收新请求,在途请求完成后关闭)", "0"},
