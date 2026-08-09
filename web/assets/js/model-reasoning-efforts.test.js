@@ -40,6 +40,12 @@ test('rejects model names that collide after normalization', () => {
   }), /duplicate model/);
 });
 
+test('counts Unicode model names by code point', () => {
+  const validName = '🧠'.repeat(255);
+  assert.deepEqual(normalizeOverrides({ [validName]: ['low'] }), { [validName]: ['low'] });
+  assert.throws(() => normalizeOverrides({ [`${validName}🧠`]: ['low'] }), /model name/);
+});
+
 test('adds and updates overrides without mutating input', () => {
   const initial = { beta: ['medium'] };
   const added = upsertOverride(initial, ' Alpha ', ['HIGH', 'low']);

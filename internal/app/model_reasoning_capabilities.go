@@ -3,9 +3,11 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"unicode/utf8"
 )
 
 const (
@@ -93,15 +95,49 @@ func (r *modelReasoningCapabilityResolver) ResolveAll(originalModels []string) (
 }
 
 func parseModelReasoningEffortOverrides(raw string) (map[string][]string, error) {
-	var values map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil {
 		return nil, fmt.Errorf("must be a JSON object: %w", err)
 	}
-	if values == nil {
+	openingDelimiter, ok := opening.(json.Delim)
+	if !ok || openingDelimiter != '{' {
 		return nil, fmt.Errorf("must be a JSON object")
 	}
-	if len(values) > maxModelReasoningEffortOverrides {
-		return nil, fmt.Errorf("must contain at most %d model overrides", maxModelReasoningEffortOverrides)
+
+	type rawOverride struct {
+		model   string
+		efforts json.RawMessage
+	}
+	values := make([]rawOverride, 0)
+	for decoder.More() {
+		modelToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("must be a JSON object: %w", err)
+		}
+		modelName, ok := modelToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("must be a JSON object")
+		}
+		var encodedEfforts json.RawMessage
+		if err := decoder.Decode(&encodedEfforts); err != nil {
+			return nil, fmt.Errorf("must be a JSON object: %w", err)
+		}
+		values = append(values, rawOverride{model: modelName, efforts: encodedEfforts})
+		if len(values) > maxModelReasoningEffortOverrides {
+			return nil, fmt.Errorf("must contain at most %d model overrides", maxModelReasoningEffortOverrides)
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return nil, fmt.Errorf("must be a JSON object")
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("must contain exactly one JSON object")
+		}
+		return nil, fmt.Errorf("must be a JSON object: %w", err)
 	}
 
 	allowedEfforts := make(map[string]struct{}, len(reasoningEffortOrder))
@@ -110,12 +146,12 @@ func parseModelReasoningEffortOverrides(raw string) (map[string][]string, error)
 	}
 
 	normalized := make(map[string][]string, len(values))
-	for rawModel, encodedEfforts := range values {
-		modelName := normalizeReasoningModelName(rawModel)
+	for _, value := range values {
+		modelName := normalizeReasoningModelName(value.model)
 		if modelName == "" {
 			return nil, fmt.Errorf("model name must not be blank")
 		}
-		if len(modelName) > maxReasoningModelNameLength {
+		if utf8.RuneCountInString(modelName) > maxReasoningModelNameLength {
 			return nil, fmt.Errorf("model name must not exceed %d characters", maxReasoningModelNameLength)
 		}
 		if _, exists := normalized[modelName]; exists {
@@ -123,7 +159,7 @@ func parseModelReasoningEffortOverrides(raw string) (map[string][]string, error)
 		}
 
 		var rawEfforts []string
-		if err := json.Unmarshal(encodedEfforts, &rawEfforts); err != nil || rawEfforts == nil {
+		if err := json.Unmarshal(value.efforts, &rawEfforts); err != nil || rawEfforts == nil {
 			return nil, fmt.Errorf("reasoning efforts for %s must be an array of strings", modelName)
 		}
 		selected := make(map[string]struct{}, len(rawEfforts))

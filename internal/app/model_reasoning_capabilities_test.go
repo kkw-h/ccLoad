@@ -76,6 +76,7 @@ func TestParseModelReasoningEffortOverridesRejectsInvalidValues(t *testing.T) {
 		{name: "long model", raw: `{"` + strings.Repeat("m", 256) + `":["low"]}`, wantErr: "255"},
 		{name: "non array", raw: `{"model":"low"}`, wantErr: "array"},
 		{name: "unknown effort", raw: `{"model":["ultra"]}`, wantErr: "unknown reasoning effort"},
+		{name: "exact duplicate", raw: `{"model":["low"],"model":["high"]}`, wantErr: "duplicate model"},
 		{name: "normalized duplicate", raw: `{"Model":["low"],"model":["high"]}`, wantErr: "duplicate model"},
 	}
 
@@ -86,6 +87,22 @@ func TestParseModelReasoningEffortOverridesRejectsInvalidValues(t *testing.T) {
 				t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseModelReasoningEffortOverridesCountsUnicodeCodePoints(t *testing.T) {
+	modelName := strings.Repeat("模", maxReasoningModelNameLength)
+	overrides, err := parseModelReasoningEffortOverrides(`{"` + modelName + `":["low"]}`)
+	if err != nil {
+		t.Fatalf("255-code-point model name rejected: %v", err)
+	}
+	if _, ok := overrides[modelName]; !ok {
+		t.Fatalf("normalized overrides missing Unicode model name")
+	}
+
+	_, err = parseModelReasoningEffortOverrides(`{"` + modelName + `模":["low"]}`)
+	if err == nil || !strings.Contains(err.Error(), "255") {
+		t.Fatalf("256-code-point model name error = %v, want length error", err)
 	}
 }
 

@@ -20,7 +20,7 @@
     const seenModels = new Set();
     for (const [rawModel, rawEfforts] of entries) {
       const model = String(rawModel).trim().toLowerCase();
-      if (!model || model.length > MAX_MODEL_NAME_LENGTH) {
+      if (!model || Array.from(model).length > MAX_MODEL_NAME_LENGTH) {
         throw new TypeError('invalid model name');
       }
       if (seenModels.has(model)) {

@@ -47,6 +47,8 @@ type Server struct {
 	authService   *AuthService   // 认证授权服务
 	logService    *LogService    // 日志管理服务
 	configService *ConfigService // 配置管理服务
+	// 串行化管理设置的持久化与热应用，保证运行时快照和数据库提交顺序一致。
+	settingsMutationMu sync.Mutex
 
 	// ============================================================================
 	// 核心字段
