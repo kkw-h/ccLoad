@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"net/http"
+	"reflect"
 	"testing"
 
 	"ccLoad/internal/model"
@@ -453,4 +454,156 @@ func TestProxyGemini_ListModelsHandlers(t *testing.T) {
 			t.Fatalf("unexpected filtered resp: %+v", resp)
 		}
 	})
+}
+
+func TestProxyModelsExposeReasoningCapabilitiesForOpenAIAndAnthropic(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	resolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	_, err = store.CreateConfig(context.Background(), &model.Config{
+		Name:         "reasoning-model-channel",
+		URLs:         model.ChannelURLs{{URL: "https://example.com"}},
+		Priority:     1,
+		Enabled:      true,
+		ModelEntries: []model.ModelEntry{{Model: "sciland-3.0", RedirectModel: "gpt-5.6-sol"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{name: "openai"},
+		{name: "codex", headers: map[string]string{"User-Agent": "codex-cli/1.0"}},
+		{name: "anthropic", headers: map[string]string{"anthropic-version": "2023-06-01"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := newRequest(http.MethodGet, "/v1/models", nil)
+			for key, value := range tt.headers {
+				req.Header.Set(key, value)
+			}
+			c, w := newTestContext(t, req)
+			server.handleListOpenAIModels(c)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			efforts := modelReasoningEffortsFromResponse(t, w.Body.Bytes(), "sciland-3.0")
+			if efforts == nil || !reflect.DeepEqual(*efforts, []string{"low", "medium", "high", "xhigh"}) {
+				t.Fatalf("efforts=%#v", efforts)
+			}
+		})
+	}
+}
+
+func TestProxyModelsReasoningCapabilitiesIntersectionUnknownAndEmpty(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	resolver, err := newModelReasoningCapabilityResolver(`{
+		"upstream-a":["low","medium","high"],
+		"upstream-b":["medium","high","xhigh"],
+		"no-reasoning":[]
+	}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	configs := []*model.Config{
+		{Name: "intersection-a", URLs: model.ChannelURLs{{URL: "https://a.example.com"}}, Priority: 1, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "shared-model", RedirectModel: "upstream-a"}}},
+		{Name: "intersection-b", URLs: model.ChannelURLs{{URL: "https://b.example.com"}}, Priority: 2, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "shared-model", RedirectModel: "upstream-b"}}},
+		{Name: "unknown", URLs: model.ChannelURLs{{URL: "https://unknown.example.com"}}, Priority: 3, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "unknown-model", RedirectModel: "unknown-upstream"}}},
+		{Name: "empty", URLs: model.ChannelURLs{{URL: "https://empty.example.com"}}, Priority: 4, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "empty-model", RedirectModel: "no-reasoning"}}},
+	}
+	for _, cfg := range configs {
+		if _, err := store.CreateConfig(context.Background(), cfg); err != nil {
+			t.Fatalf("CreateConfig %s: %v", cfg.Name, err)
+		}
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/v1/models", nil))
+	server.handleListOpenAIModels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	shared := modelReasoningEffortsFromResponse(t, w.Body.Bytes(), "shared-model")
+	if shared == nil || !reflect.DeepEqual(*shared, []string{"medium", "high"}) {
+		t.Fatalf("shared efforts=%#v", shared)
+	}
+	if unknown := modelReasoningEffortsFromResponse(t, w.Body.Bytes(), "unknown-model"); unknown != nil {
+		t.Fatalf("unknown efforts must be omitted, got %#v", *unknown)
+	}
+	empty := modelReasoningEffortsFromResponse(t, w.Body.Bytes(), "empty-model")
+	if empty == nil || len(*empty) != 0 {
+		t.Fatalf("explicit empty efforts=%#v", empty)
+	}
+}
+
+func TestProxyModelsReasoningCapabilitiesRespectTokenChannelRestrictions(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	resolver, err := newModelReasoningCapabilityResolver(`{
+		"allowed-upstream":["low","high"],
+		"denied-upstream":["medium"]
+	}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+	server.authService = newTestAuthService(t)
+
+	if _, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "allowed", URLs: model.ChannelURLs{{URL: "https://allowed.example.com"}}, Priority: 1, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "restricted-model", RedirectModel: "allowed-upstream"}},
+	}); err != nil {
+		t.Fatalf("create allowed channel: %v", err)
+	}
+	denied, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "denied", URLs: model.ChannelURLs{{URL: "https://denied.example.com"}}, Priority: 2, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "restricted-model", RedirectModel: "denied-upstream"}},
+	})
+	if err != nil {
+		t.Fatalf("create denied channel: %v", err)
+	}
+
+	tokenHash := model.HashToken("reasoning-channel-restricted-token")
+	server.authService.authTokensMux.Lock()
+	server.authService.authTokenChannels[tokenHash] = mustChannelRestriction(t, model.ChannelRestrictionModeDeny, denied.ID)
+	server.authService.authTokensMux.Unlock()
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/v1/models", nil))
+	c.Set("token_hash", tokenHash)
+	server.handleListOpenAIModels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	efforts := modelReasoningEffortsFromResponse(t, w.Body.Bytes(), "restricted-model")
+	if efforts == nil || !reflect.DeepEqual(*efforts, []string{"low", "high"}) {
+		t.Fatalf("restricted efforts=%#v", efforts)
+	}
+}
+
+func modelReasoningEffortsFromResponse(t testing.TB, body []byte, modelID string) *[]string {
+	t.Helper()
+	var response struct {
+		Data []struct {
+			ID                        string    `json:"id"`
+			SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, body, &response)
+	for _, item := range response.Data {
+		if item.ID == modelID {
+			return item.SupportedReasoningEfforts
+		}
+	}
+	t.Fatalf("model %q missing from response: %s", modelID, body)
+	return nil
 }

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"ccLoad/internal/model"
 )
 
 // ============================================================================
@@ -45,6 +47,75 @@ func (s *Server) filterVisibleModelsForRequest(c *gin.Context, _ string, models 
 	}
 
 	return s.authService.FilterAllowedModels(tokenHashStr, models)
+}
+
+func (s *Server) visibleModelsAndChannelsForRequest(c *gin.Context, channels []*model.Config) ([]string, []*model.Config) {
+	visibleChannels := channels
+	tokenHash, _ := c.Get("token_hash")
+	tokenHashStr, _ := tokenHash.(string)
+	if s.authService != nil && tokenHashStr != "" {
+		if filtered, restricted := s.authService.FilterAllowedChannels(tokenHashStr, channels); restricted {
+			visibleChannels = filtered
+		}
+	}
+
+	models := modelNamesFromChannels(visibleChannels)
+	if s.authService != nil && tokenHashStr != "" {
+		models = s.authService.FilterAllowedModels(tokenHashStr, models)
+	}
+	return models, visibleChannels
+}
+
+func (s *Server) reasoningCapabilitiesForVisibleModels(channels []*model.Config, visibleModels []string) map[string]*[]string {
+	capabilities := make(map[string]*[]string)
+	if s.modelReasoningCapabilities == nil {
+		return capabilities
+	}
+
+	visible := make(map[string]struct{}, len(visibleModels))
+	for _, modelName := range visibleModels {
+		visible[modelName] = struct{}{}
+	}
+	originalsByModel := make(map[string]map[string]struct{}, len(visibleModels))
+	for _, cfg := range channels {
+		if cfg == nil {
+			continue
+		}
+		for _, entry := range cfg.ModelEntries {
+			if entry.Disabled {
+				continue
+			}
+			if _, ok := visible[entry.Model]; !ok {
+				continue
+			}
+			originalModel := strings.TrimSpace(entry.RedirectModel)
+			if originalModel == "" {
+				originalModel = entry.Model
+			}
+			if originalsByModel[entry.Model] == nil {
+				originalsByModel[entry.Model] = make(map[string]struct{})
+			}
+			originalsByModel[entry.Model][normalizeReasoningModelName(originalModel)] = struct{}{}
+		}
+	}
+
+	for modelName, originalsSet := range originalsByModel {
+		originals := make([]string, 0, len(originalsSet))
+		for original := range originalsSet {
+			originals = append(originals, original)
+		}
+		sort.Strings(originals)
+		efforts, known := s.modelReasoningCapabilities.ResolveAll(originals)
+		if !known {
+			continue
+		}
+		effortsCopy := append([]string(nil), efforts...)
+		if effortsCopy == nil {
+			effortsCopy = make([]string, 0)
+		}
+		capabilities[modelName] = &effortsCopy
+	}
+	return capabilities
 }
 
 // handleListGeminiModels 处理 GET /v1beta/models 请求，返回本地 Gemini 模型列表
@@ -99,28 +170,31 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	clientProtocol := detectModelsClientProtocol(c)
-	models, err := s.getAllEnabledModels(ctx)
+	channels, err := s.GetEnabledChannelsByModel(ctx, "*")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load models"})
 		return
 	}
-	models = s.filterVisibleModelsForRequest(c, clientProtocol, models)
+	models, visibleChannels := s.visibleModelsAndChannelsForRequest(c, channels)
 	sort.Strings(models)
+	reasoningCapabilities := s.reasoningCapabilitiesForVisibleModels(visibleChannels, models)
 
 	if clientProtocol == "anthropic" {
 		type ModelInfo struct {
-			ID          string `json:"id"`
-			DisplayName string `json:"display_name"`
-			Type        string `json:"type"`
-			CreatedAt   string `json:"created_at"`
+			ID                        string    `json:"id"`
+			DisplayName               string    `json:"display_name"`
+			Type                      string    `json:"type"`
+			CreatedAt                 string    `json:"created_at"`
+			SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
 		}
 		modelList := make([]ModelInfo, 0, len(models))
 		for _, model := range models {
 			modelList = append(modelList, ModelInfo{
-				ID:          model,
-				DisplayName: formatModelDisplayName(model),
-				Type:        "model",
-				CreatedAt:   time.Unix(0, 0).UTC().Format(time.RFC3339),
+				ID:                        model,
+				DisplayName:               formatModelDisplayName(model),
+				Type:                      "model",
+				CreatedAt:                 time.Unix(0, 0).UTC().Format(time.RFC3339),
+				SupportedReasoningEfforts: reasoningCapabilities[model],
 			})
 		}
 
@@ -138,19 +212,21 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 
 	// 构造 OpenAI API 响应格式
 	type ModelInfo struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
+		ID                        string    `json:"id"`
+		Object                    string    `json:"object"`
+		Created                   int64     `json:"created"`
+		OwnedBy                   string    `json:"owned_by"`
+		SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
 	}
 
 	modelList := make([]ModelInfo, 0, len(models))
 	for _, model := range models {
 		modelList = append(modelList, ModelInfo{
-			ID:      model,
-			Object:  "model",
-			Created: 0,
-			OwnedBy: "system",
+			ID:                        model,
+			Object:                    "model",
+			Created:                   0,
+			OwnedBy:                   "system",
+			SupportedReasoningEfforts: reasoningCapabilities[model],
 		})
 	}
 
