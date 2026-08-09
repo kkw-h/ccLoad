@@ -118,50 +118,6 @@ func TestHybridStore_BasicOperations(t *testing.T) {
 	}
 }
 
-func TestHybridStoreExternalAuthEnvironmentReplicatesWrites(t *testing.T) {
-	primary := createTestSQLiteStore(t)
-	replica := createTestSQLiteStore(t)
-	defer func() {
-		_ = replica.Close()
-		_ = primary.Close()
-	}()
-
-	hybrid := NewHybridStore(replica, primary)
-	defer func() { _ = hybrid.Close() }()
-	ctx := context.Background()
-
-	created, err := hybrid.CreateExternalAuthEnvironment(ctx, &model.ExternalAuthEnvironment{
-		Environment: "develop",
-		AuthzURL:    "https://develop.example.com/internal/llm/authz",
-		IsActive:    true,
-	})
-	if err != nil {
-		t.Fatalf("CreateExternalAuthEnvironment() error = %v", err)
-	}
-	if _, err := primary.GetExternalAuthEnvironment(ctx, created.ID); err != nil {
-		t.Fatalf("primary GetExternalAuthEnvironment() error = %v", err)
-	}
-	if _, err := replica.GetExternalAuthEnvironment(ctx, created.ID); err != nil {
-		t.Fatalf("replica GetExternalAuthEnvironment() error = %v", err)
-	}
-
-	created.IsActive = false
-	if _, err := hybrid.UpdateExternalAuthEnvironment(ctx, created.ID, created); err != nil {
-		t.Fatalf("UpdateExternalAuthEnvironment() error = %v", err)
-	}
-	got, err := replica.GetExternalAuthEnvironment(ctx, created.ID)
-	if err != nil || got.IsActive {
-		t.Fatalf("replica after update = %#v, %v", got, err)
-	}
-
-	if err := hybrid.DeleteExternalAuthEnvironment(ctx, created.ID); err != nil {
-		t.Fatalf("DeleteExternalAuthEnvironment() error = %v", err)
-	}
-	if _, err := replica.GetExternalAuthEnvironment(ctx, created.ID); !errors.Is(err, model.ErrExternalAuthEnvironmentNotFound) {
-		t.Fatalf("replica delete error = %v", err)
-	}
-}
-
 func TestHybridStore_CompareAndSwapOAuthCredentialKeepsReplicaOnWinner(t *testing.T) {
 	mysql := createTestSQLiteStore(t)
 	sqlite := createTestSQLiteStore(t)

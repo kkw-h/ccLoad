@@ -440,48 +440,6 @@ func (h *HybridStore) DeleteConfig(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (h *HybridStore) ListExternalAuthEnvironments(ctx context.Context) ([]*model.ExternalAuthEnvironment, error) {
-	return h.sqlite.ListExternalAuthEnvironments(ctx)
-}
-
-func (h *HybridStore) GetExternalAuthEnvironment(ctx context.Context, id int64) (*model.ExternalAuthEnvironment, error) {
-	return h.sqlite.GetExternalAuthEnvironment(ctx, id)
-}
-
-func (h *HybridStore) CreateExternalAuthEnvironment(ctx context.Context, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error) {
-	created, err := h.mysql.CreateExternalAuthEnvironment(ctx, env)
-	if err != nil {
-		return nil, err
-	}
-	h.syncToSQLite("CreateExternalAuthEnvironment", func() error {
-		_, syncErr := h.sqlite.CreateExternalAuthEnvironment(ctx, created)
-		return syncErr
-	})
-	return created, nil
-}
-
-func (h *HybridStore) UpdateExternalAuthEnvironment(ctx context.Context, id int64, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error) {
-	updated, err := h.mysql.UpdateExternalAuthEnvironment(ctx, id, env)
-	if err != nil {
-		return nil, err
-	}
-	h.syncToSQLite("UpdateExternalAuthEnvironment", func() error {
-		_, syncErr := h.sqlite.UpdateExternalAuthEnvironment(ctx, id, updated)
-		return syncErr
-	})
-	return updated, nil
-}
-
-func (h *HybridStore) DeleteExternalAuthEnvironment(ctx context.Context, id int64) error {
-	if err := h.mysql.DeleteExternalAuthEnvironment(ctx, id); err != nil {
-		return err
-	}
-	h.syncToSQLite("DeleteExternalAuthEnvironment", func() error {
-		return h.sqlite.DeleteExternalAuthEnvironment(ctx, id)
-	})
-	return nil
-}
-
 func (h *HybridStore) GetEnabledChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error) {
 	h.oauthCredentialMu.Lock()
 	defer h.oauthCredentialMu.Unlock()
