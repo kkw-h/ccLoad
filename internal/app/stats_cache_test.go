@@ -89,6 +89,14 @@ func TestStatsCache_HashFilter(t *testing.T) {
 	}
 }
 
+func TestHashFilterAuthTokenIDsIsOrderIndependent(t *testing.T) {
+	left := hashFilter(&model.LogFilter{AuthTokenIDs: []int64{9, 7, 9}})
+	right := hashFilter(&model.LogFilter{AuthTokenIDs: []int64{7, 9}})
+	if left != right {
+		t.Fatalf("hashes differ for equivalent token sets: %q != %q", left, right)
+	}
+}
+
 func TestStatsCache_BuildCacheKey(t *testing.T) {
 	startTime := time.Unix(1000000, 0)
 	endTime := time.Unix(2000000, 0)

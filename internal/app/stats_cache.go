@@ -262,7 +262,17 @@ func hashFilter(filter *model.LogFilter) string {
 	if filter.ModelLike != "" {
 		parts = append(parts, fmt.Sprintf("model_like:%s", filter.ModelLike))
 	}
-	if filter.AuthTokenID != nil {
+	if len(filter.AuthTokenIDs) > 0 {
+		authTokenIDs := append([]int64(nil), filter.AuthTokenIDs...)
+		sort.Slice(authTokenIDs, func(i, j int) bool { return authTokenIDs[i] < authTokenIDs[j] })
+		canonical := authTokenIDs[:0]
+		for _, id := range authTokenIDs {
+			if len(canonical) == 0 || canonical[len(canonical)-1] != id {
+				canonical = append(canonical, id)
+			}
+		}
+		parts = append(parts, fmt.Sprintf("auth:%v", canonical))
+	} else if filter.AuthTokenID != nil {
 		parts = append(parts, fmt.Sprintf("auth:%d", *filter.AuthTokenID))
 	}
 	if filter.StatusCode != nil {
