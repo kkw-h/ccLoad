@@ -205,6 +205,8 @@ func (s *Server) AdminUpdateSetting(c *gin.Context) {
 		return
 	}
 
+	s.settingsMutationMu.Lock()
+	defer s.settingsMutationMu.Unlock()
 	updates, err := s.completeCooldownBoundUpdates(c.Request.Context(), map[string]string{key: req.Value})
 	if respondSettingCombinationError(c, err) {
 		return
@@ -265,6 +267,8 @@ func (s *Server) AdminResetSetting(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusInternalServerError, fmt.Sprintf("invalid default value for %s: %v", key, err))
 		return
 	}
+	s.settingsMutationMu.Lock()
+	defer s.settingsMutationMu.Unlock()
 	updates, err := s.completeCooldownBoundUpdates(c.Request.Context(), map[string]string{key: setting.DefaultValue})
 	if respondSettingCombinationError(c, err) {
 		return
@@ -331,6 +335,8 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 			return
 		}
 	}
+	s.settingsMutationMu.Lock()
+	defer s.settingsMutationMu.Unlock()
 	updates, err := s.completeCooldownBoundUpdates(c.Request.Context(), req)
 	if respondSettingCombinationError(c, err) {
 		return

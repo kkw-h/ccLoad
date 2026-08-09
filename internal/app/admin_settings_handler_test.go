@@ -4,13 +4,37 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
+
+type blockingFirstSettingsStore struct {
+	storage.Store
+	calls         atomic.Int32
+	firstWritten  chan struct{}
+	secondWritten chan struct{}
+	releaseFirst  chan struct{}
+}
+
+func (s *blockingFirstSettingsStore) UpdateSetting(ctx context.Context, key, value string) error {
+	if err := s.Store.UpdateSetting(ctx, key, value); err != nil {
+		return err
+	}
+	switch s.calls.Add(1) {
+	case 1:
+		close(s.firstWritten)
+		<-s.releaseFirst
+	case 2:
+		close(s.secondWritten)
+	}
+	return nil
+}
 
 func findAdminSetting(t *testing.T, settings []map[string]any, key string) map[string]any {
 	t.Helper()
@@ -393,6 +417,64 @@ func TestAdminReasoningEffortOverridesApplyLiveWithoutRestart(t *testing.T) {
 	got, known = resolver.Resolve("gpt-5.6-sol")
 	assertReasoningEfforts(t, got, known, []string{"low", "medium", "high", "xhigh"}, true)
 	assertRestartNotTriggered(t, restarted)
+}
+
+func TestAdminReasoningEffortOverridesConcurrentUpdatesKeepRuntimeInSync(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	blockingStore := &blockingFirstSettingsStore{
+		Store:         store,
+		firstWritten:  make(chan struct{}),
+		secondWritten: make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+	}
+	server.configService = NewConfigService(blockingStore)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	update := func(value string) <-chan int {
+		done := make(chan int, 1)
+		go func() {
+			c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelReasoningEffortOverridesSetting, map[string]string{
+				"value": value,
+			}))
+			c.Params = gin.Params{{Key: "key", Value: modelReasoningEffortOverridesSetting}}
+			server.AdminUpdateSetting(c)
+			done <- w.Code
+		}()
+		return done
+	}
+
+	firstDone := update(`{"gpt-5.6-sol":["low"]}`)
+	<-blockingStore.firstWritten
+	secondDone := update(`{"gpt-5.6-sol":["high"]}`)
+	select {
+	case <-blockingStore.secondWritten:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(blockingStore.releaseFirst)
+
+	if status := <-firstDone; status != http.StatusOK {
+		t.Fatalf("first update status=%d", status)
+	}
+	if status := <-secondDone; status != http.StatusOK {
+		t.Fatalf("second update status=%d", status)
+	}
+	persisted, err := store.GetSetting(context.Background(), modelReasoningEffortOverridesSetting)
+	if err != nil {
+		t.Fatalf("GetSetting: %v", err)
+	}
+	if persisted.Value != `{"gpt-5.6-sol":["high"]}` {
+		t.Fatalf("persisted value=%s, want second update", persisted.Value)
+	}
+	got, known := resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"high"}, true)
 }
 
 func TestAdminReasoningEffortOverridesMixedBatchAppliesLiveAndRestarts(t *testing.T) {
