@@ -52,6 +52,34 @@ func setupStaticFiles(r *gin.Engine) {
 	})
 }
 
+// setupDocsRoutes exposes the embedded management OpenAPI document and Swagger UI.
+// Documentation is public metadata; /admin operations remain protected by administrator auth.
+func setupDocsRoutes(r *gin.Engine) {
+	r.GET("/docs", func(c *gin.Context) {
+		c.Redirect(http.StatusPermanentRedirect, "/docs/")
+	})
+	r.GET("/docs/", func(c *gin.Context) {
+		serveDocsAsset(c, "docs.html", "text/html; charset=utf-8")
+	})
+	r.GET("/docs/openapi.yaml", func(c *gin.Context) {
+		serveDocsAsset(c, "openapi.yaml", "application/yaml; charset=utf-8")
+	})
+}
+
+func serveDocsAsset(c *gin.Context, name, contentType string) {
+	if embedFS == nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	content, err := fs.ReadFile(embedFS, name)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.Header("Cache-Control", "no-cache, must-revalidate")
+	c.Data(http.StatusOK, contentType, content)
+}
+
 // isTestMode 检测是否在 Go 测试环境中运行
 func isTestMode() bool {
 	for _, arg := range os.Args {

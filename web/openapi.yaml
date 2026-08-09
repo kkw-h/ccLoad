@@ -1,0 +1,1037 @@
+openapi: 3.1.0
+info:
+  title: ccLoad 管理后台 API
+  version: 4.6.10-beta.2-custom
+  description: |
+    ccLoad 管理后台 HTTP API。除登录接口和本文档外，所有 `/admin/*` 接口均要求管理员 Web Session Bearer Token。
+    登录成功后从响应 `data.token` 取得令牌，在 Swagger UI 的 **Authorize** 中填写令牌本身（无需手写 `Bearer`）。
+servers:
+  - url: /
+    description: 当前 ccLoad 实例
+tags:
+  - name: Session
+  - name: Channels
+  - name: OAuth
+  - name: Observability
+  - name: Tokens
+  - name: Settings
+  - name: Fingerprints
+security:
+  - adminBearer: []
+paths:
+  /login:
+    post:
+      tags: [Session]
+      security: []
+      operationId: login
+      summary: 管理员登录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+        '401': {$ref: '#/components/responses/Error'}
+  /logout:
+    post:
+      tags: [Session]
+      operationId: logout
+      summary: 退出当前会话
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels:
+    get:
+      tags: [Channels]
+      operationId: listChannels
+      summary: 查询渠道列表
+      parameters:
+        - {$ref: '#/components/parameters/TypeQuery'}
+        - {$ref: '#/components/parameters/EnabledQuery'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+    post:
+      tags: [Channels]
+      operationId: createChannel
+      summary: 创建渠道
+      requestBody: {$ref: '#/components/requestBodies/Channel'}
+      responses:
+        '201': {$ref: '#/components/responses/Success'}
+        '400': {$ref: '#/components/responses/Error'}
+  /admin/channels/filter-options:
+    get:
+      tags: [Channels]
+      operationId: getChannelFilterOptions
+      summary: 获取渠道筛选选项
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/export:
+    get:
+      tags: [Channels]
+      operationId: exportChannels
+      summary: 导出渠道 CSV
+      responses:
+        '200':
+          description: 渠道 CSV 文件
+          content:
+            text/csv:
+              schema: {type: string}
+  /admin/channels/import:
+    post:
+      tags: [Channels]
+      operationId: importChannels
+      summary: 导入渠道 CSV
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+        '400': {$ref: '#/components/responses/Error'}
+  /admin/channels/check-duplicate:
+    post:
+      tags: [Channels]
+      operationId: checkDuplicateChannel
+      summary: 检查重复渠道 URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CheckDuplicateRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/batch-priority:
+    post:
+      tags: [Channels]
+      operationId: batchUpdateChannelPriority
+      summary: 批量更新渠道优先级
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/batch-enabled:
+    post:
+      tags: [Channels]
+      operationId: batchSetChannelsEnabled
+      summary: 批量启用或禁用渠道
+      requestBody: {$ref: '#/components/requestBodies/ChannelIDs'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/batch-advanced:
+    post:
+      tags: [Channels]
+      operationId: batchPatchChannels
+      summary: 批量更新渠道高级配置
+      requestBody: {$ref: '#/components/requestBodies/ChannelIDs'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/batch-delete:
+    post:
+      tags: [Channels]
+      operationId: batchDeleteChannels
+      summary: 批量删除渠道
+      requestBody: {$ref: '#/components/requestBodies/ChannelIDs'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/cooldown-detection/test:
+    post:
+      tags: [Channels]
+      operationId: testCooldownDetection
+      summary: 测试冷却检测规则
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/models/fetch:
+    post:
+      tags: [Channels]
+      operationId: previewModels
+      summary: 使用未保存渠道配置探测模型
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FetchModelsRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/billing/fetch:
+    post:
+      tags: [Channels]
+      operationId: fetchChannelBilling
+      summary: 探测 Sub2API 计费倍率
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BillingFetchRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/websocket-probe:
+    post:
+      tags: [Channels]
+      operationId: probeChannelWebsocket
+      summary: 探测渠道 WebSocket 能力
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/models/refresh-batch:
+    post:
+      tags: [Channels]
+      operationId: batchRefreshModels
+      summary: 批量刷新渠道模型
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BatchRefreshModelsRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/ChannelID'}
+    get:
+      tags: [Channels]
+      operationId: getChannel
+      summary: 获取渠道详情
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+        '404': {$ref: '#/components/responses/Error'}
+    put:
+      tags: [Channels]
+      operationId: updateChannel
+      summary: 更新渠道
+      requestBody: {$ref: '#/components/requestBodies/Channel'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+    delete:
+      tags: [Channels]
+      operationId: deleteChannel
+      summary: 删除渠道
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/keys:
+    get:
+      tags: [Channels]
+      operationId: listChannelKeys
+      summary: 查询渠道 API Key
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/model-stats:
+    get:
+      tags: [Channels]
+      operationId: getChannelModelStats
+      summary: 查询渠道模型统计
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/url-stats:
+    get:
+      tags: [Channels]
+      operationId: getChannelURLStats
+      summary: 查询渠道 URL 状态
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/url-disable:
+    post:
+      tags: [Channels]
+      operationId: disableChannelURL
+      summary: 禁用渠道 URL
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/URLAction'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/url-enable:
+    post:
+      tags: [Channels]
+      operationId: enableChannelURL
+      summary: 启用渠道 URL
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/URLAction'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/key-disable:
+    post:
+      tags: [Channels]
+      operationId: disableChannelKey
+      summary: 禁用渠道 Key
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/KeyAction'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/key-enable:
+    post:
+      tags: [Channels]
+      operationId: enableChannelKey
+      summary: 启用渠道 Key
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/KeyAction'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/models/fetch:
+    get:
+      tags: [Channels]
+      operationId: fetchChannelModels
+      summary: 从上游获取模型列表
+      parameters:
+        - {$ref: '#/components/parameters/ChannelID'}
+        - name: protocol
+          in: query
+          schema: {$ref: '#/components/schemas/Protocol'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/models:
+    parameters: [{$ref: '#/components/parameters/ChannelID'}]
+    post:
+      tags: [Channels]
+      operationId: addChannelModels
+      summary: 添加渠道模型
+      requestBody: {$ref: '#/components/requestBodies/Models'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+    delete:
+      tags: [Channels]
+      operationId: deleteChannelModels
+      summary: 删除渠道模型
+      requestBody: {$ref: '#/components/requestBodies/Models'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/test:
+    post:
+      tags: [Channels]
+      operationId: testChannel
+      summary: 测试渠道
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/test-url:
+    post:
+      tags: [Channels]
+      operationId: testChannelURL
+      summary: 测试渠道指定 URL
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/chat:
+    post:
+      tags: [Channels]
+      operationId: chatWithChannel
+      summary: 使用指定渠道进行 SSE 对话测试
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200':
+          description: SSE 事件流
+          content:
+            text/event-stream:
+              schema: {type: string}
+  /admin/channels/{id}/cooldown:
+    post:
+      tags: [Channels]
+      operationId: setChannelCooldown
+      summary: 设置渠道冷却
+      parameters: [{$ref: '#/components/parameters/ChannelID'}]
+      requestBody: {$ref: '#/components/requestBodies/Cooldown'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/keys/{keyIndex}/cooldown:
+    post:
+      tags: [Channels]
+      operationId: setChannelKeyCooldown
+      summary: 设置渠道 Key 冷却
+      parameters:
+        - {$ref: '#/components/parameters/ChannelID'}
+        - {$ref: '#/components/parameters/KeyIndex'}
+      requestBody: {$ref: '#/components/requestBodies/Cooldown'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/keys/{keyIndex}:
+    delete:
+      tags: [Channels]
+      operationId: deleteChannelKey
+      summary: 删除渠道 Key
+      parameters:
+        - {$ref: '#/components/parameters/ChannelID'}
+        - {$ref: '#/components/parameters/KeyIndex'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/logs:
+    get:
+      tags: [Observability]
+      operationId: listLogs
+      summary: 查询请求日志
+      parameters:
+        - {$ref: '#/components/parameters/RangeQuery'}
+        - {$ref: '#/components/parameters/LimitQuery'}
+        - {$ref: '#/components/parameters/OffsetQuery'}
+        - name: auth_token_id
+          in: query
+          description: 可重复或逗号分隔的 Token ID
+          schema: {type: array, items: {type: integer, format: int64}}
+          style: form
+          explode: true
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/logs/bootstrap:
+    get:
+      tags: [Observability]
+      operationId: getLogsBootstrap
+      summary: 获取日志页初始化数据
+      parameters: [{$ref: '#/components/parameters/RangeQuery'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/debug-logs/merged-response:
+    post:
+      tags: [Observability]
+      operationId: mergeDebugResponse
+      summary: 合并调试响应片段
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/debug-logs/{log_id}:
+    get:
+      tags: [Observability]
+      operationId: getDebugLog
+      summary: 获取调试日志
+      parameters:
+        - name: log_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/active-requests:
+    get:
+      tags: [Observability]
+      operationId: listActiveRequests
+      summary: 查询进行中的请求
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/runtime-metrics:
+    get:
+      tags: [Observability]
+      operationId: getRuntimeMetrics
+      summary: 获取运行时指标和资源上限
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/active-requests/{request_id}/debug-log:
+    get:
+      tags: [Observability]
+      operationId: getActiveRequestDebugLog
+      summary: 获取进行中请求的调试日志
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/metrics:
+    get:
+      tags: [Observability]
+      operationId: getMetrics
+      summary: 获取时间序列指标
+      parameters: [{$ref: '#/components/parameters/RangeQuery'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/stats:
+    get:
+      tags: [Observability]
+      operationId: getStats
+      summary: 获取聚合统计
+      parameters: [{$ref: '#/components/parameters/RangeQuery'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/stats/filter-options:
+    get:
+      tags: [Observability]
+      operationId: getStatsFilterOptions
+      summary: 获取统计筛选选项
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/models:
+    get:
+      tags: [Observability]
+      operationId: listObservedModels
+      summary: 查询日志中出现的模型
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/auth-tokens:
+    get:
+      tags: [Tokens]
+      operationId: listAuthTokens
+      summary: 查询 API 访问令牌
+      parameters: [{$ref: '#/components/parameters/RangeQuery'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+    post:
+      tags: [Tokens]
+      operationId: createAuthToken
+      summary: 创建 API 访问令牌
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthTokenRequest'}
+      responses:
+        '201': {$ref: '#/components/responses/Success'}
+  /admin/auth-tokens/{id}:
+    parameters: [{$ref: '#/components/parameters/ResourceID'}]
+    put:
+      tags: [Tokens]
+      operationId: updateAuthToken
+      summary: 更新 API 访问令牌
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthTokenRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+    delete:
+      tags: [Tokens]
+      operationId: deleteAuthToken
+      summary: 删除 API 访问令牌
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/settings:
+    get:
+      tags: [Settings]
+      operationId: listSettings
+      summary: 查询系统设置
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/settings/batch:
+    post:
+      tags: [Settings]
+      operationId: batchUpdateSettings
+      summary: 批量更新系统设置
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/settings/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [Settings]
+      operationId: getSetting
+      summary: 获取系统设置
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+    put:
+      tags: [Settings]
+      operationId: updateSetting
+      summary: 更新系统设置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SettingRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/settings/{key}/reset:
+    post:
+      tags: [Settings]
+      operationId: resetSetting
+      summary: 恢复设置默认值
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints:
+    get:
+      tags: [Fingerprints]
+      operationId: listFingerprints
+      summary: 查询模型指纹
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints/test-results:
+    get:
+      tags: [Fingerprints]
+      operationId: listFingerprintTestResults
+      summary: 查询指纹测试历史
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints/test-results/{id}:
+    delete:
+      tags: [Fingerprints]
+      operationId: deleteFingerprintTestResult
+      summary: 删除指纹测试记录
+      parameters: [{$ref: '#/components/parameters/ResourceID'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints/{id}:
+    parameters: [{$ref: '#/components/parameters/ResourceID'}]
+    get:
+      tags: [Fingerprints]
+      operationId: getFingerprint
+      summary: 获取模型指纹
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+    delete:
+      tags: [Fingerprints]
+      operationId: deleteFingerprint
+      summary: 删除模型指纹
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints/calibrate:
+    post:
+      tags: [Fingerprints]
+      operationId: calibrateFingerprint
+      summary: 启动模型指纹校准
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '202': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints/test:
+    post:
+      tags: [Fingerprints]
+      operationId: testFingerprint
+      summary: 启动模型指纹测试
+      requestBody: {$ref: '#/components/requestBodies/GenericObject'}
+      responses:
+        '202': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints/jobs/{id}:
+    get:
+      tags: [Fingerprints]
+      operationId: getFingerprintJob
+      summary: 查询指纹任务
+      parameters:
+        - {$ref: '#/components/parameters/StringID'}
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/fingerprints/jobs/{id}/stream:
+    get:
+      tags: [Fingerprints]
+      operationId: streamFingerprintJob
+      summary: 订阅指纹任务 SSE
+      parameters: [{$ref: '#/components/parameters/StringID'}]
+      responses:
+        '200':
+          description: SSE 事件流
+          content:
+            text/event-stream:
+              schema: {type: string}
+  /admin/fingerprints/jobs/{id}/cancel:
+    post:
+      tags: [Fingerprints]
+      operationId: cancelFingerprintJob
+      summary: 取消指纹任务
+      parameters: [{$ref: '#/components/parameters/StringID'}]
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/oauth/credentials/import:
+    post:
+      tags: [OAuth]
+      operationId: importOAuthCredentials
+      summary: 导入 OAuth 凭据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/oauth/credentials/import/stream:
+    post:
+      tags: [OAuth]
+      operationId: importOAuthCredentialsStream
+      summary: 流式导入 OAuth 凭据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/oauth/credentials/import/jobs:
+    post:
+      tags: [OAuth]
+      operationId: startOAuthCredentialImportJob
+      summary: 启动 OAuth 凭据导入任务
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/oauth/credentials/import/jobs/{id}:
+    parameters: [{$ref: '#/components/parameters/StringID'}]
+    get:
+      tags: [OAuth]
+      operationId: getOAuthCredentialImportJob
+      summary: 查询 OAuth 凭据导入任务
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/codex/oauth/start:
+    post:
+      tags: [OAuth]
+      operationId: startCodexOAuth
+      summary: 启动 Codex OAuth
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/codex/oauth/status:
+    get:
+      tags: [OAuth]
+      operationId: getCodexOAuthStatus
+      summary: 查询 Codex OAuth 状态
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/codex/oauth/cancel:
+    post:
+      tags: [OAuth]
+      operationId: cancelCodexOAuth
+      summary: 取消 Codex OAuth
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/codex/oauth/callback:
+    post:
+      tags: [OAuth]
+      operationId: submitCodexOAuthCallback
+      summary: 提交 Codex OAuth 回调
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/codex/credentials/import:
+    post:
+      tags: [OAuth]
+      operationId: importCodexCredential
+      summary: 导入 Codex 凭据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/antigravity/oauth/start:
+    post:
+      tags: [OAuth]
+      operationId: startAntigravityOAuth
+      summary: 启动 Antigravity OAuth
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/antigravity/oauth/status:
+    get:
+      tags: [OAuth]
+      operationId: getAntigravityOAuthStatus
+      summary: 查询 Antigravity OAuth 状态
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/antigravity/oauth/cancel:
+    post:
+      tags: [OAuth]
+      operationId: cancelAntigravityOAuth
+      summary: 取消 Antigravity OAuth
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/antigravity/oauth/callback:
+    post:
+      tags: [OAuth]
+      operationId: submitAntigravityOAuthCallback
+      summary: 提交 Antigravity OAuth 回调
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/antigravity/credentials/import:
+    post:
+      tags: [OAuth]
+      operationId: importAntigravityCredential
+      summary: 导入 Antigravity 凭据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/xai/oauth/start:
+    post:
+      tags: [OAuth]
+      operationId: startXAIOAuth
+      summary: 启动 xAI OAuth
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/xai/oauth/status:
+    get:
+      tags: [OAuth]
+      operationId: getXAIOAuthStatus
+      summary: 查询 xAI OAuth 状态
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/xai/oauth/cancel:
+    post:
+      tags: [OAuth]
+      operationId: cancelXAIOAuth
+      summary: 取消 xAI OAuth
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/xai/oauth/callback:
+    post:
+      tags: [OAuth]
+      operationId: submitXAIOAuthCallback
+      summary: 提交 xAI OAuth 回调
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/xai/credentials/import/stream:
+    post:
+      tags: [OAuth]
+      operationId: importXAICredentialsStream
+      summary: 流式导入 xAI 凭据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/xai/credentials/import/jobs:
+    post:
+      tags: [OAuth]
+      operationId: startXAICredentialImportJob
+      summary: 启动 xAI 凭据导入任务
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/editor:
+    parameters: [{$ref: '#/components/parameters/ChannelID'}]
+    get:
+      tags: [Channels]
+      operationId: getChannelEditor
+      summary: 获取渠道编辑器数据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/codex-credential/refresh:
+    parameters: [{$ref: '#/components/parameters/ChannelID'}]
+    post:
+      tags: [OAuth]
+      operationId: refreshCodexCredential
+      summary: 刷新渠道 Codex 凭据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/oauth-usage:
+    parameters: [{$ref: '#/components/parameters/ChannelID'}]
+    post:
+      tags: [OAuth]
+      operationId: getChannelOAuthUsage
+      summary: 查询渠道 OAuth 用量
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+  /admin/channels/{id}/antigravity-credential/refresh:
+    parameters: [{$ref: '#/components/parameters/ChannelID'}]
+    post:
+      tags: [OAuth]
+      operationId: refreshAntigravityCredential
+      summary: 刷新渠道 Antigravity 凭据
+      responses:
+        '200': {$ref: '#/components/responses/Success'}
+components:
+  securitySchemes:
+    adminBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: ccLoad Web Session Token
+  parameters:
+    ChannelID:
+      name: id
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    ResourceID:
+      name: id
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    StringID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    KeyIndex:
+      name: keyIndex
+      in: path
+      required: true
+      schema: {type: integer, minimum: 0}
+    RangeQuery:
+      name: range
+      in: query
+      schema: {type: string, example: today}
+    LimitQuery:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 1000, default: 50}
+    OffsetQuery:
+      name: offset
+      in: query
+      schema: {type: integer, minimum: 0, default: 0}
+    TypeQuery:
+      name: type
+      in: query
+      schema: {$ref: '#/components/schemas/Protocol'}
+    EnabledQuery:
+      name: enabled
+      in: query
+      schema: {type: boolean}
+  requestBodies:
+    Channel:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ChannelRequest'}
+    ChannelIDs:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [channel_ids]
+            properties:
+              channel_ids: {type: array, items: {type: integer, format: int64}}
+              enabled: {type: boolean}
+              protocol_transform_mode: {$ref: '#/components/schemas/ProtocolTransformMode'}
+    URLAction:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [url]
+            properties:
+              url: {type: string, format: uri}
+    KeyAction:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [key_index]
+            properties:
+              key_index: {type: integer, minimum: 0}
+    Models:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [models]
+            properties:
+              models: {type: array, items: {$ref: '#/components/schemas/ModelEntry'}}
+    Cooldown:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [duration_ms]
+            properties:
+              duration_ms: {type: integer, format: int64, minimum: 1000}
+    GenericObject:
+      required: true
+      content:
+        application/json:
+          schema: {type: object, additionalProperties: true}
+  responses:
+    Success:
+      description: 请求成功
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/APIResponse'}
+    Error:
+      description: 请求失败
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+  schemas:
+    APIResponse:
+      type: object
+      required: [success]
+      properties:
+        success: {type: boolean, const: true}
+        data: {}
+        error: {type: string, default: ''}
+        count: {type: integer, default: 0}
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: {type: boolean, const: false}
+        data: {}
+        error: {type: string}
+        count: {type: integer, default: 0}
+    LoginRequest:
+      type: object
+      required: [password]
+      properties:
+        password: {type: string, format: password}
+    Protocol:
+      type: string
+      enum: [anthropic, openai, gemini, codex]
+    ProtocolTransformMode:
+      type: string
+      enum: [auto, upstream, local]
+    ChannelURL:
+      type: object
+      required: [url]
+      properties:
+        url: {type: string, format: uri}
+        exact: {type: boolean, default: false}
+        protocols: {type: array, items: {$ref: '#/components/schemas/Protocol'}}
+        disabled: {type: boolean, default: false}
+    ModelEntry:
+      type: object
+      required: [model]
+      properties:
+        model: {type: string}
+        redirect_model: {type: string}
+        disabled: {type: boolean, default: false}
+    ChannelAPIKey:
+      type: object
+      required: [api_key]
+      properties:
+        api_key: {type: string, writeOnly: true}
+        note: {type: string, maxLength: 512}
+    ChannelRequest:
+      type: object
+      required: [name, urls, models]
+      properties:
+        name: {type: string}
+        api_key: {type: string, writeOnly: true, deprecated: true}
+        api_keys: {type: array, items: {$ref: '#/components/schemas/ChannelAPIKey'}}
+        websockets: {type: boolean}
+        protocol_transform_mode: {$ref: '#/components/schemas/ProtocolTransformMode'}
+        key_strategy: {type: string, enum: [sequential, round_robin]}
+        urls: {type: array, minItems: 1, items: {$ref: '#/components/schemas/ChannelURL'}}
+        priority: {type: integer}
+        rpm_limit: {type: integer, minimum: 0}
+        max_concurrency: {type: integer, minimum: 0}
+        models: {type: array, minItems: 1, items: {$ref: '#/components/schemas/ModelEntry'}}
+        enabled: {type: boolean}
+        scheduled_check_enabled: {type: boolean}
+        scheduled_check_model: {type: string}
+        daily_cost_limit: {type: number, minimum: 0}
+        cost_multiplier: {type: number, minimum: 0}
+        custom_request_rules: {type: object, additionalProperties: true}
+        cooldown_detection_rules: {type: object, additionalProperties: true}
+        proxy_url: {type: string}
+    CheckDuplicateRequest:
+      type: object
+      required: [urls]
+      properties:
+        urls: {type: array, minItems: 1, items: {$ref: '#/components/schemas/ChannelURL'}}
+    FetchModelsRequest:
+      type: object
+      required: [urls, api_key]
+      properties:
+        urls: {type: array, minItems: 1, items: {$ref: '#/components/schemas/ChannelURL'}}
+        protocol: {$ref: '#/components/schemas/Protocol'}
+        api_key: {type: string, writeOnly: true}
+    BatchRefreshModelsRequest:
+      type: object
+      required: [channel_ids]
+      properties:
+        channel_ids: {type: array, minItems: 1, items: {type: integer, format: int64}}
+        mode: {type: string, enum: [merge, replace], default: merge}
+        protocol: {$ref: '#/components/schemas/Protocol'}
+        lowercase_models: {type: boolean}
+        strip_model_source_prefix: {type: boolean}
+    BillingFetchRequest:
+      type: object
+      required: [base_url, api_key]
+      properties:
+        base_url: {type: string, format: uri}
+        api_key: {type: string, writeOnly: true}
+    AuthTokenRequest:
+      type: object
+      properties:
+        description: {type: string}
+        expires_at: {type: [integer, 'null'], format: int64, description: Unix 毫秒；null 表示永不过期}
+        is_active: {type: boolean}
+        allowed_models: {type: array, items: {type: string}}
+        allowed_channel_ids: {type: array, items: {type: integer, format: int64}}
+        channel_restriction_mode: {type: string, enum: [allow, deny]}
+        cost_limit_usd: {type: number, minimum: 0}
+        max_concurrency: {type: integer, minimum: 0}
+    SettingRequest:
+      type: object
+      required: [value]
+      properties:
+        value: {type: string}

@@ -530,6 +530,7 @@ docker run -d --name ccload \
 
 服务启动后访问：
 - 管理界面：`http://localhost:8080/web/`
+- **管理 API 文档**：`http://localhost:8080/docs/` - Swagger UI，规范文件位于 `GET /docs/openapi.yaml`
 - API 代理：`POST http://localhost:8080/v1/messages`
 - **API 令牌管理**：`http://localhost:8080/web/tokens.html` - 通过 Web 界面配置 API 访问令牌
 
