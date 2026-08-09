@@ -326,6 +326,11 @@ func TestAdminCooldownBoundsUseFreshAtomicSnapshot(t *testing.T) {
 			t.Fatalf("%s=%q, want 250", key, setting.Value)
 		}
 	}
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected restart triggered")
+	}
 }
 
 func TestAdminSettingsHandlers(t *testing.T) {
