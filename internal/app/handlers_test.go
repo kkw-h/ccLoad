@@ -375,6 +375,15 @@ func TestBuildLogFilter(t *testing.T) {
 			},
 		},
 		{
+			name:  "auth_token_id all invalid fails closed",
+			query: "auth_token_id=invalid,0,-1",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if lf.AuthTokenID == nil || *lf.AuthTokenID != -1 {
+					t.Fatalf("AuthTokenID=%v, want non-matching sentinel -1", lf.AuthTokenID)
+				}
+			},
+		},
+		{
 			name:  "default_log_source_proxy",
 			query: "",
 			check: func(t *testing.T, lf model.LogFilter) {
