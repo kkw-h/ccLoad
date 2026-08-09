@@ -773,8 +773,8 @@ func (h *HybridStore) UpdateTokenLastUsed(ctx context.Context, tokenHash string,
 	return nil
 }
 
-func (h *HybridStore) UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64) error {
-	if err := h.sqlite.UpdateTokenStats(ctx, tokenHash, isSuccess, duration, isStreaming, firstByteTime, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens, costUSD, effectiveCostUSD); err != nil {
+func (h *HybridStore) UpdateTokenStats(ctx context.Context, tokenHash string, outcome model.TokenStatOutcome, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64) error {
+	if err := h.sqlite.UpdateTokenStats(ctx, tokenHash, outcome, duration, isStreaming, firstByteTime, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens, costUSD, effectiveCostUSD); err != nil {
 		return err
 	}
 	token, err := h.sqlite.GetAuthTokenByValue(ctx, tokenHash)

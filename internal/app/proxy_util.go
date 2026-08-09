@@ -163,6 +163,7 @@ type proxyRequestContext struct {
 	header                     http.Header
 	isStreaming                bool
 	tokenHash                  string               // Token哈希值（用于统计）
+	tokenEnvironment           string               // Token 环境标识（用于用量事件分流）
 	tokenID                    int64                // Token ID（用于日志记录，0表示未使用token）
 	clientIP                   string               // 客户端IP地址（用于日志记录）
 	activeReqID                int64                // 活跃请求ID（用于更新渠道信息）
@@ -173,6 +174,8 @@ type proxyRequestContext struct {
 	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 	thinkingEffort             string
+	requestID                  string                     // 关联同一用户请求的所有用量事件
+	attemptSeq                 int                        // 真实上游尝试序号（每次转发前自增）
 	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
 	nativeCodexWS              *codexUpstreamWebsocketSession
 	nativeCodexBody            []byte
@@ -894,6 +897,10 @@ type logEntryParams struct {
 	DebugData        *model.DebugLogEntry // Debug日志数据
 	CostMultiplier   float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
 	ThinkingEffort   string
+	TokenHash        string // 认证 token 哈希（用量事件维度）
+	TokenEnvironment string // 认证 token 归属环境（用量事件路由维度）
+	RequestID        string // 关联同一用户请求的用量事件
+	AttemptSeq       int    // 真实上游尝试序号
 }
 
 // resolveProxyBillingModel 选择代理请求的计费模型。
@@ -970,6 +977,9 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			}
 		}
 		entry.Message = truncateErr(msg)
+		if p.StatusCode == 499 && p.Result != nil && hasConsumedTokens(p.Result) {
+			fillEntryUsage(entry, p.Result, billingModel)
+		}
 	} else if p.Result != nil {
 		res := p.Result
 		if p.StatusCode >= 200 && p.StatusCode < 300 {
@@ -996,22 +1006,11 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			entry.FirstByteTime = res.FirstByteTime
 		}
 
-		// Token统计（2025-11新增，从SSE响应中提取）
-		entry.InputTokens = res.InputTokens
-		entry.OutputTokens = res.OutputTokens
-		entry.ReasoningTokens = res.ReasoningTokens
-		entry.CacheReadInputTokens = res.CacheReadInputTokens
-		entry.CacheCreationInputTokens = res.CacheCreationInputTokens
-		entry.Cache5mInputTokens = res.Cache5mInputTokens
-		entry.Cache1hInputTokens = res.Cache1hInputTokens
-		entry.ServiceTier = res.ServiceTier
-
 		if p.StatusCode >= http.StatusOK && p.StatusCode < http.StatusMultipleChoices {
-			// 使用实际转发的模型计算成本（重定向时价格可能不同）；
-			// 始终调用以支持按次计费图像模型（tokens=0 时返回固定成本）。
-			// 优先 actual（重定向可能换价）；无定价时回退 request（渠道第一列作定价别名）
-			// alpha/search 固定按 search_call 计费。
-			entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+			fillEntryUsage(entry, res, billingModel)
+		} else {
+			// 失败日志保留既有 usage 可见性，但不计算成本。
+			fillEntryTokenUsage(entry, res)
 		}
 	} else {
 		entry.Message = "unknown"
@@ -1026,7 +1025,58 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		}
 	}
 	entry.DebugData = p.DebugData
+	entry.UsageEvent = buildAttemptUsageEvent(p, entry)
 	return entry
+}
+
+func fillEntryTokenUsage(entry *model.LogEntry, res *fwResult) {
+	entry.InputTokens = res.InputTokens
+	entry.OutputTokens = res.OutputTokens
+	entry.ReasoningTokens = res.ReasoningTokens
+	entry.CacheReadInputTokens = res.CacheReadInputTokens
+	entry.CacheCreationInputTokens = res.CacheCreationInputTokens
+	entry.Cache5mInputTokens = res.Cache5mInputTokens
+	entry.Cache1hInputTokens = res.Cache1hInputTokens
+	entry.ServiceTier = res.ServiceTier
+}
+
+func fillEntryUsage(entry *model.LogEntry, res *fwResult, billingModel string) {
+	fillEntryTokenUsage(entry, res)
+	entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+}
+
+func buildAttemptUsageEvent(p logEntryParams, entry *model.LogEntry) *model.UsageEvent {
+	if p.RequestID == "" {
+		return nil
+	}
+	return &model.UsageEvent{
+		RequestID:                p.RequestID,
+		AttemptSeq:               p.AttemptSeq,
+		Kind:                     model.UsageEventAttempt,
+		Time:                     entry.Time,
+		Environment:              p.TokenEnvironment,
+		TokenHash:                p.TokenHash,
+		AuthTokenID:              entry.AuthTokenID,
+		ChannelID:                entry.ChannelID,
+		Model:                    entry.Model,
+		ActualModel:              entry.ActualModel,
+		StatusCode:               entry.StatusCode,
+		IsStreaming:              entry.IsStreaming,
+		Duration:                 entry.Duration,
+		FirstByte:                entry.FirstByteTime,
+		ClientIP:                 entry.ClientIP,
+		InputTokens:              entry.InputTokens,
+		OutputTokens:             entry.OutputTokens,
+		ReasoningTokens:          entry.ReasoningTokens,
+		CacheReadInputTokens:     entry.CacheReadInputTokens,
+		CacheCreationInputTokens: entry.CacheCreationInputTokens,
+		Cache5mInputTokens:       entry.Cache5mInputTokens,
+		Cache1hInputTokens:       entry.Cache1hInputTokens,
+		StandardCostUSD:          entry.Cost,
+		CostMultiplier:           entry.CostMultiplier,
+		EffectiveCostUSD:         entry.Cost * entry.CostMultiplier,
+		ServiceTier:              entry.ServiceTier,
+	}
 }
 
 func appendRetryStrategyToMessage(message, strategy string) string {

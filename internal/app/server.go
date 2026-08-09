@@ -27,6 +27,7 @@ import (
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
+	"ccLoad/internal/eventbus"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	protocolbuiltin "ccLoad/internal/protocol/builtin"
@@ -144,6 +145,9 @@ type Server struct {
 	oauthCredentialCleanupJobsMu sync.Mutex
 	oauthCredentialCleanupJobs   *oauthCredentialCleanupJobManager
 	oauthCredentialRefreshes     *oauthCredentialRefreshTracker
+
+	// 用量事件发布器（Redis）；未配置时为 NoopPublisher。
+	eventPublisher eventbus.Publisher
 }
 
 // NewServer 创建并初始化一个新的 Server 实例
@@ -357,6 +361,8 @@ func NewServer(store storage.Store) *Server {
 	// 创建服务层（仅保留有价值的服务）
 	// ============================================================================
 
+	s.eventPublisher = newEventPublisherFromEnv()
+
 	// 1. LogService（负责日志管理）
 	s.logService = NewLogService(
 		store,
@@ -367,6 +373,7 @@ func NewServer(store storage.Store) *Server {
 		&s.isShuttingDown,
 		&s.wg,
 	)
+	s.logService.SetEventPublisher(s.eventPublisher)
 	// 2. AuthService（负责认证授权）
 	// 初始化时自动从数据库加载API访问令牌
 	s.authService = NewAuthService(
@@ -1719,6 +1726,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if err == nil {
 			err = ctx.Err()
 		}
+	}
+
+	// 日志 worker 完成后再关闭发布器，确保已落库的 attempt 事件能够排空。
+	if s.eventPublisher != nil {
+		s.eventPublisher.Close()
 	}
 
 	// 停止连接池老化计时器并关闭全局及渠道代理 Transport 的空闲连接。

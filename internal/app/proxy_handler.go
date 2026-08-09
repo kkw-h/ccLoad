@@ -312,6 +312,8 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 	tokenID, _ := c.Get("token_id")
 	tokenIDInt64, _ := tokenID.(int64)
+	tokenEnvironment, _ := c.Get("token_environment")
+	tokenEnvironmentStr, _ := tokenEnvironment.(string)
 
 	if !s.enforceTokenLimits(c, tokenHashStr, incoming.authorizationModel()) {
 		return
@@ -419,21 +421,23 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 
 	reqCtx := &proxyRequestContext{
-		originalModel:  originalModel,
-		clientProtocol: clientProtocol,
-		codexClient:    isCodexMultiAgentClient(codexMultiAgentUserAgent(c.Request.Header)),
-		requestMethod:  requestMethod,
-		requestPath:    effectiveRequestPath,
-		rawQuery:       c.Request.URL.RawQuery,
-		body:           all,
-		translatedBody: all,
-		header:         c.Request.Header,
-		isStreaming:    isStreaming,
-		tokenHash:      tokenHashStr,
-		tokenID:        tokenIDInt64,
-		clientIP:       c.ClientIP(),
-		startTime:      startTime,
-		thinkingEffort: thinkingEffort,
+		originalModel:    originalModel,
+		clientProtocol:   clientProtocol,
+		codexClient:      isCodexMultiAgentClient(codexMultiAgentUserAgent(c.Request.Header)),
+		requestMethod:    requestMethod,
+		requestPath:      effectiveRequestPath,
+		rawQuery:         c.Request.URL.RawQuery,
+		body:             all,
+		translatedBody:   all,
+		header:           c.Request.Header,
+		isStreaming:      isStreaming,
+		tokenHash:        tokenHashStr,
+		tokenEnvironment: tokenEnvironmentStr,
+		tokenID:          tokenIDInt64,
+		clientIP:         c.ClientIP(),
+		startTime:        startTime,
+		thinkingEffort:   thinkingEffort,
+		requestID:        util.NewUUIDv4(),
 	}
 	if routingSession != nil {
 		reqCtx.routingSession = routingSession
@@ -465,6 +469,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			s.activeRequests.Remove(reqCtx.activeReqID)
 		}
 	}()
+	defer s.publishRequestUsageEvent(c, reqCtx)
 
 	lastResult, succeeded := s.runProxyAttemptLoop(ctx, cands, reqCtx, c.Writer)
 	if executionSession != nil {
