@@ -1,6 +1,7 @@
 package sql_test
 
 import (
+	"strings"
 	"testing"
 
 	"ccLoad/internal/model"
@@ -73,6 +74,13 @@ func TestWhereBuilder_ApplyLogFilter(t *testing.T) {
 			expectArgsLen: 2,
 		},
 		{
+			name: "multiple auth_token_id filter",
+			filter: &model.LogFilter{
+				AuthTokenIDs: []int64{7, 9},
+			},
+			expectArgsLen: 3,
+		},
+		{
 			name: "all filters combined",
 			filter: &model.LogFilter{
 				ChannelID:   &channelID,
@@ -117,6 +125,9 @@ func TestWhereBuilder_ApplyLogFilter(t *testing.T) {
 
 			if clause == "" {
 				t.Error("expected non-empty clause")
+			}
+			if tt.name == "multiple auth_token_id filter" && !strings.Contains(clause, "auth_token_id IN (?, ?)") {
+				t.Errorf("multiple auth token clause=%q, want IN (?, ?)", clause)
 			}
 			if tt.filter != nil && tt.filter.LogSource == model.LogSourceDetection && clause != "log_source IN (?, ?, ?)" {
 				t.Errorf("unexpected detection clause: %q", clause)
