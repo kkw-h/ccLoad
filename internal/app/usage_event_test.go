@@ -1,7 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sync"
@@ -99,7 +101,7 @@ func TestBuildLogEntry_UsageEventReusesNormalizedFields(t *testing.T) {
 	if ev.Kind != model.UsageEventAttempt {
 		t.Fatalf("kind=%q, want attempt", ev.Kind)
 	}
-	if ev.RequestID != "req-1" || ev.AttemptSeq != 3 || ev.TokenHash != "hash-abc" {
+	if ev.RequestID != "req-1" || ev.AttemptSeq != 3 || ev.AuthTokenID != 7 {
 		t.Fatalf("关联字段不符: %+v", ev)
 	}
 	if ev.Environment != "dev" {
@@ -116,6 +118,31 @@ func TestBuildLogEntry_UsageEventReusesNormalizedFields(t *testing.T) {
 	}
 	if want := entry.Cost * entry.CostMultiplier; ev.EffectiveCostUSD != want {
 		t.Fatalf("effective=%v, want %v", ev.EffectiveCostUSD, want)
+	}
+}
+
+func TestUsageEventDoesNotSerializeReplayableTokenHash(t *testing.T) {
+	t.Parallel()
+
+	replayableHash := model.HashToken("plain-api-token")
+	entry := buildLogEntry(logEntryParams{
+		RequestModel: "claude-sonnet",
+		StatusCode:   http.StatusOK,
+		AuthTokenID:  7,
+		TokenHash:    replayableHash,
+		RequestID:    "req-no-secret",
+		AttemptSeq:   1,
+		Result:       &fwResult{InputTokens: 1, OutputTokens: 2},
+	})
+	payload, err := json.Marshal(entry.UsageEvent)
+	if err != nil {
+		t.Fatalf("marshal usage event: %v", err)
+	}
+	if bytes.Contains(payload, []byte(`"token_hash"`)) || bytes.Contains(payload, []byte(replayableHash)) {
+		t.Fatalf("usage event exposes replayable token hash: %s", payload)
+	}
+	if entry.UsageEvent.AuthTokenID != 7 {
+		t.Fatalf("auth_token_id=%d, want 7", entry.UsageEvent.AuthTokenID)
 	}
 }
 

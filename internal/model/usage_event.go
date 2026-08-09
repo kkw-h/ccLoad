@@ -26,7 +26,6 @@ type UsageEvent struct {
 	Kind        UsageEventKind `json:"kind"`
 	Time        JSONTime       `json:"time"`
 	Environment string         `json:"environment,omitempty"`
-	TokenHash   string         `json:"token_hash,omitempty"`
 	AuthTokenID int64          `json:"auth_token_id"`
 	ChannelID   int64          `json:"channel_id"`
 	Model       string         `json:"model"`
