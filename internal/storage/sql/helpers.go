@@ -222,3 +222,10 @@ func normalizeCostMultiplier(m float64) float64 {
 	}
 	return m
 }
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}

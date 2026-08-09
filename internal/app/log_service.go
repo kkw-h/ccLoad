@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"ccLoad/internal/config"
+	"ccLoad/internal/eventbus"
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
 )
@@ -42,6 +43,14 @@ type LogService struct {
 	shutdownCh     chan struct{}
 	isShuttingDown *atomic.Bool
 	wg             *sync.WaitGroup
+
+	// 用量事件发布器：日志批量落库成功后发布 attempt 事件。
+	eventPublisher eventbus.Publisher
+}
+
+// SetEventPublisher 注入用量事件发布器（在 StartWorkers 之前调用）。
+func (s *LogService) SetEventPublisher(p eventbus.Publisher) {
+	s.eventPublisher = p
 }
 
 // NewLogService 创建日志服务实例
@@ -158,6 +167,7 @@ retryLoop:
 			if attempt > 1 {
 				log.Printf("[WARN] 日志批量写入重试成功 (attempt=%d/%d, batch_size=%d)", attempt, maxRetries, len(logs))
 			}
+			s.publishUsageEvents(logs)
 			return
 		}
 
@@ -186,6 +196,18 @@ retryLoop:
 	}
 
 	log.Printf("[ERROR] 日志批量写入最终失败 (attempts=%d, batch_size=%d): %v", attempts, len(logs), lastErr)
+}
+
+// publishUsageEvents 仅发布已经成功落库日志携带的 attempt 事件。
+func (s *LogService) publishUsageEvents(logs []*model.LogEntry) {
+	if s.eventPublisher == nil {
+		return
+	}
+	for _, entry := range logs {
+		if entry != nil && entry.UsageEvent != nil {
+			s.eventPublisher.Publish(entry.UsageEvent)
+		}
+	}
 }
 
 func (s *LogService) isShutdownInProgress() bool {

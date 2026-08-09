@@ -40,15 +40,16 @@ type AuthService struct {
 
 	// API 认证（代理 API 使用的数据库令牌）
 	// [FIX] 2025-12: 存储过期时间而非bool，支持懒惰过期校验
-	authTokens          map[string]int64                    // Token哈希 → 过期时间(Unix毫秒，0=永不过期)
-	authTokenIDs        map[string]int64                    // Token哈希 → Token ID 映射（用于日志记录，2025-12新增）
-	authTokenHashes     map[int64]string                    // Token ID → Token哈希（Web会话绑定代理身份）
-	authTokenModels     map[string][]string                 // Token哈希 → 允许的模型列表（2026-01新增）
-	authTokenChannels   map[string]model.ChannelRestriction // Token哈希 → 已校验的渠道限制策略
-	authTokenCostLimits map[string]tokenCostLimit           // Token哈希 → 费用限额状态（仅限额>0的令牌）
-	authTokenMaxConns   map[string]int                      // Token哈希 → 最大并发请求数（0=无限制）
-	authTokenActiveReqs map[string]int                      // Token哈希 → 当前进行中请求数
-	authTokensMux       sync.RWMutex                        // 并发保护（支持热更新）
+	authTokens            map[string]int64                    // Token哈希 → 过期时间(Unix毫秒，0=永不过期)
+	authTokenIDs          map[string]int64                    // Token哈希 → Token ID 映射（用于日志记录，2025-12新增）
+	authTokenHashes       map[int64]string                    // Token ID → Token哈希（Web会话绑定代理身份）
+	authTokenModels       map[string][]string                 // Token哈希 → 允许的模型列表（2026-01新增）
+	authTokenEnvironments map[string]string                   // Token哈希 → 用量事件环境
+	authTokenChannels     map[string]model.ChannelRestriction // Token哈希 → 已校验的渠道限制策略
+	authTokenCostLimits   map[string]tokenCostLimit           // Token哈希 → 费用限额状态（仅限额>0的令牌）
+	authTokenMaxConns     map[string]int                      // Token哈希 → 最大并发请求数（0=无限制）
+	authTokenActiveReqs   map[string]int                      // Token哈希 → 当前进行中请求数
+	authTokensMux         sync.RWMutex                        // 并发保护（支持热更新）
 
 	// 数据库依赖（用于热更新令牌）
 	store storage.Store
@@ -92,6 +93,7 @@ func NewAuthService(
 		authTokenIDs:           make(map[string]int64),
 		authTokenHashes:        make(map[int64]string),
 		authTokenModels:        make(map[string][]string),
+		authTokenEnvironments:  make(map[string]string),
 		authTokenChannels:      make(map[string]model.ChannelRestriction),
 		authTokenCostLimits:    make(map[string]tokenCostLimit),
 		authTokenMaxConns:      make(map[string]int),
@@ -419,6 +421,9 @@ func (s *AuthService) prepareAPIIdentity(c *gin.Context, tokenHash string, token
 
 func (s *AuthService) attachAPIIdentity(c *gin.Context, tokenHash string, tokenID int64) {
 	c.Set("token_hash", tokenHash)
+	if environment := s.authTokenEnvironment(tokenHash); environment != "" {
+		c.Set("token_environment", environment)
+	}
 	if tokenID > 0 {
 		c.Set("token_id", tokenID)
 	}
@@ -426,6 +431,12 @@ func (s *AuthService) attachAPIIdentity(c *gin.Context, tokenHash string, tokenI
 	case s.lastUsedCh <- tokenHash:
 	default:
 	}
+}
+
+func (s *AuthService) authTokenEnvironment(tokenHash string) string {
+	s.authTokensMux.RLock()
+	defer s.authTokensMux.RUnlock()
+	return s.authTokenEnvironments[tokenHash]
 }
 
 func (s *AuthService) resolveAuthToken(token string) (tokenHash string, expiresAt, tokenID int64, exists bool) {
@@ -535,6 +546,7 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 			delete(s.authTokenIDs, tokenHash)
 			delete(s.authTokenHashes, tokenID)
 			delete(s.authTokenModels, tokenHash)
+			delete(s.authTokenEnvironments, tokenHash)
 			delete(s.authTokenChannels, tokenHash)
 			delete(s.authTokenCostLimits, tokenHash)
 			delete(s.authTokenMaxConns, tokenHash)
@@ -726,6 +738,7 @@ func (s *AuthService) ReloadAuthTokens() error {
 	newTokenIDs := make(map[string]int64, len(tokens))
 	newTokenHashes := make(map[int64]string, len(tokens))
 	newTokenModels := make(map[string][]string, len(tokens))
+	newTokenEnvironments := make(map[string]string, len(tokens))
 	newTokenChannels := make(map[string]model.ChannelRestriction, len(tokens))
 	newTokenCostLimits := make(map[string]tokenCostLimit, len(tokens))
 	newTokenMaxConns := make(map[string]int, len(tokens))
@@ -744,6 +757,9 @@ func (s *AuthService) ReloadAuthTokens() error {
 		// 只有有限制时才存储（节省内存）
 		if len(t.AllowedModels) > 0 {
 			newTokenModels[t.Token] = t.AllowedModels
+		}
+		if environment := extractUsageEventEnvironment(t.Description); environment != "" {
+			newTokenEnvironments[t.Token] = environment
 		}
 		channelRestriction, err := t.ChannelRestriction()
 		if err != nil {
@@ -790,6 +806,7 @@ func (s *AuthService) ReloadAuthTokens() error {
 	s.authTokenIDs = newTokenIDs
 	s.authTokenHashes = newTokenHashes
 	s.authTokenModels = newTokenModels
+	s.authTokenEnvironments = newTokenEnvironments
 	s.authTokenChannels = newTokenChannels
 	s.authTokenCostLimits = newTokenCostLimits
 	s.authTokenMaxConns = newTokenMaxConns

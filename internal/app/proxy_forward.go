@@ -1969,6 +1969,7 @@ func (s *Server) forwardAttempt(
 	reqCtx.attemptStartTime = time.Now()
 	reqCtx.baseURL = baseURL
 	reqCtx.upstreamProtocol = upstreamProtocol
+	reqCtx.attemptSeq++
 	actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx, upstreamProtocol)
 	requestPath := replaceModelInPath(reqCtx.requestPath, reqCtx.originalModel, actualModel)
 
