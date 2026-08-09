@@ -1485,6 +1485,40 @@ func TestInitDefaultSettings_PreservesExistingResponsesSessionTTLValue(t *testin
 	}
 }
 
+func TestInitDefaultSettings_PreservesExistingNonStreamTimeoutValues(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	want := map[string]string{
+		"non_stream_timeout":           "300",
+		"anthropic_non_stream_timeout": "301",
+		"codex_non_stream_timeout":     "302",
+		"openai_non_stream_timeout":    "303",
+		"gemini_non_stream_timeout":    "304",
+	}
+	for key, value := range want {
+		if _, err := db.ExecContext(ctx, "UPDATE system_settings SET value = ? WHERE key = ?", value, key); err != nil {
+			t.Fatalf("set %s: %v", key, err)
+		}
+	}
+
+	if err := initDefaultSettings(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("reinitialize defaults: %v", err)
+	}
+	for key, expected := range want {
+		var value string
+		if err := db.QueryRowContext(ctx, "SELECT value FROM system_settings WHERE key = ?", key).Scan(&value); err != nil {
+			t.Fatalf("query %s: %v", key, err)
+		}
+		if value != expected {
+			t.Errorf("setting %s=%q, want preserved %q", key, value, expected)
+		}
+	}
+}
+
 func TestInitDefaultSettings_PreservesExistingResponsesWebsocketValues(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
