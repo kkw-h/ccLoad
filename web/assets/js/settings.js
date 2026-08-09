@@ -3,6 +3,7 @@ const t = window.t;
 
 let originalSettings = {}; // 保存原始值用于比较
 let settingDefinitions = new Map();
+let externalAuthEnvironments = [];
 let runtimeMetricsLoading = false;
 let runtimeMetricsPreviousFocus = null;
 let globalCooldownRulesPreviousFocus = null;
@@ -237,6 +238,111 @@ function bindSettingsPageActions() {
   }
 
   bindGlobalCooldownRulesModal();
+
+  const addEnvironmentBtn = document.getElementById('add-external-auth-environment');
+  if (addEnvironmentBtn && !addEnvironmentBtn.dataset.bound) {
+    addEnvironmentBtn.addEventListener('click', () => {
+      externalAuthEnvironments.push({ environment: '', authz_url: '', is_active: true });
+      renderExternalAuthEnvironments();
+    });
+    addEnvironmentBtn.dataset.bound = '1';
+  }
+}
+
+async function loadExternalAuthEnvironments() {
+  try {
+    const data = await fetchDataWithAuth('/admin/external-auth-environments');
+    if (!Array.isArray(data)) throw new Error(t('settings.msg.invalidResponse'));
+    externalAuthEnvironments = data;
+    renderExternalAuthEnvironments();
+  } catch (err) {
+    console.error('Failed to load external auth environments:', err);
+    showError(t('settings.externalAuth.loadFailed') + ': ' + err.message);
+  }
+}
+
+function renderExternalAuthEnvironments() {
+  const tbody = document.getElementById('external-auth-environment-rows');
+  if (!tbody) return;
+  if (externalAuthEnvironments.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-secondary">${t('settings.externalAuth.empty')}</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = externalAuthEnvironments.map((item, index) => `
+    <tr class="mobile-card-row" data-index="${index}">
+      <td data-mobile-label="${escapeHtml(t('settings.externalAuth.environment'))}">
+        <input class="settings-input external-auth-environment-name" type="text"
+          value="${escapeHtml(item.environment || '')}" pattern="[a-z0-9_-]+"
+          aria-label="${escapeHtml(t('settings.externalAuth.environment'))}" required>
+      </td>
+      <td data-mobile-label="${escapeHtml(t('settings.externalAuth.authzUrl'))}">
+        <input class="settings-input external-auth-environment-url" type="url"
+          value="${escapeHtml(item.authz_url || '')}"
+          aria-label="${escapeHtml(t('settings.externalAuth.authzUrl'))}" required>
+      </td>
+      <td data-mobile-label="${escapeHtml(t('settings.externalAuth.active'))}">
+        <input class="external-auth-environment-active" type="checkbox"
+          aria-label="${escapeHtml(t('settings.externalAuth.active'))}" ${item.is_active ? 'checked' : ''}>
+      </td>
+      <td data-mobile-label="${escapeHtml(t('common.actions'))}">
+        <button class="btn btn-primary external-auth-environment-save" type="button">${t('common.save')}</button>
+        ${item.id ? `<button class="btn btn-danger external-auth-environment-delete" type="button">${t('common.delete')}</button>` : ''}
+      </td>
+    </tr>
+  `).join('');
+
+  if (tbody.dataset.bound) return;
+  tbody.addEventListener('click', (event) => {
+    const row = event.target.closest('tr[data-index]');
+    if (!row) return;
+    const index = Number(row.dataset.index);
+    if (event.target.closest('.external-auth-environment-save')) {
+      saveExternalAuthEnvironment(index, row);
+    } else if (event.target.closest('.external-auth-environment-delete')) {
+      deleteExternalAuthEnvironment(index);
+    }
+  });
+  tbody.dataset.bound = '1';
+}
+
+async function saveExternalAuthEnvironment(index, row) {
+  const environment = externalAuthEnvironments[index];
+  const environmentInput = row.querySelector('.external-auth-environment-name');
+  const urlInput = row.querySelector('.external-auth-environment-url');
+  if (!environmentInput.reportValidity() || !urlInput.reportValidity()) return;
+
+  const body = {
+    environment: environmentInput.value.trim(),
+    authz_url: urlInput.value.trim(),
+    is_active: row.querySelector('.external-auth-environment-active').checked
+  };
+  const endpoint = environment.id
+    ? `/admin/external-auth-environments/${environment.id}`
+    : '/admin/external-auth-environments';
+  try {
+    await fetchDataWithAuth(endpoint, {
+      method: environment.id ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    showSuccess(t('settings.externalAuth.saveSuccess'));
+    await loadExternalAuthEnvironments();
+  } catch (err) {
+    showError(t('settings.externalAuth.saveFailed') + ': ' + err.message);
+  }
+}
+
+async function deleteExternalAuthEnvironment(index) {
+  const item = externalAuthEnvironments[index];
+  if (!item?.id || !confirm(t('settings.externalAuth.confirmDelete', { environment: item.environment }))) return;
+  try {
+    await fetchDataWithAuth(`/admin/external-auth-environments/${item.id}`, { method: 'DELETE' });
+    showSuccess(t('settings.externalAuth.deleteSuccess'));
+    await loadExternalAuthEnvironments();
+  } catch (err) {
+    showError(t('settings.externalAuth.deleteFailed') + ': ' + err.message);
+  }
 }
 
 function bindGlobalCooldownRulesModal() {
@@ -987,5 +1093,6 @@ window.initPageBootstrap({
   run: () => {
     bindSettingsPageActions();
     loadSettings();
+    loadExternalAuthEnvironments();
   }
 });
