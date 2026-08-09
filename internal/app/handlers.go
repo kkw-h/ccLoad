@@ -386,5 +386,8 @@ func parsePositiveInt64QueryValues(values []string) []int64 {
 			ids = append(ids, id)
 		}
 	}
+	if len(values) > 0 && len(ids) == 0 {
+		return []int64{-1}
+	}
 	return ids
 }
