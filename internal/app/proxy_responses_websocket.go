@@ -174,20 +174,6 @@ func (s *Server) HandleResponsesWebsocket(c *gin.Context) {
 		eventType := strings.TrimSpace(gjson.GetBytes(message.payload, "type").String())
 		switch eventType {
 		case responsesWebsocketRequestCreate, responsesWebsocketRequestAppend:
-			if eventType == responsesWebsocketRequestCreate {
-				if errAuth := s.authorizeResponsesWebsocketTurn(c, message.payload); errAuth != nil {
-					code := "external_auth_unavailable"
-					if isExternalAuthErrorKind(errAuth, externalAuthErrorDenied) {
-						code = "external_auth_denied"
-					}
-					if errWrite := writeResponsesWebsocketError(conn, code, errAuth.Error()); errWrite != nil {
-						return
-					}
-					continue
-				}
-				tokenHash, _ = c.Get("token_hash")
-				tokenHashString, _ = tokenHash.(string)
-			}
 			if executionSession == nil {
 				sessionID := responsesExecutionSessionID(c.Request.Header)
 				var errSession error
@@ -276,48 +262,6 @@ func (s *Server) HandleResponsesWebsocket(c *gin.Context) {
 			}
 		}
 	}
-}
-
-func (s *Server) authorizeResponsesWebsocketTurn(c *gin.Context, payload []byte) error {
-	if s == nil || s.externalAuthService == nil || !s.externalAuthService.config.Enabled {
-		return nil
-	}
-	if s.externalAuthService.bypassesClientIP(c.ClientIP()) {
-		s.externalAuthService.stats.bypassed.Add(1)
-		return nil
-	}
-	environmentHeaders := c.Request.Header.Values("X-Sedna-Env")
-	if len(environmentHeaders) != 1 {
-		return &externalAuthError{kind: externalAuthErrorDenied, msg: "external authorization environment denied"}
-	}
-	modelName := strings.TrimSpace(gjson.GetBytes(payload, "response.model").String())
-	if modelName == "" {
-		modelName = strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-	}
-	result, err := s.externalAuthService.Authorize(c.Request.Context(), externalAuthRequest{
-		Environment:           environmentHeaders[0],
-		RequestID:             c.GetHeader("X-Request-Id"),
-		Method:                http.MethodGet,
-		Path:                  c.Request.URL.Path,
-		Model:                 modelName,
-		Stream:                true,
-		ClientIP:              c.ClientIP(),
-		OriginalAuthorization: c.GetHeader("Authorization"),
-	})
-	if err != nil {
-		return err
-	}
-	tokenHash, expiresAt, tokenID, exists := s.authService.resolveAuthToken(result.CCLoadToken)
-	if !exists || (expiresAt > 0 && time.Now().UnixMilli() > expiresAt) {
-		return unavailableExternalAuthError("external authorization returned an invalid local token")
-	}
-	c.Set(externalAuthIdentityContextKey, externalAuthIdentity{
-		ExternalUserID: result.ExternalUserID,
-		CCLoadToken:    result.CCLoadToken,
-		ExpiresAt:      result.ExpiresAt,
-	})
-	s.authService.attachAPIIdentity(c, tokenHash, tokenID)
-	return nil
 }
 
 type responsesWebsocketInboundMessage struct {
