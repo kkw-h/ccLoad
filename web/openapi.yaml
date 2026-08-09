@@ -939,8 +939,9 @@ components:
         count: {type: integer, default: 0}
     LoginRequest:
       type: object
-      required: [password]
+      required: [mode, password]
       properties:
+        mode: {type: string, enum: [admin]}
         password: {type: string, format: password}
     Protocol:
       type: string
@@ -971,9 +972,10 @@ components:
         note: {type: string, maxLength: 512}
     ChannelRequest:
       type: object
-      required: [name, urls, models]
+      required: [name, auth_type, urls, models]
       properties:
         name: {type: string}
+        auth_type: {type: string, enum: [api_key, codex_oauth, antigravity_oauth, xai_oauth]}
         api_key: {type: string, writeOnly: true, deprecated: true}
         api_keys: {type: array, items: {$ref: '#/components/schemas/ChannelAPIKey'}}
         websockets: {type: boolean}

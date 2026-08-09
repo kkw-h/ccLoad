@@ -49,6 +49,37 @@ func TestManagementOpenAPICoversRegisteredAdminRoutes(t *testing.T) {
 
 }
 
+func TestManagementOpenAPIDocumentsRequiredAuthDiscriminators(t *testing.T) {
+	content := mustReadRepositoryFile(t, "../../web/openapi.yaml")
+	var document struct {
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string       `yaml:"required"`
+				Properties map[string]any `yaml:"properties"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		t.Fatalf("parse openapi.yaml: %v", err)
+	}
+
+	login := document.Components.Schemas["LoginRequest"]
+	if !containsString(login.Required, "mode") || !containsString(login.Required, "password") {
+		t.Fatalf("LoginRequest.required=%v, want mode and password", login.Required)
+	}
+	if _, ok := login.Properties["mode"]; !ok {
+		t.Fatal("LoginRequest must document mode")
+	}
+
+	channel := document.Components.Schemas["ChannelRequest"]
+	if !containsString(channel.Required, "auth_type") {
+		t.Fatalf("ChannelRequest.required=%v, want auth_type", channel.Required)
+	}
+	if _, ok := channel.Properties["auth_type"]; !ok {
+		t.Fatal("ChannelRequest must document auth_type")
+	}
+}
+
 func TestDocsRoutesServeSwaggerUIAndOpenAPI(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	original := embedFS
@@ -161,4 +192,13 @@ func mustReadRepositoryFile(t *testing.T, path string) []byte {
 
 func contains(value, substring string) bool {
 	return strings.Contains(value, substring)
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
