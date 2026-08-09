@@ -19,6 +19,7 @@
   <script defer src="/web/assets/js/web-auth.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/ui.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-cooldown-detection.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/model-reasoning-efforts.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/settings.js?v=__VERSION__"></script>
 </head>
 <body>
@@ -110,6 +111,49 @@
           data-i18n="common.cancel">取消</button>
         <button type="button" class="btn btn-primary" data-action="apply-global-cooldown-rules"
           data-i18n="settings.globalCooldownRules.apply">应用到设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 原模型推理强度覆盖 -->
+  <div id="modelReasoningEffortsModal" class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="modelReasoningEffortsTitle" aria-describedby="modelReasoningEffortsDescription" aria-hidden="true">
+    <div class="modal-content model-reasoning-efforts-modal">
+      <div class="modal-header">
+        <div>
+          <h2 id="modelReasoningEffortsTitle" class="modal-title" data-i18n="settings.modelReasoningEfforts.title">原模型推理强度覆盖</h2>
+          <p id="modelReasoningEffortsDescription" class="modal-description" data-i18n="settings.modelReasoningEfforts.description">按渠道重定向后的原模型名称配置可用推理强度；留空覆盖表示明确不支持推理强度。</p>
+        </div>
+        <button type="button" class="close-btn" data-action="close-model-reasoning-efforts"
+          data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
+      </div>
+
+      <div class="model-reasoning-efforts-editor">
+        <label class="model-reasoning-efforts-model-field" for="model-reasoning-efforts-model">
+          <span data-i18n="settings.modelReasoningEfforts.modelName">原模型名称</span>
+          <input id="model-reasoning-efforts-model" type="text" class="form-input" maxlength="255"
+            autocomplete="off" spellcheck="false" placeholder="gpt-5.6-sol">
+        </label>
+        <fieldset class="model-reasoning-efforts-options">
+          <legend data-i18n="settings.modelReasoningEfforts.available">可用推理强度</legend>
+          <label><input type="checkbox" name="model-reasoning-effort" value="none"> none</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="minimal"> minimal</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="low"> low</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="medium"> medium</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="high"> high</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="xhigh"> xhigh</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="max"> max</label>
+        </fieldset>
+        <button type="button" class="btn btn-secondary model-reasoning-efforts-upsert"
+          data-action="upsert-model-reasoning-effort" data-i18n="settings.modelReasoningEfforts.addOrUpdate">添加或更新</button>
+        <div id="model-reasoning-efforts-list" class="model-reasoning-efforts-list" aria-live="polite"></div>
+      </div>
+
+      <div class="modal-footer custom-rules-footer">
+        <button type="button" class="btn btn-secondary" data-action="close-model-reasoning-efforts"
+          data-i18n="common.cancel">取消</button>
+        <button type="button" class="btn btn-primary" data-action="apply-model-reasoning-efforts"
+          data-i18n="settings.modelReasoningEfforts.apply">应用到设置</button>
       </div>
     </div>
   </div>

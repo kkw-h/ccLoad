@@ -3694,6 +3694,118 @@ body {
   font-size: 0.875rem;
 }
 
+.model-reasoning-efforts-control {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.model-reasoning-efforts-summary,
+.model-reasoning-efforts-empty {
+  color: var(--color-text-secondary);
+  font-size: 0.875rem;
+}
+
+.modal-content.model-reasoning-efforts-modal {
+  width: min(760px, calc(100vw - 32px));
+  max-width: 760px;
+  max-height: min(90vh, 820px);
+  overflow-y: auto;
+}
+
+.model-reasoning-efforts-editor {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(320px, 2fr) auto;
+  align-items: end;
+  gap: 16px;
+}
+
+.model-reasoning-efforts-model-field {
+  display: grid;
+  gap: 7px;
+  color: var(--color-text-secondary);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.model-reasoning-efforts-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+}
+
+.model-reasoning-efforts-options legend {
+  padding: 0 4px;
+  color: var(--color-text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.model-reasoning-efforts-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8125rem;
+}
+
+.model-reasoning-efforts-list {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.model-reasoning-efforts-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--surface-bg-muted);
+}
+
+.model-reasoning-efforts-row > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.model-reasoning-efforts-row strong,
+.model-reasoning-efforts-row span {
+  overflow-wrap: anywhere;
+}
+
+.model-reasoning-efforts-row span {
+  color: var(--color-text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8125rem;
+}
+
+@media (max-width: 720px) {
+  .model-reasoning-efforts-editor {
+    grid-template-columns: 1fr;
+  }
+
+  .model-reasoning-efforts-list {
+    grid-column: 1;
+  }
+
+  .model-reasoning-efforts-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
 .modal-content.runtime-metrics-modal {
   display: flex;
   flex-direction: column;

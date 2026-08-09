@@ -8,11 +8,15 @@ let runtimeMetricsPreviousFocus = null;
 let runtimeMetricsRefreshTimer = null;
 const RUNTIME_METRICS_REFRESH_MS = 3000;
 let globalCooldownRulesPreviousFocus = null;
+let modelReasoningEffortsPreviousFocus = null;
+let modelReasoningEffortsDraft = {};
 
 const globalCooldownRulesSettingKey = 'global_cooldown_detection_rules';
+const modelReasoningEffortOverridesSettingKey = 'model_reasoning_effort_overrides';
 const containerImageManagedDisabledReason = 'container_image_managed';
 const advancedSettingKeys = new Set([
   globalCooldownRulesSettingKey,
+  modelReasoningEffortOverridesSettingKey,
   'auto_refresh_interval_seconds',
   'active_request_title_enabled',
   'codex_map_429_to_503',
@@ -357,6 +361,141 @@ function bindSettingsPageActions() {
   }
 
   bindGlobalCooldownRulesModal();
+  bindModelReasoningEffortsModal();
+}
+
+function parseModelReasoningEffortOverrides(value) {
+  try {
+    return window.ModelReasoningEfforts.normalizeOverrides(JSON.parse(String(value || '{}')));
+  } catch (_) {
+    return {};
+  }
+}
+
+function updateModelReasoningEffortsSummary(value) {
+  const summary = document.getElementById('model-reasoning-efforts-summary');
+  if (!summary) return;
+  const count = Object.keys(parseModelReasoningEffortOverrides(value)).length;
+  summary.textContent = count === 0
+    ? t('settings.modelReasoningEfforts.none')
+    : t('settings.modelReasoningEfforts.overrideCount', { count });
+}
+
+function renderModelReasoningEffortsDraft() {
+  const list = document.getElementById('model-reasoning-efforts-list');
+  if (!list) return;
+  const entries = Object.entries(modelReasoningEffortsDraft);
+  if (entries.length === 0) {
+    list.innerHTML = `<p class="model-reasoning-efforts-empty">${escapeHtml(t('settings.modelReasoningEfforts.none'))}</p>`;
+    return;
+  }
+  list.innerHTML = entries.map(([model, efforts]) => `
+    <div class="model-reasoning-efforts-row">
+      <div>
+        <strong>${escapeHtml(model)}</strong>
+        <span>${escapeHtml(efforts.length > 0 ? efforts.join(', ') : t('settings.modelReasoningEfforts.disabled'))}</span>
+      </div>
+      <button type="button" class="btn btn-secondary" data-action="delete-model-reasoning-effort" data-model="${escapeHtml(model)}">
+        ${escapeHtml(t('settings.modelReasoningEfforts.restoreAutomatic'))}
+      </button>
+    </div>`).join('');
+}
+
+function openModelReasoningEffortsModal(trigger) {
+  const modal = document.getElementById('modelReasoningEffortsModal');
+  const input = document.getElementById(modelReasoningEffortOverridesSettingKey);
+  if (!modal || !input || !window.ModelReasoningEfforts) return;
+  modelReasoningEffortsPreviousFocus = trigger || document.activeElement;
+  modelReasoningEffortsDraft = parseModelReasoningEffortOverrides(input.value);
+  const modelInput = document.getElementById('model-reasoning-efforts-model');
+  if (modelInput) modelInput.value = '';
+  modal.querySelectorAll('input[name="model-reasoning-effort"]').forEach((checkbox) => {
+    checkbox.checked = false;
+  });
+  renderModelReasoningEffortsDraft();
+  document.querySelector('.app-container')?.setAttribute('inert', '');
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  modelInput?.focus();
+}
+
+function closeModelReasoningEffortsModal() {
+  const modal = document.getElementById('modelReasoningEffortsModal');
+  if (!modal) return;
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  document.querySelector('.app-container')?.removeAttribute('inert');
+  if (modelReasoningEffortsPreviousFocus?.isConnected) modelReasoningEffortsPreviousFocus.focus();
+  modelReasoningEffortsPreviousFocus = null;
+}
+
+function upsertModelReasoningEffortDraft() {
+  const modelInput = document.getElementById('model-reasoning-efforts-model');
+  if (!modelInput) return;
+  const efforts = Array.from(document.querySelectorAll('input[name="model-reasoning-effort"]:checked'))
+    .map((checkbox) => checkbox.value);
+  try {
+    modelReasoningEffortsDraft = window.ModelReasoningEfforts.upsertOverride(
+      modelReasoningEffortsDraft,
+      modelInput.value,
+      efforts
+    );
+  } catch (error) {
+    showError(t('settings.modelReasoningEfforts.invalid', { reason: error.message }));
+    modelInput.focus();
+    return;
+  }
+  modelInput.value = '';
+  renderModelReasoningEffortsDraft();
+}
+
+function applyModelReasoningEfforts() {
+  const input = document.getElementById(modelReasoningEffortOverridesSettingKey);
+  if (!input) return;
+  input.value = JSON.stringify(modelReasoningEffortsDraft);
+  markChanged(input);
+  updateModelReasoningEffortsSummary(input.value);
+  closeModelReasoningEffortsModal();
+}
+
+function bindModelReasoningEffortsModal() {
+  const modal = document.getElementById('modelReasoningEffortsModal');
+  if (!modal || modal.dataset.bound) return;
+  modal.addEventListener('click', (event) => {
+    if (event.target === modal) {
+      closeModelReasoningEffortsModal();
+      return;
+    }
+    const button = event.target.closest('[data-action]');
+    if (!button) return;
+    switch (button.dataset.action) {
+      case 'close-model-reasoning-efforts':
+        closeModelReasoningEffortsModal();
+        break;
+      case 'upsert-model-reasoning-effort':
+        upsertModelReasoningEffortDraft();
+        break;
+      case 'delete-model-reasoning-effort':
+        modelReasoningEffortsDraft = window.ModelReasoningEfforts.deleteOverride(
+          modelReasoningEffortsDraft,
+          button.dataset.model
+        );
+        renderModelReasoningEffortsDraft();
+        break;
+      case 'apply-model-reasoning-efforts':
+        applyModelReasoningEfforts();
+        break;
+    }
+  });
+  modal.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeModelReasoningEffortsModal();
+    } else if (event.key === 'Tab') {
+      trapModalFocus(modal, event);
+    }
+  });
+  modal.dataset.bound = '1';
 }
 
 function bindGlobalCooldownRulesModal() {
@@ -966,6 +1105,11 @@ function initSettingsEventDelegation() {
 
   // 重置按钮点击
   tbody.addEventListener('click', (e) => {
+    const editReasoningEffortsBtn = e.target.closest('[data-action="edit-model-reasoning-efforts"]');
+    if (editReasoningEffortsBtn) {
+      openModelReasoningEffortsModal(editReasoningEffortsBtn);
+      return;
+    }
     const editGlobalRulesBtn = e.target.closest('[data-action="edit-global-cooldown-rules"]');
     if (editGlobalRulesBtn) {
       openGlobalCooldownRulesModal(editGlobalRulesBtn);
@@ -1004,6 +1148,21 @@ function renderInput(setting) {
         <span id="global-cooldown-rules-summary" class="global-cooldown-rules-summary">
           ${escapeHtml(t('settings.globalCooldownRules.ruleCount', { count }))}
         </span>
+      </div>`;
+  }
+
+  if (setting.key === modelReasoningEffortOverridesSettingKey) {
+    const count = Object.keys(parseModelReasoningEffortOverrides(setting.value)).length;
+    const summary = count === 0
+      ? t('settings.modelReasoningEfforts.none')
+      : t('settings.modelReasoningEfforts.overrideCount', { count });
+    return `
+      <div class="model-reasoning-efforts-control">
+        <input type="hidden" id="${safeKey}" value="${safeValue}">
+        <button type="button" class="btn btn-secondary" data-action="edit-model-reasoning-efforts" ${disabledAttributes}>
+          ${escapeHtml(t('settings.modelReasoningEfforts.edit'))}
+        </button>
+        <span id="model-reasoning-efforts-summary" class="model-reasoning-efforts-summary">${escapeHtml(summary)}</span>
       </div>`;
   }
 
@@ -1113,6 +1272,7 @@ function setSettingControlValue(key, value) {
   }
 
   if (key === globalCooldownRulesSettingKey) updateGlobalCooldownRulesSummary(normalizedValue);
+  if (key === modelReasoningEffortOverridesSettingKey) updateModelReasoningEffortsSummary(normalizedValue);
   return control;
 }
 
@@ -1164,7 +1324,8 @@ async function saveAllSettings() {
     }
   }
 
-  if (!confirm(t('settings.msg.confirmSave'))) return;
+  const requiresRestart = Object.keys(updates).some((key) => key !== modelReasoningEffortOverridesSettingKey);
+  if (requiresRestart && !confirm(t('settings.msg.confirmSave'))) return;
 
   // 使用批量更新接口（单次请求，事务保护）
   try {
