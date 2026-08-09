@@ -78,6 +78,7 @@ async function loadSettingsPage(t, settings, inputValues) {
   const errors = [];
 
   global.window = {
+    ModelReasoningEfforts: require('./model-reasoning-efforts.js'),
     t(key) {
       if (key === 'settings.msg.confirmSave') return confirmMessage;
       return key;
@@ -198,6 +199,33 @@ test('保存设置须经用户确认', async (t) => {
 
   assert.deepEqual(page.prompts, [confirmMessage, confirmMessage]);
   assert.equal(saveRequests(page).length, 1);
+});
+
+test('推理强度覆盖使用映射编辑器并可单独热保存', async (t) => {
+  const key = 'model_reasoning_effort_overrides';
+  const page = await loadSettingsPage(t, [{
+    key,
+    value: '{}',
+    default_value: '{}',
+    value_type: 'json',
+    description: ''
+  }], {
+    [key]: '{"gpt-5.6-sol":["low","high"]}'
+  });
+
+  const row = page.renderCalls.find(({ template }) => template === 'tpl-setting-row');
+  assert.match(row.data.inputHtml, /data-action="edit-model-reasoning-efforts"/);
+  assert.match(row.data.inputHtml, /type="hidden"/);
+
+  page.saveButton.click();
+  await flushAsyncWork();
+
+  assert.deepEqual(page.prompts, []);
+  const requests = saveRequests(page);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    [key]: '{"gpt-5.6-sol":["low","high"]}'
+  });
 });
 
 test('字节型设置以 MiB 数值编辑并以字节保存', async (t) => {
