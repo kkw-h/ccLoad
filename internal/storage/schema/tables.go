@@ -136,6 +136,17 @@ func DefineSystemSettingsTable() *TableBuilder {
 		Column("updated_at BIGINT NOT NULL")
 }
 
+func DefineExternalAuthEnvironmentsTable() *TableBuilder {
+	return NewTable("external_auth_environments").
+		Column("id INT PRIMARY KEY AUTO_INCREMENT").
+		Column("environment VARCHAR(64) NOT NULL UNIQUE").
+		Column("authz_url VARCHAR(2048) NOT NULL").
+		Column("is_active TINYINT NOT NULL DEFAULT 1").
+		Column("created_at BIGINT NOT NULL").
+		Column("updated_at BIGINT NOT NULL").
+		Index("idx_external_auth_environments_active", "is_active")
+}
+
 // DefineWebSessionsTable defines role-aware browser sessions.
 func DefineWebSessionsTable() *TableBuilder {
 	return NewTable("web_sessions").

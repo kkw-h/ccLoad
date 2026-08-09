@@ -31,6 +31,13 @@ type Store interface {
 		Priority int
 	}) (int64, error)
 
+	// === External Authorization Environments ===
+	ListExternalAuthEnvironments(ctx context.Context) ([]*model.ExternalAuthEnvironment, error)
+	GetExternalAuthEnvironment(ctx context.Context, id int64) (*model.ExternalAuthEnvironment, error)
+	CreateExternalAuthEnvironment(ctx context.Context, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error)
+	UpdateExternalAuthEnvironment(ctx context.Context, id int64, env *model.ExternalAuthEnvironment) (*model.ExternalAuthEnvironment, error)
+	DeleteExternalAuthEnvironment(ctx context.Context, id int64) error
+
 	// === Channel URL Runtime State ===
 	// 持久化URL级运行态（当前仅记录手动禁用），重启后由URLSelector回填
 	LoadDisabledURLs(ctx context.Context) (map[int64][]string, error)
