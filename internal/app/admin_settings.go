@@ -410,14 +410,6 @@ func validateSettingValue(key, valueType, value string) error {
 			if intVal < 1 || int64(intVal) > maxSettingDurationSeconds {
 				return fmt.Errorf("%s must be between 1 and %d", key, maxSettingDurationSeconds)
 			}
-		case "external_auth_timeout_ms":
-			if intVal < externalAuthMinTimeoutMS || intVal > externalAuthMaxTimeoutMS {
-				return fmt.Errorf("external_auth_timeout_ms must be between %d and %d", externalAuthMinTimeoutMS, externalAuthMaxTimeoutMS)
-			}
-		case "external_auth_max_retries":
-			if intVal < 0 || intVal > externalAuthMaxRetries {
-				return fmt.Errorf("external_auth_max_retries must be between 0 and %d", externalAuthMaxRetries)
-			}
 		default:
 			if intVal < -1 {
 				return fmt.Errorf("value must be >= -1")
@@ -459,9 +451,6 @@ func validateSettingValue(key, valueType, value string) error {
 
 	case "string":
 		switch key {
-		case "external_auth_bypass_cidrs":
-			_, err := parseExternalAuthBypassPrefixes(value)
-			return err
 		case config.CodexBaseURLSettingKey,
 			config.XAIBaseURLSettingKey,
 			config.AntigravityURLSettingKey:
