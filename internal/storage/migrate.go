@@ -618,6 +618,11 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"responses_ws_max_transcript_bytes", "0", "int", responsesWSMaxTranscriptBytesDescription, "0"},
 		{"responses_ws_max_connections", "0", "int", responsesWSMaxConnectionsDescription, "0"},
 		{"responses_ws_max_connections_per_token", "0", "int", responsesWSMaxConnectionsPerTokenDescription, "0"},
+		// 外部鉴权（默认关闭，配置环境后由管理员显式启用）
+		{"external_auth_enabled", "false", "bool", "启用按 X-Sedna-Env 路由的外部鉴权", "false"},
+		{"external_auth_timeout_ms", "2000", "int", "外部鉴权单次请求超时(毫秒,100-10000)", "2000"},
+		{"external_auth_max_retries", "2", "int", "外部鉴权瞬态失败最大重试次数(0-2)", "2"},
+		{"external_auth_bypass_cidrs", "", "string", "迁移期跳过外部鉴权的客户端 IP/CIDR", ""},
 	}
 
 	var query string
