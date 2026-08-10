@@ -66,12 +66,13 @@ func (s *Server) visibleModelsAndChannelsForRequest(c *gin.Context, channels []*
 	return models, visibleChannels
 }
 
-func (s *Server) reasoningCapabilitiesForVisibleModels(channels []*model.Config, visibleModels []string) map[string]*[]string {
-	capabilities := make(map[string]*[]string)
-	if s.modelReasoningCapabilities == nil {
-		return capabilities
-	}
+type visibleModelCapabilities struct {
+	SupportedReasoningEfforts *[]string
+	ThinkingLevels            *[]string
+	Metadata                  modelMetadata
+}
 
+func originalModelsForVisibleModels(channels []*model.Config, visibleModels []string) map[string][]string {
 	visible := make(map[string]struct{}, len(visibleModels))
 	for _, modelName := range visibleModels {
 		visible[modelName] = struct{}{}
@@ -99,23 +100,52 @@ func (s *Server) reasoningCapabilitiesForVisibleModels(channels []*model.Config,
 		}
 	}
 
+	result := make(map[string][]string, len(originalsByModel))
 	for modelName, originalsSet := range originalsByModel {
 		originals := make([]string, 0, len(originalsSet))
 		for original := range originalsSet {
 			originals = append(originals, original)
 		}
 		sort.Strings(originals)
-		efforts, known := s.modelReasoningCapabilities.ResolveAll(originals)
-		if !known {
-			continue
+		result[modelName] = originals
+	}
+	return result
+}
+
+func (s *Server) capabilitiesForVisibleModels(channels []*model.Config, visibleModels []string) map[string]visibleModelCapabilities {
+	capabilities := make(map[string]visibleModelCapabilities, len(visibleModels))
+	for modelName, originals := range originalModelsForVisibleModels(channels, visibleModels) {
+		capability := visibleModelCapabilities{}
+		if s.modelReasoningCapabilities != nil {
+			efforts, known := s.modelReasoningCapabilities.ResolveAll(originals)
+			if known {
+				effortsCopy := append([]string(nil), efforts...)
+				if effortsCopy == nil {
+					effortsCopy = make([]string, 0)
+				}
+				capability.SupportedReasoningEfforts = &effortsCopy
+				capability.ThinkingLevels = thinkingLevelsFromReasoningEfforts(effortsCopy)
+			}
 		}
-		effortsCopy := append([]string(nil), efforts...)
-		if effortsCopy == nil {
-			effortsCopy = make([]string, 0)
+		if s.modelMetadataCapabilities != nil {
+			capability.Metadata = s.modelMetadataCapabilities.ResolveAll(originals)
 		}
-		capabilities[modelName] = &effortsCopy
+		capabilities[modelName] = capability
 	}
 	return capabilities
+}
+
+func thinkingLevelsFromReasoningEfforts(efforts []string) *[]string {
+	levels := append([]string(nil), efforts...)
+	if levels == nil {
+		levels = make([]string, 0)
+	}
+	for index, effort := range levels {
+		if effort == "none" {
+			levels[index] = "off"
+		}
+	}
+	return &levels
 }
 
 // handleListGeminiModels 处理 GET /v1beta/models 请求，返回本地 Gemini 模型列表
@@ -177,24 +207,38 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 	}
 	models, visibleChannels := s.visibleModelsAndChannelsForRequest(c, channels)
 	sort.Strings(models)
-	reasoningCapabilities := s.reasoningCapabilitiesForVisibleModels(visibleChannels, models)
+	capabilities := s.capabilitiesForVisibleModels(visibleChannels, models)
 
 	if clientProtocol == "anthropic" {
 		type ModelInfo struct {
 			ID                        string    `json:"id"`
 			DisplayName               string    `json:"display_name"`
+			CamelCaseDisplayName      string    `json:"displayName"`
 			Type                      string    `json:"type"`
 			CreatedAt                 string    `json:"created_at"`
 			SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
+			Provider                  *string   `json:"provider,omitempty"`
+			ThinkingLevels            *[]string `json:"thinkingLevels,omitempty"`
+			ContextWindow             *int64    `json:"contextWindow,omitempty"`
+			MaxTokens                 *int64    `json:"maxTokens,omitempty"`
+			InputTypes                *[]string `json:"inputTypes,omitempty"`
 		}
 		modelList := make([]ModelInfo, 0, len(models))
-		for _, model := range models {
+		for _, modelName := range models {
+			capability := capabilities[modelName]
+			displayName := formatModelDisplayName(modelName)
 			modelList = append(modelList, ModelInfo{
-				ID:                        model,
-				DisplayName:               formatModelDisplayName(model),
+				ID:                        modelName,
+				DisplayName:               displayName,
+				CamelCaseDisplayName:      displayName,
 				Type:                      "model",
 				CreatedAt:                 time.Unix(0, 0).UTC().Format(time.RFC3339),
-				SupportedReasoningEfforts: reasoningCapabilities[model],
+				SupportedReasoningEfforts: capability.SupportedReasoningEfforts,
+				Provider:                  capability.Metadata.Provider,
+				ThinkingLevels:            capability.ThinkingLevels,
+				ContextWindow:             capability.Metadata.ContextWindow,
+				MaxTokens:                 capability.Metadata.MaxTokens,
+				InputTypes:                capability.Metadata.InputTypes,
 			})
 		}
 
@@ -218,16 +262,29 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 		OwnedBy                   string    `json:"owned_by"`
 		MultiAgentVersion         string    `json:"multi_agent_version,omitempty"`
 		SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
+		DisplayName               string    `json:"displayName"`
+		Provider                  *string   `json:"provider,omitempty"`
+		ThinkingLevels            *[]string `json:"thinkingLevels,omitempty"`
+		ContextWindow             *int64    `json:"contextWindow,omitempty"`
+		MaxTokens                 *int64    `json:"maxTokens,omitempty"`
+		InputTypes                *[]string `json:"inputTypes,omitempty"`
 	}
 
 	modelList := make([]ModelInfo, 0, len(models))
-	for _, model := range models {
+	for _, modelName := range models {
+		capability := capabilities[modelName]
 		modelList = append(modelList, ModelInfo{
-			ID:                        model,
+			ID:                        modelName,
 			Object:                    "model",
 			Created:                   0,
 			OwnedBy:                   "system",
-			SupportedReasoningEfforts: reasoningCapabilities[model],
+			SupportedReasoningEfforts: capability.SupportedReasoningEfforts,
+			DisplayName:               formatModelDisplayName(modelName),
+			Provider:                  capability.Metadata.Provider,
+			ThinkingLevels:            capability.ThinkingLevels,
+			ContextWindow:             capability.Metadata.ContextWindow,
+			MaxTokens:                 capability.Metadata.MaxTokens,
+			InputTypes:                capability.Metadata.InputTypes,
 			MultiAgentVersion: func() string {
 				if clientProtocol == "codex" {
 					return "v2"
