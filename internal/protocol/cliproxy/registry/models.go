@@ -20,9 +20,14 @@ type ThinkingSupport struct {
 
 // ModelInfo describes immutable model capabilities used during conversion.
 type ModelInfo struct {
-	ID       string           `json:"id"`
-	Name     string           `json:"name,omitempty"`
-	Thinking *ThinkingSupport `json:"thinking,omitempty"`
+	ID                  string           `json:"id"`
+	Name                string           `json:"name,omitempty"`
+	OwnedBy             string           `json:"owned_by,omitempty"`
+	DisplayName         string           `json:"display_name,omitempty"`
+	ContextLength       int64            `json:"context_length,omitempty"`
+	MaxCompletionTokens int64            `json:"max_completion_tokens,omitempty"`
+	SupportedParameters []string         `json:"supported_parameters,omitempty"`
+	Thinking            *ThinkingSupport `json:"thinking,omitempty"`
 }
 
 type modelCatalog struct {
@@ -80,6 +85,7 @@ func modelsForProvider(provider string) [][]*ModelInfo {
 
 func cloneModelInfo(model *ModelInfo) *ModelInfo {
 	clone := *model
+	clone.SupportedParameters = append([]string(nil), model.SupportedParameters...)
 	if model.Thinking != nil {
 		thinking := *model.Thinking
 		thinking.Levels = append([]string(nil), model.Thinking.Levels...)
