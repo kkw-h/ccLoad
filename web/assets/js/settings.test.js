@@ -228,6 +228,50 @@ test('推理强度覆盖使用映射编辑器并可单独热保存', async (t) =
   });
 });
 
+test('模型元数据覆盖位于高级分组并可单独热保存', async (t) => {
+  const key = 'model_metadata_overrides';
+  const value = '{"gpt-5.6-sol":{"provider":"OpenAI","inputTypes":["text"]}}';
+  const page = await loadSettingsPage(t, [{
+    key,
+    value: '{}',
+    default_value: '{}',
+    value_type: 'json',
+    description: ''
+  }], {
+    [key]: value
+  });
+
+  const advancedGroup = page.renderCalls.find(({ template, data }) => (
+    template === 'tpl-setting-group-row' && data.groupId === 'advanced'
+  ));
+  assert.ok(advancedGroup, '模型元数据覆盖应位于高级分组');
+
+  page.saveButton.click();
+  await flushAsyncWork();
+
+  assert.deepEqual(page.prompts, []);
+  const requests = saveRequests(page);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { [key]: value });
+});
+
+test('模型元数据覆盖与普通设置混合保存时仍要求重启确认', async (t) => {
+  const metadataKey = 'model_metadata_overrides';
+  const page = await loadSettingsPage(t, [
+    { key: metadataKey, value: '{}', default_value: '{}', value_type: 'json', description: '' },
+    { key: 'sample_setting', value: 'old-value', default_value: '', value_type: 'string', description: '' }
+  ], {
+    [metadataKey]: '{"gpt-5.6-sol":{"provider":"OpenAI"}}',
+    sample_setting: 'new-value'
+  });
+
+  page.saveButton.click();
+  await flushAsyncWork();
+
+  assert.deepEqual(page.prompts, [confirmMessage]);
+  assert.equal(saveRequests(page).length, 0);
+});
+
 test('字节型设置以 MiB 数值编辑并以字节保存', async (t) => {
   const transcriptKey = 'responses_ws_max_transcript_bytes';
   const bodyKey = 'max_body_bytes';

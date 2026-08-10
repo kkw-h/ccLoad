@@ -80,6 +80,38 @@ func TestManagementOpenAPIDocumentsRequiredAuthDiscriminators(t *testing.T) {
 	}
 }
 
+func TestManagementOpenAPIDocumentsModelListMetadata(t *testing.T) {
+	content := mustReadRepositoryFile(t, "../../web/openapi.yaml")
+	var document struct {
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string       `yaml:"required"`
+				Properties map[string]any `yaml:"properties"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		t.Fatalf("parse openapi.yaml: %v", err)
+	}
+
+	for _, schemaName := range []string{"OpenAIModel", "AnthropicModel"} {
+		schema := document.Components.Schemas[schemaName]
+		for _, field := range []string{"displayName", "provider", "thinkingLevels", "contextWindow", "maxTokens", "inputTypes"} {
+			if _, ok := schema.Properties[field]; !ok {
+				t.Errorf("%s must document %s", schemaName, field)
+			}
+		}
+	}
+	anthropic := document.Components.Schemas["AnthropicModel"]
+	if !containsString(anthropic.Required, "display_name") {
+		t.Fatalf("AnthropicModel.required=%v, want display_name", anthropic.Required)
+	}
+	settings := document.Components.Schemas["SettingsBatchRequest"]
+	if _, ok := settings.Properties["model_metadata_overrides"]; !ok {
+		t.Fatal("SettingsBatchRequest must document model_metadata_overrides")
+	}
+}
+
 func TestDocsRoutesServeSwaggerUIAndOpenAPI(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	original := embedFS

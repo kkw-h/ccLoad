@@ -32,6 +32,10 @@ paths:
         `supported_reasoning_efforts` 根据可见渠道中该公开模型映射到的原模型名称计算。多个原模型
         共享同一公开名称时返回能力交集；能力未知时省略字段，人工明确配置为空集合时返回 `[]`。
         渠道中的 `redirect_model` 只参与服务端计算，不会在响应中暴露。
+
+        camelCase 元数据同样按映射后的原模型计算。供应商不一致时返回 `mixed`，上下文和最大输出
+        取最小值，输入类型取交集；任一原模型缺少某字段时只省略该字段。`thinkingLevels` 与
+        `supported_reasoning_efforts` 使用相同能力集合，但将 `none` 展示为 `off`。
       security:
         - proxyBearer: []
         - proxyAPIKey: []
@@ -54,6 +58,12 @@ paths:
                         created: 0
                         owned_by: system
                         supported_reasoning_efforts: [low, medium, high, xhigh]
+                        displayName: Sciland 3.0
+                        provider: OpenAI
+                        thinkingLevels: [low, medium, high, xhigh]
+                        contextWindow: 372000
+                        maxTokens: 128000
+                        inputTypes: [text]
         '401': {$ref: '#/components/responses/Error'}
   /login:
     post:
@@ -1101,6 +1111,29 @@ components:
         items: {$ref: '#/components/schemas/ReasoningEffort'}
       example:
         gpt-5.6-sol: [low, medium, high, xhigh]
+    ModelMetadataOverride:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        provider: {type: string, minLength: 1}
+        contextWindow: {type: integer, format: int64, minimum: 1}
+        maxTokens: {type: integer, format: int64, minimum: 1}
+        inputTypes:
+          type: array
+          uniqueItems: true
+          items: {type: string, minLength: 1}
+    ModelMetadataOverrides:
+      type: object
+      maxProperties: 500
+      description: 键为规范化后的原模型名称；每个对象仅覆盖明确提供的字段，空 inputTypes 表示明确不支持任何输入类型。
+      additionalProperties: {$ref: '#/components/schemas/ModelMetadataOverride'}
+      example:
+        gpt-5.6-sol:
+          provider: OpenAI
+          contextWindow: 372000
+          maxTokens: 128000
+          inputTypes: [text]
     SettingsBatchRequest:
       type: object
       additionalProperties: {type: string}
@@ -1110,20 +1143,44 @@ components:
           contentMediaType: application/json
           description: 序列化后的 ModelReasoningEffortOverrides JSON 对象；保存后即时生效。
           example: '{"gpt-5.6-sol":["low","high"]}'
+        model_metadata_overrides:
+          type: string
+          contentMediaType: application/json
+          description: 序列化后的 ModelMetadataOverrides JSON 对象；保存后即时生效。
+          example: '{"gpt-5.6-sol":{"provider":"OpenAI","contextWindow":372000,"maxTokens":128000,"inputTypes":["text"]}}'
     SupportedReasoningEfforts:
       type: array
       description: 可用推理强度；能力未知时省略，明确禁用时返回空数组。
       uniqueItems: true
       items: {$ref: '#/components/schemas/ReasoningEffort'}
+    ThinkingLevel:
+      type: string
+      enum: [off, minimal, low, medium, high, xhigh, max]
+    ThinkingLevels:
+      type: array
+      description: 面向客户端展示的推理强度；none 被转换为 off，能力未知时省略。
+      uniqueItems: true
+      items: {$ref: '#/components/schemas/ThinkingLevel'}
+    InputTypes:
+      type: array
+      description: 原模型共同支持的输入类型；能力未知时省略，明确不支持时返回空数组。
+      uniqueItems: true
+      items: {type: string}
     OpenAIModel:
       type: object
-      required: [id, object, created, owned_by]
+      required: [id, object, created, owned_by, displayName]
       properties:
         id: {type: string}
         object: {type: string, const: model}
         created: {type: integer, format: int64}
         owned_by: {type: string}
         supported_reasoning_efforts: {$ref: '#/components/schemas/SupportedReasoningEfforts'}
+        displayName: {type: string}
+        provider: {type: string, description: 原模型供应商；多供应商时为 mixed。}
+        thinkingLevels: {$ref: '#/components/schemas/ThinkingLevels'}
+        contextWindow: {type: integer, format: int64, minimum: 1}
+        maxTokens: {type: integer, format: int64, minimum: 1}
+        inputTypes: {$ref: '#/components/schemas/InputTypes'}
     OpenAIModelList:
       type: object
       required: [object, data]
@@ -1132,13 +1189,19 @@ components:
         data: {type: array, items: {$ref: '#/components/schemas/OpenAIModel'}}
     AnthropicModel:
       type: object
-      required: [id, display_name, type, created_at]
+      required: [id, display_name, displayName, type, created_at]
       properties:
         id: {type: string}
         display_name: {type: string}
+        displayName: {type: string, description: 与 display_name 相同的 camelCase 兼容字段。}
         type: {type: string, const: model}
         created_at: {type: string, format: date-time}
         supported_reasoning_efforts: {$ref: '#/components/schemas/SupportedReasoningEfforts'}
+        provider: {type: string, description: 原模型供应商；多供应商时为 mixed。}
+        thinkingLevels: {$ref: '#/components/schemas/ThinkingLevels'}
+        contextWindow: {type: integer, format: int64, minimum: 1}
+        maxTokens: {type: integer, format: int64, minimum: 1}
+        inputTypes: {$ref: '#/components/schemas/InputTypes'}
     AnthropicModelList:
       type: object
       required: [data, has_more]

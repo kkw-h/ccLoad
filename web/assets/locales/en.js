@@ -1392,6 +1392,7 @@ window.I18N_LOCALES['en'] = {
   'settings.globalCooldownRules.description': 'Channels without channel-specific rules inherit these rules. Channel-specific rules replace the global set. Save all changes to restart and apply.',
   'settings.globalCooldownRules.apply': 'Apply to settings',
   'settings.desc.model_reasoning_effort_overrides': 'Override reasoning efforts exposed by /v1/models using the original model name after channel redirection',
+  'settings.desc.model_metadata_overrides': 'Override provider, context window, maximum output, and input types exposed by /v1/models using the original model name after channel redirection',
   'settings.modelReasoningEfforts.edit': 'Edit mappings',
   'settings.modelReasoningEfforts.title': 'Original model reasoning effort overrides',
   'settings.modelReasoningEfforts.description': 'Configure available reasoning efforts by the original model name after channel redirection. An empty selection explicitly disables reasoning efforts. Save to apply immediately.',

@@ -1392,6 +1392,7 @@ window.I18N_LOCALES['zh-CN'] = {
   'settings.globalCooldownRules.description': '渠道未配置专属规则时继承；渠道专属规则会完整覆盖全局规则。保存所有更改后重启生效。',
   'settings.globalCooldownRules.apply': '应用到设置',
   'settings.desc.model_reasoning_effort_overrides': '按渠道重定向后的原模型名称，覆盖 /v1/models 返回的可用推理强度',
+  'settings.desc.model_metadata_overrides': '按渠道重定向后的原模型名称，覆盖 /v1/models 返回的供应商、上下文、最大输出和输入类型',
   'settings.modelReasoningEfforts.edit': '编辑映射',
   'settings.modelReasoningEfforts.title': '原模型推理强度覆盖',
   'settings.modelReasoningEfforts.description': '按渠道重定向后的原模型名称配置可用推理强度；留空覆盖表示明确不支持推理强度。修改后保存即可即时生效。',
