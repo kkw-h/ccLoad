@@ -464,6 +464,11 @@ func TestProxyModelsExposeReasoningCapabilitiesForOpenAIAndAnthropic(t *testing.
 		t.Fatalf("new resolver: %v", err)
 	}
 	server.modelReasoningCapabilities = resolver
+	metadataResolver, err := newModelMetadataResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new metadata resolver: %v", err)
+	}
+	server.modelMetadataCapabilities = metadataResolver
 
 	_, err = store.CreateConfig(context.Background(), &model.Config{
 		Name:         "reasoning-model-channel",
@@ -499,7 +504,107 @@ func TestProxyModelsExposeReasoningCapabilitiesForOpenAIAndAnthropic(t *testing.
 			if efforts == nil || !reflect.DeepEqual(*efforts, []string{"low", "medium", "high", "xhigh"}) {
 				t.Fatalf("efforts=%#v", efforts)
 			}
+			metadata := modelListMetadataFromResponse(t, w.Body.Bytes(), "sciland-3.0")
+			if metadata.DisplayName != "Sciland 3.0" {
+				t.Fatalf("displayName=%q", metadata.DisplayName)
+			}
+			if tt.name == "anthropic" && metadata.LegacyDisplayName != metadata.DisplayName {
+				t.Fatalf("display_name=%q displayName=%q", metadata.LegacyDisplayName, metadata.DisplayName)
+			}
+			assertMetadataString(t, "provider", metadata.Provider, "OpenAI")
+			assertMetadataStrings(t, "thinkingLevels", metadata.ThinkingLevels, []string{"low", "medium", "high", "xhigh"})
+			assertMetadataInt64(t, "contextWindow", metadata.ContextWindow, 372000)
+			assertMetadataInt64(t, "maxTokens", metadata.MaxTokens, 128000)
+			assertMetadataStrings(t, "inputTypes", metadata.InputTypes, []string{"text"})
 		})
+	}
+}
+
+func TestModelListMetadataAggregatesMappedOriginalsAndTranslatesOff(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	reasoningResolver, err := newModelReasoningCapabilityResolver(`{
+		"upstream-a":["none","low","high"],
+		"upstream-b":["none","high"]
+	}`)
+	if err != nil {
+		t.Fatalf("new reasoning resolver: %v", err)
+	}
+	metadataResolver, err := newModelMetadataResolver(`{
+		"upstream-a":{"provider":"OpenAI","contextWindow":200000,"maxTokens":64000,"inputTypes":["text","image"]},
+		"upstream-b":{"provider":"Anthropic","contextWindow":100000,"maxTokens":32000,"inputTypes":["text"]},
+		"empty-upstream":{"provider":"OpenAI","inputTypes":[]},
+		"partial-upstream":{"provider":"Google"}
+	}`)
+	if err != nil {
+		t.Fatalf("new metadata resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = reasoningResolver
+	server.modelMetadataCapabilities = metadataResolver
+
+	configs := []*model.Config{
+		{Name: "metadata-a", URLs: model.ChannelURLs{{URL: "https://a.example.com"}}, Priority: 1, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "shared-model", RedirectModel: "upstream-a"}}},
+		{Name: "metadata-b", URLs: model.ChannelURLs{{URL: "https://b.example.com"}}, Priority: 2, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "shared-model", RedirectModel: "upstream-b"}}},
+		{Name: "metadata-empty", URLs: model.ChannelURLs{{URL: "https://empty.example.com"}}, Priority: 3, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "empty-input-model", RedirectModel: "empty-upstream"}}},
+		{Name: "metadata-partial", URLs: model.ChannelURLs{{URL: "https://partial.example.com"}}, Priority: 4, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "partial-model", RedirectModel: "partial-upstream"}}},
+	}
+	for _, cfg := range configs {
+		if _, err := store.CreateConfig(context.Background(), cfg); err != nil {
+			t.Fatalf("CreateConfig %s: %v", cfg.Name, err)
+		}
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/v1/models", nil))
+	server.handleListOpenAIModels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	shared := modelListMetadataFromResponse(t, w.Body.Bytes(), "shared-model")
+	assertMetadataString(t, "provider", shared.Provider, "mixed")
+	assertMetadataStrings(t, "thinkingLevels", shared.ThinkingLevels, []string{"off", "high"})
+	assertMetadataInt64(t, "contextWindow", shared.ContextWindow, 100000)
+	assertMetadataInt64(t, "maxTokens", shared.MaxTokens, 32000)
+	assertMetadataStrings(t, "inputTypes", shared.InputTypes, []string{"text"})
+	efforts := modelReasoningEffortsFromResponse(t, w.Body.Bytes(), "shared-model")
+	if efforts == nil || !reflect.DeepEqual(*efforts, []string{"none", "high"}) {
+		t.Fatalf("supported_reasoning_efforts=%#v", efforts)
+	}
+
+	empty := modelListMetadataFromResponse(t, w.Body.Bytes(), "empty-input-model")
+	assertMetadataStrings(t, "inputTypes", empty.InputTypes, []string{})
+	partial := modelListMetadataFromResponse(t, w.Body.Bytes(), "partial-model")
+	assertMetadataString(t, "provider", partial.Provider, "Google")
+	if partial.ContextWindow != nil || partial.MaxTokens != nil || partial.InputTypes != nil {
+		t.Fatalf("unknown partial fields must be omitted: %+v", partial)
+	}
+}
+
+func TestModelListMetadataDoesNotExtendGeminiV1BetaShape(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	if _, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "gemini-shape", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Priority: 1, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "sciland-3.0", RedirectModel: "gpt-5.6-sol"}},
+	}); err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/v1beta/models", nil))
+	server.handleListGeminiModels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Models []map[string]any `json:"models"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &response)
+	for _, item := range response.Models {
+		for _, field := range []string{"provider", "thinkingLevels", "contextWindow", "maxTokens", "inputTypes"} {
+			if _, exists := item[field]; exists {
+				t.Fatalf("/v1beta/models unexpectedly contains %s: %v", field, item)
+			}
+		}
 	}
 }
 
@@ -557,6 +662,14 @@ func TestProxyModelsReasoningCapabilitiesRespectTokenChannelRestrictions(t *test
 		t.Fatalf("new resolver: %v", err)
 	}
 	server.modelReasoningCapabilities = resolver
+	metadataResolver, err := newModelMetadataResolver(`{
+		"allowed-upstream":{"provider":"OpenAI","contextWindow":200000},
+		"denied-upstream":{"provider":"Anthropic","contextWindow":100000}
+	}`)
+	if err != nil {
+		t.Fatalf("new metadata resolver: %v", err)
+	}
+	server.modelMetadataCapabilities = metadataResolver
 	server.authService = newTestAuthService(t)
 
 	if _, err := store.CreateConfig(context.Background(), &model.Config{
@@ -588,6 +701,9 @@ func TestProxyModelsReasoningCapabilitiesRespectTokenChannelRestrictions(t *test
 	if efforts == nil || !reflect.DeepEqual(*efforts, []string{"low", "high"}) {
 		t.Fatalf("restricted efforts=%#v", efforts)
 	}
+	metadata := modelListMetadataFromResponse(t, w.Body.Bytes(), "restricted-model")
+	assertMetadataString(t, "provider", metadata.Provider, "OpenAI")
+	assertMetadataInt64(t, "contextWindow", metadata.ContextWindow, 200000)
 }
 
 func modelReasoningEffortsFromResponse(t testing.TB, body []byte, modelID string) *[]string {
@@ -606,4 +722,32 @@ func modelReasoningEffortsFromResponse(t testing.TB, body []byte, modelID string
 	}
 	t.Fatalf("model %q missing from response: %s", modelID, body)
 	return nil
+}
+
+type modelListMetadataResponse struct {
+	DisplayName       string    `json:"displayName"`
+	LegacyDisplayName string    `json:"display_name"`
+	Provider          *string   `json:"provider"`
+	ThinkingLevels    *[]string `json:"thinkingLevels"`
+	ContextWindow     *int64    `json:"contextWindow"`
+	MaxTokens         *int64    `json:"maxTokens"`
+	InputTypes        *[]string `json:"inputTypes"`
+}
+
+func modelListMetadataFromResponse(t testing.TB, body []byte, modelID string) modelListMetadataResponse {
+	t.Helper()
+	var response struct {
+		Data []struct {
+			ID string `json:"id"`
+			modelListMetadataResponse
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, body, &response)
+	for _, item := range response.Data {
+		if item.ID == modelID {
+			return item.modelListMetadataResponse
+		}
+	}
+	t.Fatalf("model %q missing from response: %s", modelID, body)
+	return modelListMetadataResponse{}
 }
