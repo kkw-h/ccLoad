@@ -457,6 +457,72 @@ func TestAdminReasoningEffortOverridesApplyLiveWithoutRestart(t *testing.T) {
 	assertRestartNotTriggered(t, restarted)
 }
 
+func TestAdminModelMetadataOverridesApplyLiveWithoutRestart(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelMetadataResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelMetadataCapabilities = resolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	value := `{"gpt-5.6-sol":{"provider":"Custom","contextWindow":300000,"maxTokens":64000,"inputTypes":["text","image"]}}`
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelMetadataOverridesSetting, map[string]string{
+		"value": value,
+	}))
+	c.Params = gin.Params{{Key: "key", Value: modelMetadataOverridesSetting}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", w.Code, w.Body.String())
+	}
+	got := resolver.Resolve("gpt-5.6-sol")
+	assertMetadataString(t, "provider", got.Provider, "Custom")
+	assertMetadataInt64(t, "contextWindow", got.ContextWindow, 300000)
+	assertMetadataStrings(t, "inputTypes", got.InputTypes, []string{"image", "text"})
+	assertRestartNotTriggered(t, restarted)
+
+	c, w = newTestContext(t, newRequest(http.MethodPost, "/admin/settings/"+modelMetadataOverridesSetting+"/reset", nil))
+	c.Params = gin.Params{{Key: "key", Value: modelMetadataOverridesSetting}}
+	server.AdminResetSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset status=%d body=%s", w.Code, w.Body.String())
+	}
+	got = resolver.Resolve("gpt-5.6-sol")
+	assertMetadataString(t, "provider", got.Provider, "OpenAI")
+	assertMetadataInt64(t, "contextWindow", got.ContextWindow, 372000)
+	assertRestartNotTriggered(t, restarted)
+}
+
+func TestAdminModelMetadataOverridesValidationRejectsInvalidJSON(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelMetadataResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelMetadataCapabilities = resolver
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelMetadataOverridesSetting, map[string]string{
+		"value": `{"gpt-5.6-sol":{"contextWindow":0}}`,
+	}))
+	c.Params = gin.Params{{Key: "key", Value: modelMetadataOverridesSetting}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("update status=%d, want 400 body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestAdminReasoningEffortOverridesConcurrentUpdatesKeepRuntimeInSync(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -541,6 +607,47 @@ func TestAdminReasoningEffortOverridesMixedBatchAppliesLiveAndRestarts(t *testin
 	}
 	got, known := resolver.Resolve("gpt-5.6-sol")
 	assertReasoningEfforts(t, got, known, []string{"medium"}, true)
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected mixed batch restart")
+	}
+}
+
+func TestAdminModelCapabilityOverridesMixedBatchApplyLiveAndRestart(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	reasoningResolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new reasoning resolver: %v", err)
+	}
+	metadataResolver, err := newModelMetadataResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new metadata resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = reasoningResolver
+	server.modelMetadataCapabilities = metadataResolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+		modelReasoningEffortOverridesSetting: `{"gpt-5.6-sol":["medium"]}`,
+		modelMetadataOverridesSetting:        `{"gpt-5.6-sol":{"provider":"Custom"}}`,
+		"log_retention_days":                 "14",
+	}))
+	server.AdminBatchUpdateSettings(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch status=%d body=%s", w.Code, w.Body.String())
+	}
+	efforts, known := reasoningResolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, efforts, known, []string{"medium"}, true)
+	metadata := metadataResolver.Resolve("gpt-5.6-sol")
+	assertMetadataString(t, "provider", metadata.Provider, "Custom")
 	select {
 	case <-restarted:
 	case <-time.After(time.Second):

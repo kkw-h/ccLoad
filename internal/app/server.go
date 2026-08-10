@@ -70,6 +70,7 @@ type Server struct {
 	disabledURLSyncMu             sync.Mutex
 	protocolRegistry              *protocol.Registry
 	modelReasoningCapabilities    *modelReasoningCapabilityResolver
+	modelMetadataCapabilities     *modelMetadataResolver
 	client                        *http.Client // HTTP客户端（全局默认）
 	antigravityClient             *http.Client // Antigravity 专用标准 HTTP/1.1 客户端
 	xaiSSOClient                  *http.Client // xAI Web SSO 专用 HTTP/1.1 客户端
@@ -214,6 +215,13 @@ func NewServer(store storage.Store) *Server {
 		log.Printf("[WARN] 推理强度覆盖配置无效，已回退内置能力: %v", err)
 		reasoningCapabilities, _ = newModelReasoningCapabilityResolver("{}")
 	}
+	metadataCapabilities, err := newModelMetadataResolver(
+		configService.GetString(modelMetadataOverridesSetting, "{}"),
+	)
+	if err != nil {
+		log.Printf("[WARN] 模型元数据覆盖配置无效，已回退内置能力: %v", err)
+		metadataCapabilities, _ = newModelMetadataResolver("{}")
+	}
 
 	s := &Server{
 		startedAt:                  startedAt,
@@ -221,6 +229,7 @@ func NewServer(store storage.Store) *Server {
 		configService:              configService,
 		loginRateLimiter:           util.NewLoginRateLimiter(),
 		modelReasoningCapabilities: reasoningCapabilities,
+		modelMetadataCapabilities:  metadataCapabilities,
 
 		// 运行时配置（启动时加载，修改后重启生效）
 		maxKeyRetries:            runtimeCfg.MaxKeyRetries,
