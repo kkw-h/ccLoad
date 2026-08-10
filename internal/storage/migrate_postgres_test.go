@@ -449,6 +449,13 @@ func TestPostgres(t *testing.T) {
 		if reasoningSetting.Value != "{}" || reasoningSetting.ValueType != "json" || reasoningSetting.DefaultValue != "{}" {
 			t.Fatalf("reasoning setting=%+v, want value/default {} and type json", reasoningSetting)
 		}
+		metadataSetting, err := store.GetSetting(ctx, "model_metadata_overrides")
+		if err != nil {
+			t.Fatalf("GetSetting model_metadata_overrides: %v", err)
+		}
+		if metadataSetting.Value != "{}" || metadataSetting.ValueType != "json" || metadataSetting.DefaultValue != "{}" {
+			t.Fatalf("metadata setting=%+v, want value/default {} and type json", metadataSetting)
+		}
 		if err := store.UpdateSetting(ctx, "log_retention_days", "14"); err != nil {
 			t.Fatalf("UpdateSetting: %v", err)
 		}

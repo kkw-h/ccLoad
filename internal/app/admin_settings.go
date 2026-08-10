@@ -371,23 +371,38 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 }
 
 func (s *Server) applyLiveSettings(updates map[string]string) error {
-	value, ok := updates[modelReasoningEffortOverridesSetting]
-	if !ok {
-		return nil
-	}
-	if s.modelReasoningCapabilities == nil {
+	reasoningValue, updatesReasoning := updates[modelReasoningEffortOverridesSetting]
+	metadataValue, updatesMetadata := updates[modelMetadataOverridesSetting]
+	if updatesReasoning && s.modelReasoningCapabilities == nil {
 		return fmt.Errorf("model reasoning capability resolver is not initialized")
 	}
-	return s.modelReasoningCapabilities.SetOverrides(value)
+	if updatesMetadata && s.modelMetadataCapabilities == nil {
+		return fmt.Errorf("model metadata resolver is not initialized")
+	}
+	if updatesReasoning {
+		if err := s.modelReasoningCapabilities.SetOverrides(reasoningValue); err != nil {
+			return err
+		}
+	}
+	if updatesMetadata {
+		if err := s.modelMetadataCapabilities.SetOverrides(metadataValue); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func settingsRequireRestart(updates map[string]string) bool {
 	for key := range updates {
-		if key != modelReasoningEffortOverridesSetting {
+		if !isLiveModelCapabilitySetting(key) {
 			return true
 		}
 	}
 	return false
+}
+
+func isLiveModelCapabilitySetting(key string) bool {
+	return key == modelReasoningEffortOverridesSetting || key == modelMetadataOverridesSetting
 }
 
 // validateSettingValue 验证配置值的合法性
@@ -532,6 +547,9 @@ func validateSettingValue(key, valueType, value string) error {
 			return validateJSONStringArray(value)
 		case modelReasoningEffortOverridesSetting:
 			_, err := parseModelReasoningEffortOverrides(value)
+			return err
+		case modelMetadataOverridesSetting:
+			_, err := parseModelMetadataOverrides(value)
 			return err
 		default:
 			return fmt.Errorf("unknown JSON setting: %s", key)
