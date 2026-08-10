@@ -49,6 +49,72 @@ func TestManagementOpenAPICoversRegisteredAdminRoutes(t *testing.T) {
 
 }
 
+func TestManagementOpenAPIDocumentsRequiredAuthDiscriminators(t *testing.T) {
+	content := mustReadRepositoryFile(t, "../../web/openapi.yaml")
+	var document struct {
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string       `yaml:"required"`
+				Properties map[string]any `yaml:"properties"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		t.Fatalf("parse openapi.yaml: %v", err)
+	}
+
+	login := document.Components.Schemas["LoginRequest"]
+	if !containsString(login.Required, "mode") || containsString(login.Required, "password") {
+		t.Fatalf("LoginRequest.required=%v, want mode only because api_token login does not use password", login.Required)
+	}
+	if _, ok := login.Properties["mode"]; !ok {
+		t.Fatal("LoginRequest must document mode")
+	}
+	if _, ok := login.Properties["token"]; !ok {
+		t.Fatal("LoginRequest must document token")
+	}
+
+	channel := document.Components.Schemas["ChannelRequest"]
+	if !containsString(channel.Required, "auth_type") {
+		t.Fatalf("ChannelRequest.required=%v, want auth_type", channel.Required)
+	}
+	if _, ok := channel.Properties["auth_type"]; !ok {
+		t.Fatal("ChannelRequest must document auth_type")
+	}
+}
+
+func TestManagementOpenAPIDocumentsModelListMetadata(t *testing.T) {
+	content := mustReadRepositoryFile(t, "../../web/openapi.yaml")
+	var document struct {
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string       `yaml:"required"`
+				Properties map[string]any `yaml:"properties"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		t.Fatalf("parse openapi.yaml: %v", err)
+	}
+
+	for _, schemaName := range []string{"OpenAIModel", "AnthropicModel"} {
+		schema := document.Components.Schemas[schemaName]
+		for _, field := range []string{"displayName", "provider", "thinkingLevels", "contextWindow", "maxTokens", "inputTypes"} {
+			if _, ok := schema.Properties[field]; !ok {
+				t.Errorf("%s must document %s", schemaName, field)
+			}
+		}
+	}
+	anthropic := document.Components.Schemas["AnthropicModel"]
+	if !containsString(anthropic.Required, "display_name") {
+		t.Fatalf("AnthropicModel.required=%v, want display_name", anthropic.Required)
+	}
+	settings := document.Components.Schemas["SettingsBatchRequest"]
+	if _, ok := settings.Properties["model_metadata_overrides"]; !ok {
+		t.Fatal("SettingsBatchRequest must document model_metadata_overrides")
+	}
+}
+
 func TestDocsRoutesServeSwaggerUIAndOpenAPI(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	original := embedFS
@@ -161,4 +227,13 @@ func mustReadRepositoryFile(t *testing.T, path string) []byte {
 
 func contains(value, substring string) bool {
 	return strings.Contains(value, substring)
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

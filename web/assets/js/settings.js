@@ -13,10 +13,12 @@ let modelReasoningEffortsDraft = {};
 
 const globalCooldownRulesSettingKey = 'global_cooldown_detection_rules';
 const modelReasoningEffortOverridesSettingKey = 'model_reasoning_effort_overrides';
+const modelMetadataOverridesSettingKey = 'model_metadata_overrides';
 const containerImageManagedDisabledReason = 'container_image_managed';
 const advancedSettingKeys = new Set([
   globalCooldownRulesSettingKey,
   modelReasoningEffortOverridesSettingKey,
+  modelMetadataOverridesSettingKey,
   'auto_refresh_interval_seconds',
   'active_request_title_enabled',
   'codex_map_429_to_503',
@@ -1324,7 +1326,11 @@ async function saveAllSettings() {
     }
   }
 
-  const requiresRestart = Object.keys(updates).some((key) => key !== modelReasoningEffortOverridesSettingKey);
+  const liveModelCapabilitySettings = new Set([
+    modelReasoningEffortOverridesSettingKey,
+    modelMetadataOverridesSettingKey
+  ]);
+  const requiresRestart = Object.keys(updates).some((key) => !liveModelCapabilitySettings.has(key));
   if (requiresRestart && !confirm(t('settings.msg.confirmSave'))) return;
 
   // 使用批量更新接口（单次请求，事务保护）
