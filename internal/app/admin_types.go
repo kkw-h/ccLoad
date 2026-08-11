@@ -449,6 +449,12 @@ type AdminChannelModelEntry struct {
 	RedirectModel             string    `json:"redirect_model,omitempty"`
 	Disabled                  bool      `json:"disabled,omitempty"`
 	SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
+	DisplayName               string    `json:"displayName"`
+	Provider                  *string   `json:"provider,omitempty"`
+	ThinkingLevels            *[]string `json:"thinkingLevels,omitempty"`
+	ContextWindow             *int64    `json:"contextWindow,omitempty"`
+	MaxTokens                 *int64    `json:"maxTokens,omitempty"`
+	InputTypes                *[]string `json:"inputTypes,omitempty"`
 }
 
 // ChannelWithCooldown 带冷却状态的渠道响应结构

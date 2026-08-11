@@ -1025,6 +1025,19 @@ components:
         model: {type: string}
         redirect_model: {type: string}
         disabled: {type: boolean, default: false}
+        supported_reasoning_efforts:
+          allOf: [{$ref: '#/components/schemas/SupportedReasoningEfforts'}]
+          readOnly: true
+        displayName: {type: string, readOnly: true}
+        provider: {type: string, readOnly: true, description: 映射后原模型的供应商。}
+        thinkingLevels:
+          allOf: [{$ref: '#/components/schemas/ThinkingLevels'}]
+          readOnly: true
+        contextWindow: {type: integer, format: int64, minimum: 1, readOnly: true}
+        maxTokens: {type: integer, format: int64, minimum: 1, readOnly: true}
+        inputTypes:
+          allOf: [{$ref: '#/components/schemas/InputTypes'}]
+          readOnly: true
     ChannelAPIKey:
       type: object
       required: [api_key]

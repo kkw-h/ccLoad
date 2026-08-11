@@ -106,6 +106,12 @@ type adminChannelReasoningModelResponse struct {
 	Model                     string    `json:"model"`
 	RedirectModel             string    `json:"redirect_model"`
 	SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts"`
+	DisplayName               string    `json:"displayName"`
+	Provider                  *string   `json:"provider"`
+	ThinkingLevels            *[]string `json:"thinkingLevels"`
+	ContextWindow             *int64    `json:"contextWindow"`
+	MaxTokens                 *int64    `json:"maxTokens"`
+	InputTypes                *[]string `json:"inputTypes"`
 }
 
 type adminChannelReasoningResponse struct {
@@ -129,6 +135,14 @@ func assertAdminChannelReasoningModels(t *testing.T, models []adminChannelReason
 		!slices.Equal(*sciland.SupportedReasoningEfforts, wantEfforts) {
 		t.Fatalf("sciland-3.0=%+v, want redirect gpt-5.6-sol and efforts %v", sciland, wantEfforts)
 	}
+	wantInputTypes := []string{"image", "text"}
+	if sciland.DisplayName != "Sciland 3.0" || sciland.Provider == nil || *sciland.Provider != "Test OpenAI" ||
+		sciland.ThinkingLevels == nil || !slices.Equal(*sciland.ThinkingLevels, wantEfforts) ||
+		sciland.ContextWindow == nil || *sciland.ContextWindow != 300000 ||
+		sciland.MaxTokens == nil || *sciland.MaxTokens != 64000 ||
+		sciland.InputTypes == nil || !slices.Equal(*sciland.InputTypes, wantInputTypes) {
+		t.Fatalf("sciland-3.0 metadata=%+v, want mapped gpt-5.6-sol metadata", sciland)
+	}
 
 	unknown := byName["unknown-model"]
 	if unknown.RedirectModel != "unknown-model" || unknown.SupportedReasoningEfforts != nil {
@@ -151,6 +165,18 @@ func TestAdminChannelResponsesIncludeReasoningEfforts(t *testing.T) {
 		t.Fatalf("创建推理能力解析器失败: %v", err)
 	}
 	server.modelReasoningCapabilities = resolver
+	metadataResolver, err := newModelMetadataResolver(`{
+		"gpt-5.6-sol": {
+			"provider": "Test OpenAI",
+			"contextWindow": 300000,
+			"maxTokens": 64000,
+			"inputTypes": ["text", "image"]
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("创建模型元数据解析器失败: %v", err)
+	}
+	server.modelMetadataCapabilities = metadataResolver
 
 	created, err := store.CreateConfig(context.Background(), &model.Config{
 		Name: "reasoning-capability-response",
