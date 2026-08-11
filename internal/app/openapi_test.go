@@ -97,7 +97,7 @@ func TestManagementOpenAPIDocumentsModelListMetadata(t *testing.T) {
 		t.Fatalf("parse openapi.yaml: %v", err)
 	}
 
-	for _, schemaName := range []string{"OpenAIModel", "AnthropicModel"} {
+	for _, schemaName := range []string{"OpenAIModel", "AnthropicModel", "ModelEntry"} {
 		schema := document.Components.Schemas[schemaName]
 		for _, field := range []string{"displayName", "provider", "thinkingLevels", "contextWindow", "maxTokens", "inputTypes"} {
 			if _, ok := schema.Properties[field]; !ok {

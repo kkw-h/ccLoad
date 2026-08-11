@@ -409,6 +409,7 @@ func (s *Server) adminChannelModelEntries(entries []model.ModelEntry) []AdminCha
 			Model:         entry.Model,
 			RedirectModel: redirectModel,
 			Disabled:      entry.Disabled,
+			DisplayName:   formatModelDisplayName(entry.Model),
 		}
 		originalModel := strings.TrimSpace(entry.RedirectModel)
 		if originalModel == "" {
@@ -418,7 +419,15 @@ func (s *Server) adminChannelModelEntries(entries []model.ModelEntry) []AdminCha
 			if efforts, known := s.modelReasoningCapabilities.Resolve(originalModel); known {
 				effortsCopy := append([]string{}, efforts...)
 				responseEntry.SupportedReasoningEfforts = &effortsCopy
+				responseEntry.ThinkingLevels = thinkingLevelsFromReasoningEfforts(effortsCopy)
 			}
+		}
+		if s != nil && s.modelMetadataCapabilities != nil {
+			metadata := s.modelMetadataCapabilities.Resolve(originalModel)
+			responseEntry.Provider = metadata.Provider
+			responseEntry.ContextWindow = metadata.ContextWindow
+			responseEntry.MaxTokens = metadata.MaxTokens
+			responseEntry.InputTypes = metadata.InputTypes
 		}
 		out = append(out, responseEntry)
 	}
