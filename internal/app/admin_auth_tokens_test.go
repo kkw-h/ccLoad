@@ -79,6 +79,34 @@ func TestAdminAPI_CreateAuthToken_Basic(t *testing.T) {
 	}
 }
 
+func TestAdminAPI_CreateAuthToken_NormalizesDevelopmentDescription(t *testing.T) {
+	server := newInMemoryServer(t)
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/auth-tokens", map[string]any{
+		"description": "sedna-development-user-user-123",
+	}))
+	server.HandleCreateAuthToken(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	resp := mustParseAPIResponse[struct {
+		ID          int64  `json:"id"`
+		Description string `json:"description"`
+	}](t, w.Body.Bytes())
+	const want = "sedna-dev-user-user-123"
+	if resp.Data.Description != want {
+		t.Fatalf("description=%q, want %q", resp.Data.Description, want)
+	}
+	stored, err := server.store.GetAuthToken(context.Background(), resp.Data.ID)
+	if err != nil {
+		t.Fatalf("GetAuthToken failed: %v", err)
+	}
+	if stored.Description != want {
+		t.Fatalf("stored description=%q, want %q", stored.Description, want)
+	}
+}
+
 func TestAdminAPI_CreateAuthToken_InvalidChannelRestrictionMode(t *testing.T) {
 	server := newInMemoryServer(t)
 
