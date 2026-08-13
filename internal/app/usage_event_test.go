@@ -155,6 +155,7 @@ func TestExtractUsageEventEnvironmentFromTokenDescription(t *testing.T) {
 		want        string
 	}{
 		{name: "medge dev token", description: "sedna-dev-user-123", want: "dev"},
+		{name: "legacy development token", description: "sedna-development-user-234", want: "dev"},
 		{name: "medge test token", description: "sedna-test-user-456", want: "test"},
 		{name: "hyphen env", description: "sedna-staging-cn-user-456", want: "staging-cn"},
 		{name: "legacy description", description: "manual token", want: ""},

@@ -25,5 +25,8 @@ func extractUsageEventEnvironment(description string) string {
 	if env == "" || strings.ContainsAny(env, ":{} \t\r\n") {
 		return ""
 	}
+	if env == "development" {
+		return "dev"
+	}
 	return env
 }
