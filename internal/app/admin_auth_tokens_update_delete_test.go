@@ -130,6 +130,31 @@ func TestHandleUpdateAuthToken(t *testing.T) {
 		}
 	})
 
+	t.Run("normalizes legacy development description", func(t *testing.T) {
+		body := map[string]any{"description": "sedna-development-user-user-456"}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/auth-tokens/1", body))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(token.ID, 10)}}
+
+		server.HandleUpdateAuthToken(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		resp := mustParseAPIResponse[struct {
+			Description string `json:"description"`
+		}](t, w.Body.Bytes())
+		const want = "sedna-dev-user-user-456"
+		if resp.Data.Description != want {
+			t.Fatalf("description=%q, want %q", resp.Data.Description, want)
+		}
+		updated, err := store.GetAuthToken(ctx, token.ID)
+		if err != nil {
+			t.Fatalf("GetAuthToken failed: %v", err)
+		}
+		if updated.Description != want {
+			t.Fatalf("stored description=%q, want %q", updated.Description, want)
+		}
+	})
+
 	t.Run("success", func(t *testing.T) {
 		body := map[string]any{
 			"description":         "new-desc",

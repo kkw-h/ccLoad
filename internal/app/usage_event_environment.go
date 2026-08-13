@@ -3,9 +3,18 @@ package app
 import "strings"
 
 const (
-	usageEventEnvironmentPrefix = "sedna-"
-	usageEventEnvironmentSuffix = "-user-"
+	usageEventEnvironmentPrefix  = "sedna-"
+	usageEventEnvironmentSuffix  = "-user-"
+	legacyDevelopmentTokenPrefix = "sedna-development-user-"
 )
+
+func normalizeUsageEventTokenDescription(description string) string {
+	if !strings.HasPrefix(description, legacyDevelopmentTokenPrefix) {
+		return description
+	}
+	return usageEventEnvironmentPrefix + "dev" + usageEventEnvironmentSuffix +
+		strings.TrimPrefix(description, legacyDevelopmentTokenPrefix)
+}
 
 // extractUsageEventEnvironment 从 medge 注册到 ccLoad 的 API 令牌描述中提取环境标识。
 //
