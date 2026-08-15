@@ -694,7 +694,9 @@ func waitXAICredentialImportTestJob(
 	jobID string,
 ) (oauthCredentialImportJobView, string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	// Race instrumentation makes the 101-item import substantially slower than a
+	// normal test build, especially while race-fast is exercising other packages.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		request := httptest.NewRequest(http.MethodGet, "/admin/oauth/credentials/import/jobs/"+jobID+"?after=0", nil)
 		requestContext, response := newTestContext(t, request)
