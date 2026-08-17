@@ -66,7 +66,7 @@ func TestCodexOAuthRequestUsesRuntimeCredentialAndCodexWireContract(t *testing.T
 	cfg := &model.Config{
 		ID: 1, Name: "codex", AuthType: model.AuthTypeCodexOAuth,
 		URLs:             model.ChannelURLs{{URL: "https://chatgpt.example.test/backend-api/codex/responses", Exact: true, Protocols: []string{"codex"}}},
-		CodexAccessToken: "at-secret", CodexAccountID: "account-1",
+		CodexAccessToken: "at-secret", CodexAccountID: "account-1", CodexAccountFedRAMP: true,
 		CustomRequestRules: &model.CustomRequestRules{Headers: []model.CustomHeaderRule{
 			{Action: model.RuleActionOverride, Name: "Authorization", Value: "Bearer attacker"},
 			{Action: model.RuleActionOverride, Name: "User-Agent", Value: "attacker"},
@@ -103,7 +103,12 @@ func TestCodexOAuthRequestUsesRuntimeCredentialAndCodexWireContract(t *testing.T
 	if got := req.Header.Get("ChatGPT-Account-ID"); got != "account-1" {
 		t.Fatalf("ChatGPT-Account-ID = %q", got)
 	}
-	if req.Header.Get("User-Agent") != codexUserAgent || req.Header.Get("Originator") != "codex-tui" {
+	if got := req.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
+		t.Fatalf("X-OpenAI-FedRAMP = %q", got)
+	}
+	if req.Header.Get("User-Agent") != codexUserAgent ||
+		req.Header.Get("Originator") != codexOriginator ||
+		req.Header.Get("Version") != codexVersion {
 		t.Fatalf("Codex identity headers = %v", req.Header)
 	}
 	if req.Header.Get("Session_id") == "" {
@@ -116,14 +121,14 @@ func TestCodexOAuthRequestUsesRuntimeCredentialAndCodexWireContract(t *testing.T
 		t.Fatalf("static key headers leaked: %v", req.Header)
 	}
 	for _, name := range []string{
-		"X-Codex-Beta-Features", "Version", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Configured",
+		"X-Codex-Beta-Features", "X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Configured",
 	} {
 		if req.Header.Get(name) == "" {
 			t.Fatalf("missing passthrough header %s: %v", name, req.Header)
 		}
 	}
 	for _, name := range []string{
-		"OpenAI-Beta", "X-Codex-Turn-State", "X-Forwarded-For", "X-Arbitrary-Client",
+		"OpenAI-Beta", "X-Forwarded-For", "X-Arbitrary-Client",
 		"X-ResponsesAPI-Include-Timing-Metrics",
 	} {
 		if got := req.Header.Get(name); got != "" {

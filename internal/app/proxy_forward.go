@@ -2148,6 +2148,9 @@ func (s *Server) forwardAttempt(
 	reqCtx.attemptSeq++
 	actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx, upstreamProtocol)
 	requestPath := replaceModelInPath(reqCtx.requestPath, reqCtx.originalModel, actualModel)
+	if upstreamProtocol == protocol.Codex {
+		requestPath = normalizeCodexClientPath(requestPath)
+	}
 
 	// 转发请求（传递实际的API Key字符串和观测回调）
 	// [FIX] 2026-01: 使用传入的 requestPath（可能已替换模型名）而非 reqCtx.requestPath
@@ -3529,6 +3532,7 @@ func (s *Server) tryCodexOAuthChannel(
 		runtimeCfg := cfg.Clone()
 		runtimeCfg.CodexAccessToken = credential.AccessToken
 		runtimeCfg.CodexAccountID = credential.AccountID
+		runtimeCfg.CodexAccountFedRAMP = credential.AccountFedRAMP
 		return runtimeCfg, credential.AccessToken, err
 	}, func(result *proxyResult) bool {
 		return result != nil && result.status == http.StatusUnauthorized

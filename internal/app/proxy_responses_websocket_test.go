@@ -555,6 +555,64 @@ func TestResponsesWebsocketAcceptsCodexDirectRouteAlias(t *testing.T) {
 	readWebsocketUntilType(t, conn, "response.completed")
 }
 
+// TestResponsesWebsocketAcceptsV1CodexPath verifies the omp/pi Codex flavor
+// path (/v1/codex/responses, baseUrl + "/codex/responses") upgrades and
+// completes a turn exactly like the canonical /v1/responses path.
+func TestResponsesWebsocketAcceptsV1CodexPath(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-v1codex\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "codex-v1-path", upstreamProtocol: "codex", models: "gpt-test", priority: 100,
+	}}, map[int]string{0: upstream.URL})
+	conn := dialResponsesWebsocketAtPath(t, env.engine, "test-api-key", "/v1/codex/responses")
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test",
+		"input": []any{map[string]any{"role": "user", "content": "hello"}},
+	}); err != nil {
+		t.Fatalf("write turn over /v1/codex/responses: %v", err)
+	}
+	readWebsocketUntilType(t, conn, "response.completed")
+}
+
+// TestCodexResponsePathsHTTPSSEFallback verifies the codex response path
+// aliases also serve plain HTTP SSE turns (the omp fallback when the
+// websocket upgrade fails), for both /v1/codex/responses and
+// /backend-api/codex/responses. The upstream must see the canonical
+// /v1/responses path, not the alias.
+func TestCodexResponsePathsHTTPSSEFallback(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("upstream path = %q, want /v1/responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-sse-codex\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+
+	for _, path := range []string{"/v1/codex/responses", "/backend-api/codex/responses"} {
+		t.Run(path, func(t *testing.T) {
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "codex-sse-fallback", upstreamProtocol: "codex", models: "gpt-test", priority: 100,
+			}}, map[int]string{0: upstream.URL})
+			response := doProxyRequest(t, env.engine, path, map[string]any{
+				"model": "gpt-test", "stream": true, "input": "hello",
+			}, nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("SSE fallback status=%d body=%s", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			if !strings.Contains(body, `"type":"response.completed"`) ||
+				!strings.Contains(body, `"id":"resp-sse-codex"`) {
+				t.Fatalf("SSE fallback body=%s", body)
+			}
+		})
+	}
+}
+
 func TestResponsesWebsocketRequiresAPIAuthentication(t *testing.T) {
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -2013,7 +2071,7 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 			"Session-Id":                            "ws-session",
 			"Session_id":                            "ws-session",
 			"Thread-Id":                             "worker-thread",
-			"Version":                               "1.2.3",
+			"Version":                               codexVersion,
 			"X-Client-Request-Id":                   "request-1",
 			"X-Codex-Beta-Features":                 "feature-1",
 			"X-Codex-Turn-Metadata":                 `{"turn_id":"turn-1"}`,
@@ -2146,6 +2204,9 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 		if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-ws" {
 			t.Errorf("ChatGPT-Account-ID = %q", got)
 		}
+		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
+			t.Errorf("X-OpenAI-FedRAMP = %q", got)
+		}
 		if r.Header.Get("User-Agent") != codexUserAgent || r.Header.Get("Originator") != "codex-tui" {
 			t.Errorf("Codex identity headers = %v", r.Header)
 		}
@@ -2185,7 +2246,7 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 	env := setupProxyTestEnv(t, []testChannel{{
 		name: "native-codex-oauth", upstreamProtocol: "codex", websockets: true,
 		models: "gpt-test", authType: model.AuthTypeCodexOAuth,
-		oauthCredential: codexProxyTestCredential(t, "at-ws", "rt-ws", "account-ws"), priority: 100,
+		oauthCredential: codexProxyTestCredential(t, "at-ws", "rt-ws", "account-ws", true), priority: 100,
 	}}, map[int]string{0: upstream.URL})
 	downstream := dialResponsesWebsocket(t, env.engine)
 	if err := downstream.WriteJSON(map[string]any{
@@ -5479,10 +5540,13 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 			return
 		}
 		httpCalls.Add(1)
-		for _, name := range []string{"OpenAI-Beta", "X-Codex-Turn-State", "X-ResponsesAPI-Include-Timing-Metrics"} {
+		for _, name := range []string{"OpenAI-Beta", "X-ResponsesAPI-Include-Timing-Metrics"} {
 			if got := r.Header.Get(name); got != "" {
 				t.Errorf("websocket-only header leaked into HTTP fallback: %s=%q; headers=%v", name, got, r.Header)
 			}
+		}
+		if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state" {
+			t.Errorf("HTTP fallback X-Codex-Turn-State=%q, want %q; headers=%v", got, "turn-state", r.Header)
 		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil || !json.Valid(body) {

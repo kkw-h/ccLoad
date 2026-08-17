@@ -20,13 +20,16 @@ import (
 
 const (
 	codexCredentialRefreshLead       = 5 * time.Minute
-	codexUserAgent                   = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
+	codexVersion                     = codexauth.DefaultClientVersion
+	codexOriginator                  = codexauth.DefaultOriginator
+	codexUserAgent                   = codexauth.DefaultUserAgent
 	codexQuotaOverdraftWriteAttempts = 3
 )
 
 var codexHTTPForwardHeaders = []string{
 	"X-Codex-Beta-Features",
 	"Version",
+	"X-Codex-Turn-State",
 	"X-Codex-Turn-Metadata",
 	"X-Client-Request-Id",
 	"User-Agent",
@@ -94,6 +97,12 @@ func (m *codexCredentialManager) credentialForRejectedAccessToken(
 	credential, err := m.cachedOrParse(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if credential.IsPersonalAccessToken() {
+		if forceRefresh {
+			return cloneCodexCredential(credential), codexauth.ErrPersonalAccessTokenCannotRefresh
+		}
+		return cloneCodexCredential(credential), nil
 	}
 	needsRefresh, err := credential.NeedsRefresh(m.now(), codexCredentialRefreshLead)
 	if err != nil {
@@ -684,7 +693,8 @@ func injectCodexHeaders(req *http.Request, cfg *model.Config, apiKey string, str
 	}
 	req.Header.Set("Connection", "Keep-Alive")
 	req.Header.Set("User-Agent", codexUserAgent)
-	req.Header.Set("Originator", "codex-tui")
+	req.Header.Set("Originator", codexOriginator)
+	req.Header.Set("Version", codexVersion)
 	if cfg.UsesCodexOAuth() && req.Header.Get("Session_id") == "" && req.Header.Get("Session-Id") == "" {
 		req.Header.Set("Session_id", util.NewUUIDv4())
 	}
@@ -692,5 +702,10 @@ func injectCodexHeaders(req *http.Request, cfg *model.Config, apiKey string, str
 		req.Header.Set("ChatGPT-Account-ID", cfg.CodexAccountID)
 	} else {
 		req.Header.Del("ChatGPT-Account-ID")
+	}
+	if cfg.UsesCodexOAuth() && cfg.CodexAccountFedRAMP {
+		req.Header.Set("X-OpenAI-FedRAMP", "true")
+	} else {
+		req.Header.Del("X-OpenAI-FedRAMP")
 	}
 }
