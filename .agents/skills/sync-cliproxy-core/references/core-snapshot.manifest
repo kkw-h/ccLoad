@@ -15,7 +15,8 @@ file|source|internal/registry/models/models.json|internal/protocol/cliproxy/regi
 
 # ccLoad-owned pure wire helpers with no direct upstream source file.
 local|source|internal/protocol/cliproxy/common/anthropic_response.go|ccload-native-anthropic-wire|c018c7ac308d69eadbb8b38193b8a57b44591fa0
-local|source|internal/protocol/cliproxy/registry/models.go|static-catalog-loader|8dc84eccf81ffa3d7a015ca7f561f3f74012b01b
+local|source|internal/protocol/cliproxy/registry/models.go|static-catalog-loader|67391b80755fddea6031db117bbf66b4b3b3f486
+local|test|internal/protocol/cliproxy/registry/models_test.go|model-capability-contract|1a8ebc98ef93da6d441ba0dca14be03b3ca288db
 local|source|internal/protocol/cliproxy/util/function_name.go|ccload-function-name-normalization|a08a75d94b772b9fe3b79a9cd3b2e9288196f39b
 
 # Translator runtime registration, unsupported protocols, no-op paths, and benchmarks.
