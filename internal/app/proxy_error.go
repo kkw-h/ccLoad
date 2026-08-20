@@ -226,6 +226,7 @@ func buildProxyLogEntry(
 		TokenHash:        reqCtx.tokenHash,
 		TokenEnvironment: reqCtx.tokenEnvironment,
 		RequestID:        reqCtx.requestID,
+		ResearchID:       reqCtx.researchID,
 		AttemptSeq:       reqCtx.attemptSeq,
 	})
 }

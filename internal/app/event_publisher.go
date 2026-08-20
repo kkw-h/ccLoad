@@ -63,6 +63,7 @@ func (s *Server) publishRequestUsageEvent(c *gin.Context, reqCtx *proxyRequestCo
 	}
 	s.eventPublisher.Publish(&model.UsageEvent{
 		RequestID:   reqCtx.requestID,
+		ResearchID:  reqCtx.researchID,
 		AttemptSeq:  0,
 		Kind:        model.UsageEventRequest,
 		Time:        model.JSONTime{Time: time.Now()},

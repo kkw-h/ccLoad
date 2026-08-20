@@ -14,6 +14,7 @@ import (
 func sampleEvent() *model.UsageEvent {
 	return &model.UsageEvent{
 		RequestID:        "req-1",
+		ResearchID:       "research-redis-1",
 		AttemptSeq:       1,
 		Kind:             model.UsageEventAttempt,
 		Time:             model.JSONTime{Time: time.Unix(1_700_000_000, 0)},
@@ -159,7 +160,7 @@ func assertPayload(t *testing.T, payload string) {
 	if err := sonic.Unmarshal([]byte(payload), &ev); err != nil {
 		t.Fatalf("反序列化事件失败: %v", err)
 	}
-	if ev.RequestID != "req-1" || ev.AttemptSeq != 1 || ev.EffectiveCostUSD != 1.0 {
+	if ev.RequestID != "req-1" || ev.ResearchID != "research-redis-1" || ev.AttemptSeq != 1 || ev.EffectiveCostUSD != 1.0 {
 		t.Fatalf("事件字段不符: %+v", ev)
 	}
 }

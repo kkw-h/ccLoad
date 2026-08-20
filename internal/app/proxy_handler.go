@@ -280,6 +280,11 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 
 	requestMethod := c.Request.Method
+	researchID, err := parseResearchIDHeader(c.Request.Header)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	incoming, err := parseIncomingRequest(c, s.bodyLimits)
 	if err != nil {
@@ -438,6 +443,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		startTime:        startTime,
 		thinkingEffort:   thinkingEffort,
 		requestID:        util.NewUUIDv4(),
+		researchID:       researchID,
 	}
 	if routingSession != nil {
 		reqCtx.routingSession = routingSession
