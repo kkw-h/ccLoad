@@ -89,6 +89,10 @@ func (s *Server) HandleResponsesWebsocket(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired authorization"})
 		return
 	}
+	if _, err := parseResearchIDHeader(c.Request.Header); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	releaseConnection, connectionLimit := s.responsesWebsocketConnections.acquire(tokenHashString)
 	if connectionLimit != nil {
 		setting := responsesWebsocketMaxConnectionsSetting
@@ -459,6 +463,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 
 	header := responsesWebsocketUpstreamHeaders(c.Request.Header)
 	header.Set("Content-Type", "application/json")
+	researchID, _ := parseResearchIDHeader(c.Request.Header)
 	reqCtx := &proxyRequestContext{
 		originalModel:              modelName,
 		clientProtocol:             protocol.Codex,
@@ -475,6 +480,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 		clientIP:                   c.ClientIP(),
 		startTime:                  startTime,
 		thinkingEffort:             thinkingEffort,
+		researchID:                 researchID,
 		routingSession:             executionSession,
 		nativeCodexWS:              nativeCodexWS,
 		nativeCodexBody:            bytes.Clone(nativeRequestBody),
@@ -680,6 +686,7 @@ func responsesWebsocketUpstreamHeaders(source http.Header) http.Header {
 	}
 	header.Del("Connection")
 	header.Del("Upgrade")
+	header.Del(researchIDHeader)
 	return header
 }
 

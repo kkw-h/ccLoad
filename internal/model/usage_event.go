@@ -22,6 +22,7 @@ const (
 //   - 允许 request 先于其 attempt 到达（attempt 有批量落库延迟）。
 type UsageEvent struct {
 	RequestID   string         `json:"request_id"`
+	ResearchID  string         `json:"research_id,omitempty"`
 	AttemptSeq  int            `json:"attempt_seq"` // request 事件为 0
 	Kind        UsageEventKind `json:"kind"`
 	Time        JSONTime       `json:"time"`

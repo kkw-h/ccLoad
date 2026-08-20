@@ -376,6 +376,7 @@ func TestCopyRequestHeaders_StripsHopByHopAndAuth(t *testing.T) {
 	src.Set("x-goog-api-key", "client-goog")
 	src.Set("Accept-Encoding", "br")
 	src.Set("X-Pass", "ok")
+	src.Set(researchIDHeader, "research-private")
 
 	copyRequestHeaders(req, src)
 
@@ -398,10 +399,65 @@ func TestCopyRequestHeaders_StripsHopByHopAndAuth(t *testing.T) {
 		"X-API-Key",
 		"x-goog-api-key",
 		"Accept-Encoding",
+		researchIDHeader,
 	} {
 		if v := req.Header.Get(k); v != "" {
 			t.Fatalf("expected header %q stripped, got %q", k, v)
 		}
+	}
+}
+
+func TestParseResearchIDHeader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		values  []string
+		want    string
+		wantErr bool
+	}{
+		{name: "missing"},
+		{name: "valid", values: []string{"workspace:abc_123"}, want: "workspace:abc_123"},
+		{name: "trimmed", values: []string{"  workspace-123  "}, want: "workspace-123"},
+		{name: "empty", values: []string{" "}, wantErr: true},
+		{name: "invalid character", values: []string{"workspace/123"}, wantErr: true},
+		{name: "too long", values: []string{strings.Repeat("a", 129)}, wantErr: true},
+		{name: "duplicate", values: []string{"one", "two"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := http.Header{}
+			for _, value := range tt.values {
+				header.Add(researchIDHeader, value)
+			}
+			got, err := parseResearchIDHeader(header)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseResearchIDHeader() error = nil, want rejection")
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("parseResearchIDHeader() = %q, %v; want %q, nil", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponsesWebsocketUpstreamHeadersStripsResearchID(t *testing.T) {
+	t.Parallel()
+	source := http.Header{}
+	source.Set(researchIDHeader, "research-private")
+	source.Set("Origin", "https://desktop.invalid")
+	source.Set("X-Pass", "ok")
+
+	got := responsesWebsocketUpstreamHeaders(source)
+	if got.Get(researchIDHeader) != "" {
+		t.Fatalf("internal research header leaked upstream: %q", got.Get(researchIDHeader))
+	}
+	if got.Get("Origin") != "" || got.Get("X-Pass") != "ok" {
+		t.Fatalf("unexpected websocket header projection: %#v", got)
 	}
 }
 

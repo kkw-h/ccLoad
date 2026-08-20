@@ -86,6 +86,7 @@ func TestBuildLogEntry_UsageEventReusesNormalizedFields(t *testing.T) {
 		TokenHash:        "hash-abc",
 		TokenEnvironment: "dev",
 		RequestID:        "req-1",
+		ResearchID:       "research-abc",
 		AttemptSeq:       3,
 		Result: &fwResult{
 			InputTokens:          100,
@@ -101,7 +102,7 @@ func TestBuildLogEntry_UsageEventReusesNormalizedFields(t *testing.T) {
 	if ev.Kind != model.UsageEventAttempt {
 		t.Fatalf("kind=%q, want attempt", ev.Kind)
 	}
-	if ev.RequestID != "req-1" || ev.AttemptSeq != 3 || ev.AuthTokenID != 7 {
+	if ev.RequestID != "req-1" || ev.ResearchID != "research-abc" || ev.AttemptSeq != 3 || ev.AuthTokenID != 7 {
 		t.Fatalf("关联字段不符: %+v", ev)
 	}
 	if ev.Environment != "dev" {

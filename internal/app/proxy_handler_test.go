@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,26 @@ func TestHandleProxyRequest_UnknownPathReturns404(t *testing.T) {
 
 	if body := w.Body.String(); !bytes.Contains([]byte(body), []byte("unsupported path")) {
 		t.Fatalf("响应内容缺少错误信息，实际: %s", body)
+	}
+}
+
+func TestHandleProxyRequest_InvalidResearchIDReturns400(t *testing.T) {
+	srv := &Server{
+		concurrencySem: make(chan struct{}, 1),
+		activeRequests: newActiveRequestManager(),
+	}
+	req := newRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"model":"claude"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(researchIDHeader, "invalid/research")
+	c, w := newTestContext(t, req)
+
+	srv.HandleProxyRequest(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), researchIDHeader) {
+		t.Fatalf("body=%q, want research header error", w.Body.String())
 	}
 }
 

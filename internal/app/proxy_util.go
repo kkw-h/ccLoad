@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +21,12 @@ import (
 	"github.com/bytedance/sonic"
 )
 
-const anthropicBillingHeaderPrefix = "x-anthropic-billing-header:"
+const (
+	anthropicBillingHeaderPrefix = "x-anthropic-billing-header:"
+	researchIDHeader             = "X-Sedna-Research-Id"
+)
+
+var researchIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // ============================================================================
 // 常量定义
@@ -175,6 +181,7 @@ type proxyRequestContext struct {
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 	thinkingEffort             string
 	requestID                  string                     // 关联同一用户请求的所有用量事件
+	researchID                 string                     // 可选研究归属，来自客户端后端的 workspace incarnation_id
 	attemptSeq                 int                        // 真实上游尝试序号（每次转发前自增）
 	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
 	nativeCodexWS              *codexUpstreamWebsocketSession
@@ -339,7 +346,8 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 		// 不透传认证头（由上游注入）
 		if strings.EqualFold(k, "Authorization") ||
 			strings.EqualFold(k, "X-Api-Key") ||
-			strings.EqualFold(k, "x-goog-api-key") {
+			strings.EqualFold(k, "x-goog-api-key") ||
+			strings.EqualFold(k, researchIDHeader) {
 			continue
 		}
 		// 不透传 Accept-Encoding，避免上游返回 br/gzip 压缩导致错误体乱码
@@ -354,6 +362,21 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 	if dst.Header.Get("Accept") == "" {
 		dst.Header.Set("Accept", "application/json")
 	}
+}
+
+func parseResearchIDHeader(header http.Header) (string, error) {
+	values := header.Values(researchIDHeader)
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) != 1 {
+		return "", fmt.Errorf("%s must appear exactly once", researchIDHeader)
+	}
+	researchID := strings.TrimSpace(values[0])
+	if !researchIDPattern.MatchString(researchID) {
+		return "", fmt.Errorf("%s is invalid", researchIDHeader)
+	}
+	return researchID, nil
 }
 
 // injectAPIKeyHeaders 按运行时上游协议注入 API Key 头。
@@ -900,6 +923,7 @@ type logEntryParams struct {
 	TokenHash        string // 认证 token 哈希（用量事件维度）
 	TokenEnvironment string // 认证 token 归属环境（用量事件路由维度）
 	RequestID        string // 关联同一用户请求的用量事件
+	ResearchID       string // 可选研究归属
 	AttemptSeq       int    // 真实上游尝试序号
 }
 
@@ -1051,6 +1075,7 @@ func buildAttemptUsageEvent(p logEntryParams, entry *model.LogEntry) *model.Usag
 	}
 	return &model.UsageEvent{
 		RequestID:                p.RequestID,
+		ResearchID:               p.ResearchID,
 		AttemptSeq:               p.AttemptSeq,
 		Kind:                     model.UsageEventAttempt,
 		Time:                     entry.Time,
