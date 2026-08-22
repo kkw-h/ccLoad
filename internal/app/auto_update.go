@@ -81,7 +81,6 @@ func (s *Server) startUpdateManager(interval time.Duration, channel version.Rele
 		return
 	}
 	s.updateManager = manager
-
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()

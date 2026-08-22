@@ -24,6 +24,7 @@ import (
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/testutil"
 	"ccLoad/internal/util"
@@ -155,6 +156,29 @@ func createAnthropicOAuthChannelForAdminTest(t testing.TB, srv *Server, upstream
 		URLs:                  model.ChannelURLs{{URL: upstreamURL, Protocols: []string{util.ProtocolAnthropic}}},
 		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
 		ModelEntries:          []model.ModelEntry{{Model: "claude-sonnet-4-5"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+func createCursorOAuthChannelForAdminTest(t testing.TB, srv *Server, upstreamURL string) *model.Config {
+	t.Helper()
+	payload, err := (&cursorauth.Credential{
+		AccessToken: "tok", APIKey: "cursor-user-key", Email: "user@example.com",
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.store.CreateConfig(context.Background(), &model.Config{
+		Name:                  "cursor-oauth-admin-test",
+		AuthType:              model.AuthTypeCursorOAuth,
+		OAuthCredential:       payload,
+		URLs:                  model.ChannelURLs{{URL: upstreamURL, Protocols: []string{util.ProtocolAnthropic, util.ProtocolOpenAI}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "grok-4.6"}, {Model: "composer-2.5"}},
+		Enabled:               true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1888,6 +1912,51 @@ func TestTestChannelAPI_StreamFirstValidContentTimeoutIgnoresHeartbeats(t *testi
 	}
 	if _, ok := result["first_byte_duration_ms"]; ok {
 		t.Fatalf("heartbeat must not set first_byte_duration_ms, result=%+v", result)
+	}
+}
+
+func TestTestChannelAPI_ResponsesMetadataDoesNotStopFirstContentTimeout(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+			_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"late"}`+"\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.firstByteTimeout = 30 * time.Millisecond
+	result := srv.testChannelAPI(context.Background(), &model.Config{
+		ID:           9533,
+		Name:         "responses-metadata-first-content-timeout-test",
+		URLs:         model.ChannelURLs{{URL: upstream.URL, Protocols: []string{"codex"}}},
+		Priority:     1,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5.6-sol"}},
+		Enabled:      true,
+	}, "sk-test", &testutil.TestChannelRequest{
+		Model:          "gpt-5.6-sol",
+		ClientProtocol: "codex",
+		Content:        "hello",
+		Stream:         true,
+	})
+
+	if success, _ := result["success"].(bool); success {
+		t.Fatalf("Responses metadata must not count as valid content, result=%+v", result)
+	}
+	if statusCode, _ := getResultInt(result["status_code"]); statusCode != util.StatusFirstByteTimeout {
+		t.Fatalf("status_code=%d, want %d, result=%+v", statusCode, util.StatusFirstByteTimeout, result)
+	}
+	if _, ok := result["first_byte_duration_ms"]; ok {
+		t.Fatalf("Responses metadata must not set first_byte_duration_ms, result=%+v", result)
 	}
 }
 
@@ -5692,6 +5761,66 @@ func TestDownstreamEndpointPath(t *testing.T) {
 	}
 }
 
+// 管理测试与代理链路必须发出同一套上游契约，思考后缀在两边都要落进请求体。
+func TestBuildTestUpstreamRequestPlanAppliesThinkingSuffix(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 11, Name: "codex-test", AuthType: model.AuthTypeAPIKey,
+		URLs:         model.ChannelURLs{{URL: "https://upstream.example.com", Protocols: []string{util.ProtocolCodex}}},
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5.6-luna"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "gpt-5.6-luna", Content: "hello", ClientProtocol: util.ProtocolCodex,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "sk-test", testReq, "gpt-5.6-luna(max)",
+		util.ProtocolCodex, util.ProtocolCodex, "https://upstream.example.com",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	if effort := gjson.GetBytes(plan.requestBody, "reasoning.effort").String(); effort != "max" {
+		t.Fatalf("reasoning.effort=%q, want max. body=%s", effort, plan.requestBody)
+	}
+}
+
+// 跨协议转到 Codex 时，patch 不能用模板默认 medium 盖掉后缀。
+func TestBuildTestUpstreamRequestPlanKeepsThinkingSuffixAcrossCodexTransform(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 12, Name: "codex-transform-test", AuthType: model.AuthTypeAPIKey,
+		URLs:         model.ChannelURLs{{URL: "https://upstream.example.com", Protocols: []string{util.ProtocolCodex}}},
+		ModelEntries: []model.ModelEntry{{Model: "claude-opus-4-6"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-opus-4-6", Content: "hello", ClientProtocol: util.ProtocolAnthropic,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "sk-test", testReq, "claude-opus-4-6(high)",
+		util.ProtocolAnthropic, util.ProtocolCodex, "https://upstream.example.com",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	if effort := gjson.GetBytes(plan.requestBody, "reasoning.effort").String(); effort != "high" {
+		t.Fatalf("reasoning.effort=%q, want high. body=%s", effort, plan.requestBody)
+	}
+}
+
+func TestChannelTestLogIdentityStripsThinkingSuffix(t *testing.T) {
+	t.Parallel()
+
+	logModel, effort := channelTestLogIdentity("gpt-5.6-luna(max)", "low")
+	if logModel != "gpt-5.6-luna" {
+		t.Fatalf("log model=%q, want gpt-5.6-luna", logModel)
+	}
+	if effort != "max" {
+		t.Fatalf("thinking effort=%q, want max from suffix not fallback", effort)
+	}
+}
+
 func TestAdminTestZAICodingPlanEmitsZCodeWireContract(t *testing.T) {
 	srv := newInMemoryServer(t)
 	cfg := newZAITestChannel()
@@ -5701,7 +5830,7 @@ func TestAdminTestZAICodingPlanEmitsZCodeWireContract(t *testing.T) {
 	}
 
 	cfgForBuild, plan, err := srv.buildTestUpstreamRequestPlan(
-		cfg, "key-id.secret", testReq, util.ProtocolAnthropic, util.ProtocolAnthropic, zaiauth.CodingPlanProxyBaseURL,
+		cfg, "key-id.secret", testReq, testReq.Model, util.ProtocolAnthropic, util.ProtocolAnthropic, zaiauth.CodingPlanProxyBaseURL,
 	)
 	if err != nil {
 		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
@@ -5799,5 +5928,137 @@ func TestAdminTestNativeAnthropicDoesNotDoubleAppendHeaderRules(t *testing.T) {
 	}
 	if strings.Count(betas, "context-1m-2025-08-07") != 1 {
 		t.Fatalf("anthropic-beta = %q, append rule must not run twice on the native admin-test path", betas)
+	}
+}
+
+func TestAdminTestCursorOAuthUsesSDKBridgeInsteadOfHTTP(t *testing.T) {
+	t.Parallel()
+	upstreamHits := 0
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"Not Found","message":"Route POST:`+r.URL.Path+` not found","statusCode":404}`)
+	}))
+	srv := newInMemoryServer(t)
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, upstream.URL)
+	runner := &fakeCursorRunner{text: "ok from sdk bridge"}
+	srv.cursorRunner = runner
+
+	result := srv.executeChannelTestWithCooldown(context.Background(), cfg, cooldown.NoKeyIndex, "tok", &testutil.TestChannelRequest{
+		Model: "grok-4.6", ClientProtocol: util.ProtocolAnthropic, Content: "2025 年 1 月 20 日发生了什么大事？",
+	}, true)
+	if success, _ := result["success"].(bool); !success {
+		t.Fatalf("cursor admin test result=%+v", result)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("Cursor OAuth admin test must not HTTP-forward, hits=%d", upstreamHits)
+	}
+	if got, _ := result["upstream_protocol"].(string); got != "cursor-sdk-bridge" {
+		t.Fatalf("upstream_protocol=%q", got)
+	}
+	if got, _ := result["response_text"].(string); got != "ok from sdk bridge" {
+		t.Fatalf("response_text=%q result=%+v", got, result)
+	}
+	if runner.model != "grok-4.6" {
+		t.Fatalf("SDK model=%q, want exact catalog ID", runner.model)
+	}
+	if !strings.Contains(runner.prompt, "2025 年 1 月 20 日发生了什么大事？") {
+		t.Fatalf("prompt=%q", runner.prompt)
+	}
+	if body, _ := result["upstream_request_body"].(string); !strings.Contains(body, `"messages"`) || strings.Contains(body, "chat/completions") {
+		t.Fatalf("client body must stay Anthropic messages, got %s", body)
+	}
+}
+
+func TestHandleChannelTestCursorWritesOneManualLogWithDebug(t *testing.T) {
+	srv := newInMemoryServerWithSettings(t, map[string]string{"debug_log_enabled": "true"})
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, "https://unused.example.com")
+	srv.cursorRunner = &fakeCursorRunner{text: "ok from sdk bridge"}
+	request := newJSONRequest(t, http.MethodPost, fmt.Sprintf("/admin/channels/%d/test", cfg.ID), map[string]any{
+		"model":           "grok-4.6",
+		"client_protocol": "anthropic",
+		"content":         "hello",
+	})
+	c, recorder := newTestContext(t, request)
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", cfg.ID)}}
+	srv.HandleChannelTest(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	response := mustParseAPIResponse[map[string]any](t, recorder.Body.Bytes())
+	if success, _ := response.Data["success"].(bool); !success {
+		t.Fatalf("response=%v", response.Data)
+	}
+	// 等待异步代理日志的完整刷新周期，确保没有迟到的重复记录。
+	time.Sleep(config.LogBatchTimeout + 250*time.Millisecond)
+	logs, err := srv.store.ListLogs(context.Background(), time.Time{}, 10, 0, &model.LogFilter{LogSource: model.LogSourceAll})
+	if err != nil {
+		t.Fatalf("ListLogs() error = %v", err)
+	}
+	if len(logs) != 1 || logs[0].LogSource != model.LogSourceManualTest {
+		t.Fatalf("logs=%+v, want one manual-test log", logs)
+	}
+	debug, err := srv.store.GetDebugLogByLogID(context.Background(), logs[0].ID)
+	if err != nil || debug == nil {
+		t.Fatalf("debug=%+v err=%v", debug, err)
+	}
+	if !strings.Contains(debug.ReqURL, "SdkAgentService/CreateAgent+Send") ||
+		!strings.Contains(string(debug.ReqBody), `"id":"grok-4.6"`) ||
+		strings.Contains(string(debug.ReqBody), "cursor-user-key") ||
+		!strings.Contains(string(debug.RespBody), "ok from sdk bridge") ||
+		!strings.Contains(string(debug.TranslatedRespBody), "ok from sdk bridge") {
+		t.Fatalf("debug=%+v", debug)
+	}
+}
+
+func TestAdminTestCursorOAuthReportsMissingBridge(t *testing.T) {
+	t.Parallel()
+	upstreamHits := 0
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	srv := newInMemoryServer(t)
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, upstream.URL)
+	srv.cursorRunner = &fakeCursorRunner{err: cursorauth.ErrAgentMissing}
+
+	result := srv.executeChannelTestWithCooldown(context.Background(), cfg, cooldown.NoKeyIndex, "tok", &testutil.TestChannelRequest{
+		Model: "grok-4.6", ClientProtocol: util.ProtocolAnthropic, Content: "hello",
+	}, true)
+	if success, _ := result["success"].(bool); success {
+		t.Fatalf("missing bridge must fail, result=%+v", result)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("missing bridge must not HTTP-forward, hits=%d", upstreamHits)
+	}
+	if status, _ := result["status_code"].(int); status != http.StatusServiceUnavailable {
+		t.Fatalf("status_code=%v result=%+v", result["status_code"], result)
+	}
+	if action, _ := result["cooldown_action"].(string); action != "client_error_no_cooldown" {
+		t.Fatalf("cooldown_action=%q result=%+v", action, result)
+	}
+	if errMsg, _ := result["error"].(string); !strings.Contains(errMsg, "cursor-sdk-bridge is not installed") {
+		t.Fatalf("error=%q", errMsg)
+	}
+}
+
+func TestAdminTestCursorRequiresUserAPIKey(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, "https://example.invalid")
+	payload, err := (&cursorauth.Credential{AccessToken: "tok", Email: "user@example.com"}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.OAuthCredential = payload
+	result := srv.executeChannelTestWithCooldown(context.Background(), cfg, cooldown.NoKeyIndex, "tok", &testutil.TestChannelRequest{
+		Model: "grok-4.6", ClientProtocol: util.ProtocolAnthropic, Content: "hello",
+	}, true)
+	if status, _ := result["status_code"].(int); status != http.StatusUnauthorized {
+		t.Fatalf("status_code=%v result=%+v", result["status_code"], result)
+	}
+	if errMsg, _ := result["error"].(string); !strings.Contains(errMsg, "User API Key") {
+		t.Fatalf("error=%q data=%+v", errMsg, result)
 	}
 }

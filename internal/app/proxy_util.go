@@ -152,6 +152,7 @@ type ForwardObserver struct {
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
 type proxyRequestContext struct {
 	originalModel              string
+	requestedModel             string
 	clientProtocol             protocol.Protocol
 	codexClient                bool
 	upstreamProtocol           protocol.Protocol
@@ -172,6 +173,7 @@ type proxyRequestContext struct {
 	attemptStartTime           time.Time            // 渠道内单次 Key/URL 尝试开始时间
 	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
+	skipProxyLog               bool                 // 管理测试等外层会统一持久化日志的调用路径
 	thinkingEffort             string
 	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
 	nativeCodexWS              *codexUpstreamWebsocketSession
@@ -242,22 +244,36 @@ func isStreamingRequest(path string, body []byte) bool {
 // buildUpstreamURL 构建上游完整URL（KISS）
 func buildUpstreamURL(baseURL string, requestPath, rawQuery string) string {
 	upstreamURL := model.StripExactUpstreamURLMarker(baseURL)
-	if !model.HasExactUpstreamURLMarker(baseURL) {
+	if model.HasExactUpstreamURLMarker(baseURL) {
+		if protocol.DetectRequestFamily(requestPath) == protocol.RequestFamilyAlphaSearch {
+			if parsed, err := neturl.Parse(upstreamURL); err == nil {
+				if rewritten, ok := protocol.RewriteResponsesPathToAlphaSearch(parsed.Path); ok {
+					parsed.Path = rewritten
+					parsed.RawPath = ""
+					upstreamURL = parsed.String()
+				}
+			}
+		}
+	} else {
 		upstreamURL = strings.TrimRight(upstreamURL, "/") + requestPath
 	}
 
-	// 移除 key 参数（Gemini API 认证格式），避免泄露到上游
-	if rawQuery != "" {
-		if values, err := neturl.ParseQuery(rawQuery); err == nil {
-			values.Del("key")
-			rawQuery = values.Encode()
-		}
+	parsed, err := neturl.Parse(upstreamURL)
+	if err != nil || rawQuery == "" {
+		return upstreamURL
 	}
 
-	if rawQuery != "" {
-		upstreamURL += "?" + rawQuery
+	// 请求查询参数必须与 Exact URL 自带的查询串合并，不能在已序列化 URL 后再拼第二个 '?'。
+	// ParseQuery 会在返回错误时保留其余合法参数。丢弃坏片段，不能让畸形转义绕过 key 剔除。
+	requestQuery, _ := neturl.ParseQuery(rawQuery)
+	// 移除客户端的 Gemini key 参数，避免把下游凭证泄露到上游；Exact URL 自带参数不受影响。
+	requestQuery.Del("key")
+	mergedQuery := parsed.Query()
+	for key, values := range requestQuery {
+		mergedQuery[key] = append(mergedQuery[key], values...)
 	}
-	return upstreamURL
+	parsed.RawQuery = mergedQuery.Encode()
+	return parsed.String()
 }
 
 // buildUpstreamRequest 创建带上下文的HTTP请求
@@ -597,6 +613,12 @@ func replaceModelInPath(path string, originalModel string, actualModel string) s
 	return path[:idx+len(modelPrefix)] + actualModel + path[end:]
 }
 
+// rewriteUpstreamRequestPath 把路径里的模型段换成实际上游模型。以路径自身携带的
+// 模型名为准，客户端写的是 gemini-2.5-pro(high) 时同样能替换掉。
+func rewriteUpstreamRequestPath(path, actualModel string) string {
+	return replaceModelInPath(path, extractModelFromPath(path), actualModel)
+}
+
 func buildGeminiGeneratePath(model string, isStreaming bool) string {
 	if isStreaming {
 		return "/v1beta/models/" + model + ":streamGenerateContent"
@@ -624,17 +646,18 @@ func buildCodexResponsesPath() string {
 // 2. 模糊匹配（启用 model_fuzzy_match 时）
 // 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
 func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) string {
-	actualModel := originalModel
+	routedModel := model.RoutingModelName(originalModel)
+	actualModel := routedModel
 	// 1. 检查模型重定向（精确匹配优先）
-	if redirectModel, ok := cfg.GetRedirectModel(originalModel); ok && redirectModel != "" {
+	if redirectModel, ok := cfg.GetRedirectModel(routedModel); ok && redirectModel != "" {
 		actualModel = redirectModel
 	}
 
 	// 2. 模糊匹配回退（仅当未触发重定向时）
-	if actualModel == originalModel && s.modelFuzzyMatch {
+	if actualModel == routedModel && s.modelFuzzyMatch {
 		// 先检查精确匹配，避免不必要的模糊匹配
-		if !cfg.SupportsModel(originalModel) {
-			if matched, ok := cfg.FuzzyMatchModel(originalModel); ok {
+		if !cfg.SupportsModel(routedModel) {
+			if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
 				actualModel = matched
 			}
 		}
@@ -643,12 +666,13 @@ func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) str
 	// 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
 	// 场景：请求 gemini-3-flash → 模糊匹配 gemini-3-flash-preview → 重定向 gemini-3-flash-preview-0719
 	// 仅当模型已变更且变更后的模型有重定向配置时触发
-	if actualModel != originalModel {
+	if actualModel != routedModel {
 		if redirectModel, ok := cfg.GetRedirectModel(actualModel); ok && redirectModel != "" {
 			actualModel = redirectModel
 		}
 	}
-	return actualModel
+	// 渠道条目或重定向目标可能字面带思考后缀，但后缀绝不能出现在发往上游的模型名里。
+	return model.RoutingModelName(actualModel)
 }
 
 // resolveFinalUpstreamModel 返回真正发送给上游的模型身份。
@@ -666,23 +690,39 @@ func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestConte
 	actualModel = s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, string(upstreamProtocol))
 
 	bodyToSend = reqCtx.body
+	requestedModel := reqCtx.requestedModel
+	if requestedModel == "" {
+		requestedModel = reqCtx.originalModel
+	}
+	// 后缀来自客户端字面模型名，能力却属于重定向/模糊匹配后的实际上游模型。
+	bodyToSend = applyThinkingSuffixForModel(bodyToSend, reqCtx.clientProtocol, requestedModel, actualModel)
 	// billing/CCH 块是真 Claude Code 请求的身份与签名载体。只有跨协议
 	// 转换时才能删除；Anthropic -> Anthropic 必须保留，供 OAuth finalizer
 	// 识别并保留原生 Claude Code prompt。
 	if reqCtx.clientProtocol == protocol.Anthropic && upstreamProtocol != protocol.Anthropic {
 		bodyToSend = stripAnthropicBillingHeaders(bodyToSend)
 	}
-	bodyToSend = replaceJSONRequestModel(bodyToSend, reqCtx.originalModel, actualModel)
+	bodyToSend = replaceJSONRequestModel(bodyToSend, actualModel)
 
 	return actualModel, bodyToSend
 }
 
-func replaceJSONRequestModel(body []byte, originalModel, actualModel string) []byte {
-	if len(body) == 0 || actualModel == "" || actualModel == originalModel {
+// replaceJSONRequestModel 以请求体里现有的 model 值为准做替换：客户端写的可能是
+// 带思考后缀的名字，也可能和路由用的基名不一致。没有 model 字段的请求体（Gemini
+// 把模型放在 URL 里）保持原样，不能顺手注入一个字段。
+func replaceJSONRequestModel(body []byte, actualModel string) []byte {
+	if len(body) == 0 || actualModel == "" {
 		return body
 	}
 	var reqData map[string]json.RawMessage
 	if err := sonic.Unmarshal(body, &reqData); err != nil {
+		return body
+	}
+	var current string
+	if raw, ok := reqData["model"]; ok {
+		_ = sonic.Unmarshal(raw, &current)
+	}
+	if strings.TrimSpace(current) == "" || current == actualModel {
 		return body
 	}
 	modelRaw, err := sonic.Marshal(actualModel)

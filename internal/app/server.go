@@ -27,6 +27,7 @@ import (
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	protocolbuiltin "ccLoad/internal/protocol/builtin"
@@ -97,6 +98,14 @@ type Server struct {
 	zaiService                    *zaiauth.Service
 	zaiCredentials                *zaiCredentialManager
 	zaiOAuth                      *zaiOAuthManager
+	cursorService                 *cursorauth.Service
+	cursorCredentials             *cursorCredentialManager
+	cursorRunnerMu                sync.RWMutex
+	cursorRunner                  cursorauth.Runner
+	cursorBridgeRequired          atomic.Bool
+	cursorBridgeStartOnce         sync.Once
+	ensureCursorBridge            func(context.Context) (string, error)
+	startCursorBridge             func(context.Context, string) (cursorauth.Runner, error)
 	antigravityPromptMatcher      *regexp.Regexp
 	scheduledChannelChecksRunning atomic.Bool
 
@@ -245,6 +254,8 @@ func NewServer(store storage.Store) *Server {
 		shutdownCh:               make(chan struct{}),
 		shutdownDone:             make(chan struct{}),
 		oauthCredentialRefreshes: newOAuthCredentialRefreshTracker(),
+		ensureCursorBridge:       cursorauth.EnsureBridge,
+		startCursorBridge:        startCursorSDKRunner,
 
 		// Token统计队列（避免每请求起goroutine）
 		tokenStatsCh:        make(chan tokenStatsUpdate, config.DefaultTokenStatsBufferSize),
@@ -280,6 +291,7 @@ func NewServer(store storage.Store) *Server {
 		log.Fatalf("[FATAL] 加载渠道配置失败: %v", err)
 	}
 	log.Printf("[INFO] 已加载渠道配置（%d项）", len(channels))
+	s.cursorBridgeRequired.Store(hasCursorChannel(channels))
 
 	codexOAuthService := codexauth.NewService(s.client)
 	s.codexService = codexOAuthService
@@ -350,6 +362,11 @@ func NewServer(store storage.Store) *Server {
 			return cfg.ID, cfg.Name, nil
 		},
 	)
+	s.cursorService = cursorauth.NewService(s.client)
+	s.cursorCredentials = newCursorCredentialManager(store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.cursorCredentials.refreshTracker = s.oauthCredentialRefreshes
 
 	// 初始化冷却管理器（统一管理渠道级和Key级冷却）
 	// 传入Server作为configGetter，利用缓存层查询渠道配置
@@ -426,6 +443,99 @@ func NewServer(store storage.Store) *Server {
 
 	return s
 
+}
+
+func hasCursorChannel(channels []*model.Config) bool {
+	for _, channel := range channels {
+		if channel != nil && channel.UsesCursorOAuth() {
+			return true
+		}
+	}
+	return false
+}
+
+const cursorBridgeInitializationTimeout = 5 * time.Minute
+
+// StartCursorSDKBridge initializes the pinned companion in the background.
+// Non-Cursor deployments never perform installation or process startup work.
+func (s *Server) StartCursorSDKBridge() {
+	if s == nil || !s.cursorBridgeRequired.Load() || s.isShuttingDown.Load() {
+		return
+	}
+	s.cursorBridgeStartOnce.Do(func() {
+		if s.ensureCursorBridge == nil || s.startCursorBridge == nil {
+			log.Print("[WARN] Cursor SDK Bridge 后台初始化不可用")
+			return
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			ctx, cancel := context.WithTimeout(s.baseCtx, cursorBridgeInitializationTimeout)
+			defer cancel()
+			if err := s.initializeCursorSDKBridge(ctx); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("[WARN] Cursor SDK Bridge 后台初始化失败: %v", err)
+				}
+			}
+		}()
+	})
+}
+
+func (s *Server) initializeCursorSDKBridge(ctx context.Context) error {
+	path, err := s.ensureCursorBridge(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure cursor-sdk-bridge: %w", err)
+	}
+	runner, err := s.startCursorBridge(ctx, path)
+	if err != nil {
+		return fmt.Errorf("start cursor-sdk-bridge: %w", err)
+	}
+	if s.isShuttingDown.Load() {
+		closeCursorRunner(runner)
+		return context.Canceled
+	}
+	previous := s.swapCursorRunner(runner)
+	closeCursorRunner(previous)
+	log.Printf("[INFO] Cursor SDK Bridge 已就绪: %s", path)
+	return nil
+}
+
+func startCursorSDKRunner(ctx context.Context, path string) (cursorauth.Runner, error) {
+	runner := cursorauth.NewSDKRunner(path)
+	if err := runner.Start(ctx); err != nil {
+		closeCursorRunner(runner)
+		return nil, err
+	}
+	return runner, nil
+}
+
+func (s *Server) cursorRunnerSnapshot() cursorauth.Runner {
+	if s == nil {
+		return nil
+	}
+	s.cursorRunnerMu.RLock()
+	defer s.cursorRunnerMu.RUnlock()
+	return s.cursorRunner
+}
+
+func (s *Server) swapCursorRunner(next cursorauth.Runner) cursorauth.Runner {
+	s.cursorRunnerMu.Lock()
+	previous := s.cursorRunner
+	s.cursorRunner = next
+	s.cursorRunnerMu.Unlock()
+	return previous
+}
+
+func closeCursorRunner(runner cursorauth.Runner) {
+	closer, ok := runner.(interface{ Close(context.Context) error })
+	if !ok || closer == nil {
+		return
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*cursorauth.BridgeShutdownGrace)
+	if err := closer.Close(closeCtx); err != nil {
+		log.Printf("[WARN] 关闭 Cursor SDK Bridge Runner 失败: %v", err)
+	}
+	cancel()
 }
 
 // RefreshAntigravityUserAgent resolves the Antigravity Hub version before the
@@ -1397,12 +1507,15 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 	// Codex CLI 直连路由别名（chatgpt_base_url 兼容），对齐 CLIProxyAPI 的
 	// codexDirect 路由组。GET 是 Responses WebSocket 升级；POST 是 SSE
 	// fallback，两者都由 DetectRequestFamily 识别为 RequestFamilyResponses。
+	// /alpha/search 是 Codex 独立搜索端点，转发时把 Exact /responses URL
+	// 改写成 sibling /alpha/search。
 	codexDirect := r.Group("/backend-api/codex")
 	codexDirect.Use(s.authService.RequireAPIAuth())
 	codexDirect.Use(captureClientRequestMetadata())
 	{
 		codexDirect.GET("/responses", s.HandleProxyRequest)
 		codexDirect.POST("/responses", s.HandleProxyRequest)
+		codexDirect.POST("/alpha/search", s.HandleProxyRequest)
 	}
 
 	// 健康检查（公开访问，无需认证，K8s liveness/readiness probe）
@@ -1473,6 +1586,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/zai/oauth/status", s.HandleZAIOAuthStatus)
 		admin.POST("/zai/oauth/cancel", s.HandleCancelZAIOAuth)
 		admin.POST("/zai/credentials/import", s.HandleImportZAICredential)
+		admin.POST("/cursor/credentials/import", s.HandleImportCursorCredential)
 		admin.POST("/channels/check-duplicate", s.HandleCheckDuplicateChannel)
 		admin.POST("/channels/batch-priority", s.HandleBatchUpdatePriority) // 批量更新渠道优先级
 		admin.POST("/channels/batch-enabled", s.HandleBatchSetEnabled)      // 批量启用/禁用渠道
@@ -1780,6 +1894,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		log.Print("[WARN]  Server关闭超时，部分后台任务可能未完成")
 		if err == nil {
 			err = ctx.Err()
+		}
+	}
+	if closer, ok := s.cursorRunnerSnapshot().(interface{ Close(context.Context) error }); ok {
+		if closeErr := closer.Close(ctx); closeErr != nil && err == nil {
+			err = closeErr
 		}
 	}
 

@@ -10,6 +10,7 @@ import (
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
 	"ccLoad/internal/codexauth"
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/xaiauth"
@@ -17,11 +18,12 @@ import (
 )
 
 type oauthUsageCredentialState struct {
-	provider       string
-	authType       string
-	oauthUsage     json.RawMessage
-	quotaCostUsage *oauthcost.Usage
-	encode         func(json.RawMessage, *oauthcost.Usage) (string, error)
+	provider        string
+	authType        string
+	oauthUsage      json.RawMessage
+	quotaCostUsage  *oauthcost.Usage
+	tracksQuotaCost bool
+	encode          func(json.RawMessage, *oauthcost.Usage) (string, error)
 }
 
 func parseOAuthUsageCredentialState(cfg *model.Config) (*oauthUsageCredentialState, error) {
@@ -37,6 +39,7 @@ func parseOAuthUsageCredentialState(cfg *model.Config) (*oauthUsageCredentialSta
 		return &oauthUsageCredentialState{
 			provider: codexauth.ChannelType, authType: model.AuthTypeCodexOAuth,
 			oauthUsage: credential.OAuthUsage, quotaCostUsage: credential.QuotaCostUsage,
+			tracksQuotaCost: true,
 			encode: func(usage json.RawMessage, costUsage *oauthcost.Usage) (string, error) {
 				credential.OAuthUsage = append(json.RawMessage(nil), usage...)
 				credential.QuotaCostUsage = oauthcost.Clone(costUsage)
@@ -51,6 +54,7 @@ func parseOAuthUsageCredentialState(cfg *model.Config) (*oauthUsageCredentialSta
 		return &oauthUsageCredentialState{
 			provider: anthropicauth.ChannelType, authType: model.AuthTypeAnthropicOAuth,
 			oauthUsage: credential.OAuthUsage, quotaCostUsage: credential.QuotaCostUsage,
+			tracksQuotaCost: true,
 			encode: func(usage json.RawMessage, costUsage *oauthcost.Usage) (string, error) {
 				credential.OAuthUsage = append(json.RawMessage(nil), usage...)
 				credential.QuotaCostUsage = oauthcost.Clone(costUsage)
@@ -65,6 +69,7 @@ func parseOAuthUsageCredentialState(cfg *model.Config) (*oauthUsageCredentialSta
 		return &oauthUsageCredentialState{
 			provider: antigravityauth.ChannelType, authType: model.AuthTypeAntigravityOAuth,
 			oauthUsage: credential.OAuthUsage, quotaCostUsage: credential.QuotaCostUsage,
+			tracksQuotaCost: true,
 			encode: func(usage json.RawMessage, costUsage *oauthcost.Usage) (string, error) {
 				credential.OAuthUsage = append(json.RawMessage(nil), usage...)
 				credential.QuotaCostUsage = oauthcost.Clone(costUsage)
@@ -79,6 +84,7 @@ func parseOAuthUsageCredentialState(cfg *model.Config) (*oauthUsageCredentialSta
 		return &oauthUsageCredentialState{
 			provider: xaiauth.ChannelType, authType: model.AuthTypeXAIOAuth,
 			oauthUsage: credential.OAuthUsage, quotaCostUsage: credential.QuotaCostUsage,
+			tracksQuotaCost: true,
 			encode: func(usage json.RawMessage, costUsage *oauthcost.Usage) (string, error) {
 				credential.OAuthUsage = append(json.RawMessage(nil), usage...)
 				credential.QuotaCostUsage = oauthcost.Clone(costUsage)
@@ -94,6 +100,21 @@ func parseOAuthUsageCredentialState(cfg *model.Config) (*oauthUsageCredentialSta
 		// snapshot but tracks no standard-cost windows for it.
 		return &oauthUsageCredentialState{
 			provider: zaiauth.ChannelType, authType: model.AuthTypeZAIOAuth,
+			oauthUsage: credential.OAuthUsage,
+			encode: func(usage json.RawMessage, _ *oauthcost.Usage) (string, error) {
+				credential.OAuthUsage = append(json.RawMessage(nil), usage...)
+				return credential.JSON()
+			},
+		}, nil
+	case cfg.UsesCursorOAuth():
+		credential, err := cursorauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return nil, err
+		}
+		// Cursor meters included spend itself; ccLoad stores the snapshot but
+		// tracks no standard-cost windows for it.
+		return &oauthUsageCredentialState{
+			provider: cursorauth.ChannelType, authType: model.AuthTypeCursorOAuth,
 			oauthUsage: credential.OAuthUsage,
 			encode: func(usage json.RawMessage, _ *oauthcost.Usage) (string, error) {
 				credential.OAuthUsage = append(json.RawMessage(nil), usage...)

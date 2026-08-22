@@ -116,7 +116,8 @@
                   <option value="antigravity" data-i18n="channels.oauth.providerAntigravity">Antigravity</option>
                   <option value="xai" data-i18n="channels.oauth.providerXAI">xAI</option>
                   <option value="anthropic" data-i18n="channels.oauth.providerAnthropic">Anthropic</option>
-                  <option value="zai" data-i18n="channels.oauth.providerZAI">Z.ai Coding Plan</option>
+                  <option value="zai" data-i18n="channels.oauth.providerZAI">Z.ai</option>
+                  <option value="cursor" data-i18n="channels.oauth.providerCursor">Cursor</option>
                 </select>
               </div>
               <div id="codexOAuthControls">
@@ -129,7 +130,7 @@
                 </div>
                 <div id="codexPersonalAccessTokenField" class="oauth-field" hidden>
                   <label for="codexPersonalAccessToken" data-i18n="channels.codex.personalAccessTokenLabel">Codex Personal Access Token</label>
-                  <input id="codexPersonalAccessToken" name="codex_personal_access_token" type="password"
+                  <input id="codexPersonalAccessToken" name="codex_personal_access_token" type="text"
                     class="form-input" autocomplete="off" autocapitalize="none" spellcheck="false"
                     placeholder="at-..."
                     aria-describedby="codexPersonalAccessTokenHint oauthLoginDialogStatus">
@@ -204,11 +205,26 @@
                 </div>
                 <div id="zaiAPIKeyField" class="oauth-field" hidden>
                   <label for="zaiCodingPlanKey" data-i18n="channels.zai.apiKeyLabel">Coding Plan API Key</label>
-                  <input id="zaiCodingPlanKey" name="zai_coding_plan_key" type="password"
+                  <input id="zaiCodingPlanKey" name="zai_coding_plan_key" type="text"
                     class="form-input" autocomplete="off" autocapitalize="none" spellcheck="false"
                     aria-describedby="zaiAPIKeyHint oauthLoginDialogStatus">
                   <p id="zaiAPIKeyHint" class="oauth-field-hint"
                     data-i18n="channels.zai.apiKeyHint">提交后输入会立即从页面清除。ccLoad 只把它保存在渠道凭证中。</p>
+                </div>
+              </div>
+              <div id="cursorOAuthControls" hidden>
+                <div id="cursorAPIKeyField" class="oauth-field" hidden>
+                  <label for="cursorUserAPIKey" data-i18n="channels.cursor.apiKeyLabel">Cursor User API Key</label>
+                  <input id="cursorUserAPIKey" name="cursor_user_api_key" type="text"
+                    class="form-input" autocomplete="off" autocapitalize="none" spellcheck="false"
+                    aria-describedby="cursorAPIKeyGetHint cursorAPIKeyHint oauthLoginDialogStatus">
+                  <p id="cursorAPIKeyGetHint" class="oauth-field-hint">
+                    <span data-i18n="channels.cursor.apiKeyGetHint">前往 Cursor Dashboard 的 Integrations → User API Keys，创建并复制密钥。</span>
+                    <a href="https://cursor.com/dashboard" target="_blank" rel="noopener noreferrer"
+                      data-i18n="channels.cursor.openDashboard">打开 Cursor Dashboard</a>
+                  </p>
+                  <p id="cursorAPIKeyHint" class="oauth-field-hint"
+                    data-i18n="channels.cursor.apiKeyHint">提交后输入会立即从页面清除。ccLoad 用它换取 CLI 会话令牌。</p>
                 </div>
               </div>
               <div id="oauthLoginActions" class="oauth-actions">
@@ -355,7 +371,8 @@
                   <option value="antigravity_oauth">Antigravity</option>
                   <option value="xai_oauth">xAI</option>
                   <option value="anthropic_oauth">Anthropic</option>
-                  <option value="zai_oauth">Z.ai Coding Plan</option>
+                  <option value="zai_oauth">Z.ai</option>
+                  <option value="cursor_oauth">Cursor</option>
                 </select>
               </div>
               <div class="oauth-field">

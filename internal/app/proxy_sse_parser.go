@@ -61,6 +61,9 @@ type sseUsageParser struct {
 	// hasStreamOutput 表示已经看到应转发给客户端的非心跳流事件。
 	// ping 只是上游保活，不能让 200 空流被误判为成功。
 	hasStreamOutput bool
+	// hasResponsesMetadata 表示已经看到 Responses 元数据事件。
+	// 这算上游已返回数据（首字），但不构成语义输出，不阻断故障切换。
+	hasResponsesMetadata bool
 
 	responsesTurnResult responsesWebsocketTurnResult
 	hasResponsesTurn    bool
@@ -109,9 +112,10 @@ type usageParser interface {
 	GetToolCostUSD() float64                                       // 返回 Responses 工具调用的额外费用
 	GetThinkingEffort() string
 	GetReasoningTokens() int
-	GetLastError() []byte   // [INFO] 返回SSE流中检测到的最后一个error事件（用于1308等错误的延迟处理）
-	IsStreamComplete() bool // [INFO] 返回是否检测到流结束标志（[DONE]/message_stop）
-	HasStreamOutput() bool  // 返回是否已经看到非心跳的可见响应内容
+	GetLastError() []byte       // [INFO] 返回SSE流中检测到的最后一个error事件（用于1308等错误的延迟处理）
+	IsStreamComplete() bool     // [INFO] 返回是否检测到流结束标志（[DONE]/message_stop）
+	HasStreamOutput() bool      // 语义输出，提交给客户端后不可再内部切渠道
+	HasResponsesMetadata() bool // Responses 元数据（created 等），算上游已返回数据，但不提交
 	GetResponsesTurnResult() (responsesWebsocketTurnResult, bool)
 }
 
@@ -496,12 +500,13 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 
 	payloadType, _ := event["type"].(string)
 
-	// Responses 元数据事件（response.created/queued/in_progress）不构成语义输出：
-	// 客户端可以在这些事件后重新开始回合，与原生 WS 路径的
-	// isCodexWebsocketSemanticEvent 判定对齐。event: 行与 JSON type 都要认，
-	// 和 isSuccessfulResponsesTerminal 一样。只有真正的内容事件才标记为有流输出，
-	// 以便 deferredWriter 在 error 到来前不会过早 commit。
-	if !isResponsesMetadataEvent(payloadType) && !isResponsesMetadataEvent(eventType) {
+	// Responses 元数据事件不构成语义输出：客户端可以在这些事件后重新开始回合，
+	// 与原生 WS 路径的 isCodexWebsocketSemanticEvent 判定对齐。event: 行与
+	// JSON type 都要认，和 isSuccessfulResponsesTerminal 一样。只有真正的内容
+	// 事件才标记为有流输出，以便 deferredWriter 在 error 到来前不会过早 commit。
+	if isResponsesMetadataEvent(payloadType) || isResponsesMetadataEvent(eventType) {
+		p.hasResponsesMetadata = true
+	} else {
 		p.hasStreamOutput = true
 	}
 
@@ -608,6 +613,10 @@ func (p *sseUsageParser) HasStreamOutput() bool {
 	return p.hasStreamOutput
 }
 
+func (p *sseUsageParser) HasResponsesMetadata() bool {
+	return p.hasResponsesMetadata
+}
+
 func (p *sseUsageParser) GetResponsesTurnResult() (responsesWebsocketTurnResult, bool) {
 	return p.responsesTurnResult, p.hasResponsesTurn
 }
@@ -617,7 +626,8 @@ func (p *sseUsageParser) GetResponsesTurnResult() (responsesWebsocketTurnResult,
 // 空字符串不是元数据：Chat Completions 没有 type，必须算有流输出。
 func isResponsesMetadataEvent(payloadType string) bool {
 	switch payloadType {
-	case "response.created", "response.queued", "response.in_progress":
+	case "response.created", "response.queued", "response.in_progress",
+		"codex.rate_limits", "codex.response.metadata":
 		return true
 	default:
 		return false
@@ -965,6 +975,10 @@ func (p *jsonUsageParser) IsStreamComplete() bool {
 
 func (p *jsonUsageParser) HasStreamOutput() bool {
 	return p.hasBody
+}
+
+func (p *jsonUsageParser) HasResponsesMetadata() bool {
+	return false
 }
 
 func (p *jsonUsageParser) GetResponsesTurnResult() (responsesWebsocketTurnResult, bool) {

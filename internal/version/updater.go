@@ -297,26 +297,15 @@ func (u *UpdateManager) updateOnce(ctx context.Context) error {
 	if !u.applyUpdates || compareSemanticVersions(release.TagName, u.baselineVersion()) <= 0 {
 		return nil
 	}
-	assetName, ok := releaseAssetName(u.goos, u.goarch)
+	asset, ok := releaseAssetName(u.goos, u.goarch)
 	if !ok {
 		return fmt.Errorf("unsupported platform: %s/%s", u.goos, u.goarch)
 	}
 
 	var sourceErrors []error
 	for _, source := range u.releaseSources {
-		assetURL, err := releaseDownloadURL(source, release.TagName, assetName)
-		if err != nil {
-			sourceErrors = append(sourceErrors, fmt.Errorf("%s: %w", source.Name, err))
-			continue
-		}
-		checksumURL, err := releaseDownloadURL(source, release.TagName, "checksums.txt")
-		if err != nil {
-			sourceErrors = append(sourceErrors, fmt.Errorf("%s: %w", source.Name, err))
-			continue
-		}
-
 		u.setUpdating(true)
-		err = u.downloadVerifyAndReplace(ctx, release.TagName, assetName, assetURL, checksumURL)
+		err = u.downloadVerifyAndReplace(ctx, source, release.TagName, asset)
 		u.setUpdating(false)
 		if err != nil {
 			sourceErrors = append(sourceErrors, fmt.Errorf("%s: %w", source.Name, err))
@@ -329,11 +318,16 @@ func (u *UpdateManager) updateOnce(ctx context.Context) error {
 	return fmt.Errorf("download release %s from all sources: %w", release.TagName, errors.Join(sourceErrors...))
 }
 
-func (u *UpdateManager) downloadVerifyAndReplace(ctx context.Context, tag, assetName, assetURL, checksumURL string) error {
-	if strings.TrimSpace(assetURL) == "" || strings.TrimSpace(checksumURL) == "" {
-		return fmt.Errorf("release %s has empty download URL", tag)
+func (u *UpdateManager) downloadVerifyAndReplace(
+	ctx context.Context,
+	source ReleaseSource,
+	tag string,
+	asset string,
+) error {
+	checksumURL, err := releaseDownloadURL(source, tag, "checksums.txt")
+	if err != nil {
+		return err
 	}
-
 	checksumBytes, err := u.downloadBytes(ctx, checksumURL)
 	if err != nil {
 		return fmt.Errorf("download checksums: %w", err)
@@ -343,38 +337,57 @@ func (u *UpdateManager) downloadVerifyAndReplace(ctx context.Context, tag, asset
 		return fmt.Errorf("parse checksums: %w", err)
 	}
 
-	dir := filepath.Dir(u.executablePath)
-	tmp, err := os.CreateTemp(dir, ".ccload-update-*")
+	appTemp, err := u.downloadVerifiedTemp(ctx, source, tag, asset, checksums, 0o755)
 	if err != nil {
-		return fmt.Errorf("create temp binary: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-
-	if err := u.downloadToFile(ctx, assetURL, tmp); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("download asset %s: %w", assetName, err)
-	}
-	if err := tmp.Chmod(0o755); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("chmod temp binary: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync temp binary: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp binary: %w", err)
-	}
-
-	if err := verifyFileChecksum(tmpPath, assetName, checksums); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, u.executablePath); err != nil {
+	defer func() { _ = os.Remove(appTemp) }()
+	if err := os.Rename(appTemp, u.executablePath); err != nil {
 		return fmt.Errorf("replace executable: %w", err)
 	}
 	log.Printf("[UpdateManager] prepared %s; restart pending", tag)
 	return nil
+}
+
+func (u *UpdateManager) downloadVerifiedTemp(
+	ctx context.Context,
+	source ReleaseSource,
+	tag, assetName string,
+	checksums map[string]string,
+	mode os.FileMode,
+) (string, error) {
+	assetURL, err := releaseDownloadURL(source, tag, assetName)
+	if err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(u.executablePath), ".ccload-update-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp file for %s: %w", assetName, err)
+	}
+	path := tmp.Name()
+	fail := func(err error) (string, error) {
+		_ = tmp.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := u.downloadToFile(ctx, assetURL, tmp); err != nil {
+		return fail(fmt.Errorf("download asset %s: %w", assetName, err))
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		return fail(fmt.Errorf("chmod %s: %w", assetName, err))
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(fmt.Errorf("sync %s: %w", assetName, err))
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close %s: %w", assetName, err)
+	}
+	if err := verifyFileChecksum(path, assetName, checksums); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 func (u *UpdateManager) downloadBytes(ctx context.Context, rawURL string) ([]byte, error) {

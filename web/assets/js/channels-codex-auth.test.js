@@ -36,8 +36,32 @@ const {
   submitAnthropicOAuthCode,
   submitCodexOAuthCallback,
   submitCodexPersonalAccessToken,
+  submitCursorCredential,
   submitXAIOAuthCallback
 } = require('./channels-codex-auth.js');
+
+test('Cursor credential import accepts only a user API key', async () => {
+  const previousWindow = global.window;
+  global.window = { t: key => key };
+  const input = {
+    value: '  cursor-user-key  ',
+    removeAttribute() {},
+    setAttribute() {},
+    focus() {}
+  };
+  try {
+    let request;
+    await submitCursorCredential(input, async (url, options) => {
+      request = { url, options };
+      return { channel_name: 'Cursor-user@example.com' };
+    });
+    assert.equal(request.url, '/admin/cursor/credentials/import');
+    assert.deepEqual(JSON.parse(request.options.body), { api_key: 'cursor-user-key' });
+    assert.equal(input.value, '');
+  } finally {
+    global.window = previousWindow;
+  }
+});
 
 test('OAuth credential cleanup resumes its SSE stream without restarting the destructive job', async () => {
   const previousWindow = global.window;
@@ -2160,6 +2184,21 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('channelCodexPlanBadge').hidden, false);
     assert.equal(elements.get('channelCodexPlanBadge').textContent, 'Max 20x');
     assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(anthropicCredential, null, 2));
+
+    const cursorCredential = {
+      type: 'cursor', access_token: 'cursor-at', refresh_token: 'cursor-rt', email: 'user@example.com'
+    };
+    applyChannelAuthEditorMode('cursor_oauth', cursorCredential);
+    assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialRefreshButton').hidden, true);
+    assert.equal(elements.get('codexCredentialReadOnlyNotice').hidden, false);
+    assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(cursorCredential, null, 2));
+
+    const zaiCredential = { type: 'z.ai', api_key: 'zai-key', email: 'zai@example.com' };
+    applyChannelAuthEditorMode('zai_oauth', zaiCredential);
+    assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialRefreshButton').hidden, true);
+    assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(zaiCredential, null, 2));
 
     applyChannelAuthEditorMode('api_key');
     assert.equal(elements.get('codexCredentialReadOnlyNotice').hidden, true);

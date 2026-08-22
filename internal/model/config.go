@@ -20,6 +20,7 @@ const (
 	AuthTypeXAIOAuth         = "xai_oauth"
 	AuthTypeAnthropicOAuth   = "anthropic_oauth"
 	AuthTypeZAIOAuth         = "zai_oauth"
+	AuthTypeCursorOAuth      = "cursor_oauth"
 
 	// ProtocolTransformModeAuto tries the client protocol first, then falls back through
 	// Anthropic, OpenAI, Codex, Gemini while skipping the native protocol already attempted.
@@ -48,6 +49,8 @@ func NormalizeAuthType(value string) string {
 		return AuthTypeAnthropicOAuth
 	case AuthTypeZAIOAuth:
 		return AuthTypeZAIOAuth
+	case AuthTypeCursorOAuth:
+		return AuthTypeCursorOAuth
 	default:
 		return ""
 	}
@@ -621,19 +624,32 @@ func (c *Config) UsesZAIOAuth() bool {
 	return c != nil && c.GetAuthType() == AuthTypeZAIOAuth
 }
 
+// UsesCursorOAuth reports whether this channel is backed by a Cursor credential.
+func (c *Config) UsesCursorOAuth() bool {
+	return c != nil && c.GetAuthType() == AuthTypeCursorOAuth
+}
+
 // UsesOAuth reports whether API keys are replaced by a private OAuth credential.
 func (c *Config) UsesOAuth() bool {
 	return c != nil && c.GetAuthType() != AuthTypeAPIKey
 }
 
 // GetModels 获取所有已启用的模型名称列表
+// GetModels 返回渠道对外暴露且可路由的模型名。条目字面带思考后缀时按基名归一，
+// 保证模型列表与选路索引使用同一套名字。
 func (c *Config) GetModels() []string {
 	models := make([]string, 0, len(c.ModelEntries))
+	seen := make(map[string]struct{}, len(c.ModelEntries))
 	for _, e := range c.ModelEntries {
 		if e.Disabled {
 			continue
 		}
-		models = append(models, e.Model)
+		name := RoutingModelName(e.Model)
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		models = append(models, name)
 	}
 	return models
 }
@@ -731,6 +747,20 @@ func (c *Config) buildIndexIfNeeded() {
 		}
 		c.modelIndex[c.ModelEntries[i].Model] = &c.ModelEntries[i]
 	}
+	// 条目字面写成 gpt-5.6-luna(max) 时，选路用的基名也必须命中它，否则模型列表里
+	// 看得到却路由不到。显式配置的基名条目优先，不被别名覆盖。
+	for i := range c.ModelEntries {
+		if c.ModelEntries[i].Disabled {
+			continue
+		}
+		base := RoutingModelName(c.ModelEntries[i].Model)
+		if base == c.ModelEntries[i].Model {
+			continue
+		}
+		if _, exists := c.modelIndex[base]; !exists {
+			c.modelIndex[base] = &c.ModelEntries[i]
+		}
+	}
 }
 
 // GetRedirectModel 获取模型的重定向目标
@@ -814,14 +844,21 @@ func (c *Config) FuzzyMatchModel(query string) (string, bool) {
 
 	queryLower := strings.ToLower(query)
 	var matches []string
+	seen := make(map[string]struct{}, len(c.ModelEntries))
 
 	for _, entry := range c.ModelEntries {
 		if entry.Disabled {
 			continue
 		}
-		if strings.Contains(strings.ToLower(entry.Model), queryLower) {
-			matches = append(matches, entry.Model)
+		name := RoutingModelName(entry.Model)
+		if _, exists := seen[name]; exists {
+			continue
 		}
+		if !strings.Contains(strings.ToLower(name), queryLower) {
+			continue
+		}
+		seen[name] = struct{}{}
+		matches = append(matches, name)
 	}
 
 	if len(matches) == 0 {

@@ -21,6 +21,11 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func testReleaseChecksums(application []byte) string {
+	sum := sha256.Sum256(application)
+	return fmt.Sprintf("%s  ccload-linux-amd64\n", hex.EncodeToString(sum[:]))
+}
+
 func TestCompareSemanticVersions(t *testing.T) {
 	t.Parallel()
 
@@ -206,8 +211,7 @@ func TestUpdateManagerPreviewChannelSelectsHighestPublishedRelease(t *testing.T)
 	Version = "v1.0.0"
 
 	binary := []byte("preview binary")
-	sum := sha256.Sum256(binary)
-	checksum := hex.EncodeToString(sum[:]) + "  ccload-linux-amd64\n"
+	checksum := testReleaseChecksums(binary)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -283,14 +287,57 @@ func TestUpdateManagerPreviewChannelSelectsHighestPublishedRelease(t *testing.T)
 	}
 }
 
+func TestUpdateManagerChecksumFailureLeavesExecutableUntouched(t *testing.T) {
+	origVersion := Version
+	t.Cleanup(func() { Version = origVersion })
+	Version = "v1.0.0"
+	application := []byte("new app")
+	checksum := testReleaseChecksums(application)
+	applicationSum := sha256.Sum256(application)
+	checksum = strings.Replace(checksum, hex.EncodeToString(applicationSum[:]), strings.Repeat("0", 64), 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/latest":
+			http.Redirect(w, r, "/releases/tag/v1.1.0", http.StatusFound)
+		case r.URL.Path == "/releases/tag/v1.1.0":
+			_, _ = fmt.Fprint(w, "<html></html>")
+		case strings.HasSuffix(r.URL.Path, "/checksums.txt"):
+			_, _ = fmt.Fprint(w, checksum)
+		case strings.HasSuffix(r.URL.Path, "/ccload-linux-amd64"):
+			_, _ = w.Write(application)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "ccload")
+	if err := os.WriteFile(exePath, []byte("old app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updater, err := NewUpdateManager(UpdateManagerOptions{
+		Interval: time.Hour, ApplyUpdates: true,
+		ReleaseSources: []ReleaseSource{{Name: "test", LatestURL: server.URL + "/latest", DownloadBaseURL: server.URL + "/download"}},
+		ExecutablePath: exePath, Client: server.Client(), GOOS: "linux", GOARCH: "amd64", Restart: func() {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updater.updateOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("updateOnce() error = %v", err)
+	}
+	if app, _ := os.ReadFile(exePath); string(app) != "old app" {
+		t.Fatalf("application changed after checksum failure: %q", app)
+	}
+}
+
 func TestUpdateManagerRetriesReleaseAssetPropagationFailure(t *testing.T) {
 	origVersion := Version
 	t.Cleanup(func() { Version = origVersion })
 	Version = "v1.0.0"
 
 	binary := []byte("published binary")
-	sum := sha256.Sum256(binary)
-	checksum := hex.EncodeToString(sum[:]) + "  ccload-linux-amd64\n"
+	checksum := testReleaseChecksums(binary)
 	var checksumRequests atomic.Int64
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -600,8 +647,7 @@ func TestUpdateOnceReplacesPendingVersionWithNewerDownloadedRelease(t *testing.T
 			_, _ = w.Write(binaries[tag])
 		case "/caidaoli/ccLoad/releases/download/v1.0.1/checksums.txt", "/caidaoli/ccLoad/releases/download/v1.0.2/checksums.txt":
 			tag := filepath.Base(filepath.Dir(r.URL.Path))
-			sum := sha256.Sum256(binaries[tag])
-			_, _ = fmt.Fprintf(w, "%s  ccload-linux-amd64\n", hex.EncodeToString(sum[:]))
+			_, _ = fmt.Fprint(w, testReleaseChecksums(binaries[tag]))
 		default:
 			http.NotFound(w, r)
 		}
@@ -669,8 +715,7 @@ func TestUpdateManagerFallsBackToNextReleaseSource(t *testing.T) {
 	for _, failStage := range []string{"latest", "checksums", "asset"} {
 		t.Run(failStage, func(t *testing.T) {
 			binary := []byte("fallback binary")
-			sum := sha256.Sum256(binary)
-			checksum := hex.EncodeToString(sum[:]) + "  ccload-linux-amd64\n"
+			checksum := testReleaseChecksums(binary)
 
 			var mu sync.Mutex
 			var requests []string

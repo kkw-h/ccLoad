@@ -4328,7 +4328,7 @@ func TestProxy_AlphaSearchUnsupportedFallsBackToEmptyResult(t *testing.T) {
 	defer upstream.Close()
 
 	env := setupProxyTestEnv(t, []testChannel{
-		{name: "alpha-search-failure", upstreamProtocol: util.ProtocolCodex, protocolTransformMode: model.ProtocolTransformModeAuto, models: "gpt-5"},
+		{name: "alpha-search-failure", upstreamProtocol: util.ProtocolCodex, models: "gpt-5"},
 	}, map[int]string{0: upstream.URL})
 
 	request := func() *httptest.ResponseRecorder {
@@ -4400,8 +4400,8 @@ func TestProxy_AlphaSearchUnsupportedFallsBackToNextChannel(t *testing.T) {
 	defer supported.Close()
 
 	env := setupProxyTestEnv(t, []testChannel{
-		{name: "alpha-search-unsupported", upstreamProtocol: util.ProtocolCodex, protocolTransformMode: model.ProtocolTransformModeAuto, models: "gpt-5", priority: 100},
-		{name: "alpha-search-supported", upstreamProtocol: util.ProtocolCodex, protocolTransformMode: model.ProtocolTransformModeAuto, models: "gpt-5", priority: 90},
+		{name: "alpha-search-unsupported", upstreamProtocol: util.ProtocolCodex, models: "gpt-5", priority: 100},
+		{name: "alpha-search-supported", upstreamProtocol: util.ProtocolCodex, models: "gpt-5", priority: 90},
 	}, map[int]string{0: unsupported.URL, 1: supported.URL})
 
 	request := func() *httptest.ResponseRecorder {
@@ -4431,7 +4431,37 @@ func TestProxy_AlphaSearchUnsupportedFallsBackToNextChannel(t *testing.T) {
 }
 
 func TestProxy_AlphaSearchExactURLRouting(t *testing.T) {
-	t.Run("responses exact URL cannot shadow native search", func(t *testing.T) {
+	t.Run("responses exact URL is rewritten to alpha/search", func(t *testing.T) {
+		var upstreamHits atomic.Int64
+		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamHits.Add(1)
+			if r.URL.Path != "/backend-api/codex/alpha/search" {
+				t.Errorf("upstream path=%q, want /backend-api/codex/alpha/search", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}))
+		defer upstream.Close()
+
+		env := setupProxyTestEnv(t, []testChannel{{
+			name:             "codex-oauth",
+			upstreamProtocol: util.ProtocolCodex,
+			models:           "gpt-5",
+		}}, map[int]string{0: upstream.URL + "/backend-api/codex/responses#"})
+
+		w := doProxyRequest(t, env.engine, "/v1/alpha/search", map[string]any{
+			"query": "codegraph",
+		}, nil)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200: %s", w.Code, w.Body.String())
+		}
+		if upstreamHits.Load() != 1 {
+			t.Fatalf("upstream hits=%d, want 1", upstreamHits.Load())
+		}
+	})
+
+	t.Run("non-responses exact URL cannot shadow native search", func(t *testing.T) {
 		var wrongHits atomic.Int64
 		wrong := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			wrongHits.Add(1)
@@ -4452,7 +4482,7 @@ func TestProxy_AlphaSearchExactURLRouting(t *testing.T) {
 
 		env := setupProxyTestEnv(t, []testChannel{
 			{
-				name:             "responses-exact",
+				name:             "chat-exact",
 				upstreamProtocol: util.ProtocolCodex,
 				models:           "gpt-5",
 				priority:         100,
@@ -4464,7 +4494,7 @@ func TestProxy_AlphaSearchExactURLRouting(t *testing.T) {
 				priority:         90,
 			},
 		}, map[int]string{
-			0: wrong.URL + "/v1/responses#",
+			0: wrong.URL + "/v1/chat/completions#",
 			1: native.URL,
 		})
 
@@ -4499,6 +4529,36 @@ func TestProxy_AlphaSearchExactURLRouting(t *testing.T) {
 		}}, map[int]string{0: upstream.URL + "/v1/alpha/search#"})
 
 		w := doProxyRequest(t, env.engine, "/v1/alpha/search", map[string]any{
+			"query": "codegraph",
+		}, nil)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200: %s", w.Code, w.Body.String())
+		}
+		if upstreamHits.Load() != 1 {
+			t.Fatalf("upstream hits=%d, want 1", upstreamHits.Load())
+		}
+	})
+
+	t.Run("codex direct alias rewrites oauth responses url", func(t *testing.T) {
+		var upstreamHits atomic.Int64
+		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamHits.Add(1)
+			if r.URL.Path != "/backend-api/codex/alpha/search" {
+				t.Errorf("upstream path=%q, want /backend-api/codex/alpha/search", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}))
+		defer upstream.Close()
+
+		env := setupProxyTestEnv(t, []testChannel{{
+			name:             "codex-oauth",
+			upstreamProtocol: util.ProtocolCodex,
+			models:           "gpt-5",
+		}}, map[int]string{0: upstream.URL + "/backend-api/codex/responses#"})
+
+		w := doProxyRequest(t, env.engine, "/backend-api/codex/alpha/search", map[string]any{
 			"query": "codegraph",
 		}, nil)
 
@@ -8361,6 +8421,86 @@ func TestProxy_GeminiTransform_UsesResolvedActualModelInUpstreamPath(t *testing.
 	}
 }
 
+func TestProxy_ThinkingSuffixUsesResolvedModelCapabilities(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		configuredModel string
+		requestedModel  string
+		redirectModel   string
+		fuzzyMatch      bool
+	}{
+		{
+			name:            "redirect",
+			configuredModel: "latest",
+			requestedModel:  "latest(max)",
+			redirectModel:   "gpt-5.5",
+		},
+		{
+			name:            "fuzzy match",
+			configuredModel: "gpt-5.5",
+			requestedModel:  "5.5(max)",
+			fuzzyMatch:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "openai-ch", upstreamProtocol: "openai", models: tt.configuredModel, apiKey: "sk-oai",
+			}}, map[int]string{0: "https://openai-upstream.example.com"})
+
+			if tt.redirectModel != "" {
+				configs, err := env.store.ListConfigs(context.Background())
+				if err != nil {
+					t.Fatalf("ListConfigs failed: %v", err)
+				}
+				cfg := configs[0]
+				cfg.ModelEntries = []model.ModelEntry{{Model: tt.configuredModel, RedirectModel: tt.redirectModel}}
+				if _, err := env.store.UpdateConfig(context.Background(), cfg.ID, cfg); err != nil {
+					t.Fatalf("UpdateConfig failed: %v", err)
+				}
+				env.server.InvalidateChannelListCache()
+			}
+			env.server.modelFuzzyMatch = tt.fuzzyMatch
+
+			var gotModel, gotEffort string
+			env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				requestBody, err := io.ReadAll(r.Body)
+				if err != nil {
+					return nil, err
+				}
+				gotModel = gjson.GetBytes(requestBody, "model").String()
+				gotEffort = gjson.GetBytes(requestBody, "reasoning_effort").String()
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(
+						`{"id":"chatcmpl-thinking","object":"chat.completion","model":"gpt-5.5","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+					)),
+				}, nil
+			})}
+
+			w := doProxyRequest(t, env.engine, "/v1/chat/completions", map[string]any{
+				"model": tt.requestedModel,
+				"messages": []map[string]string{{
+					"role": "user", "content": "hi",
+				}},
+			}, nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			if gotModel != "gpt-5.5" {
+				t.Fatalf("upstream model = %q, want gpt-5.5", gotModel)
+			}
+			if gotEffort != "xhigh" {
+				t.Fatalf("upstream reasoning_effort = %q, want xhigh", gotEffort)
+			}
+		})
+	}
+}
+
 func TestProxy_Success_Streaming_OpenAIToGeminiTransform_TextPlainSSE(t *testing.T) {
 	t.Parallel()
 
@@ -10032,6 +10172,351 @@ func TestProxy_ResponsesMetadataThenSSEError_RetriesNextChannel(t *testing.T) {
 	}
 	if firstCalls.Load() != 1 || secondCalls.Load() != 1 {
 		t.Fatalf("upstream calls first=%d second=%d, want 1/1", firstCalls.Load(), secondCalls.Load())
+	}
+}
+
+func TestProxy_ResponsesMetadataCountsAsFirstByteWithoutCommitting(t *testing.T) {
+	t.Parallel()
+
+	semanticDelay := 300 * time.Millisecond
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: response.created\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-first-byte","status":"in_progress"}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(semanticDelay)
+		_, _ = fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"hi"}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-first-byte","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "metadata-first-byte", upstreamProtocol: "codex", models: "gpt-first-byte", apiKey: "sk-first-byte",
+	}}, map[int]string{0: upstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-first-byte", "stream": true, "input": "hi",
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "resp-first-byte") || !strings.Contains(body, `"hi"`) {
+		t.Fatalf("expected created+delta, got: %s", body)
+	}
+
+	entry := waitForProxyLog(t, env, "gpt-first-byte")
+	if entry.FirstByteTime <= 0 || entry.FirstByteTime >= semanticDelay.Seconds() {
+		t.Fatalf("first_byte_time=%.3f should be upstream created, not semantic delay %.3f; duration=%.3f",
+			entry.FirstByteTime, semanticDelay.Seconds(), entry.Duration)
+	}
+	if entry.Duration < semanticDelay.Seconds() {
+		t.Fatalf("duration=%.3f shorter than semantic delay, test setup invalid", entry.Duration)
+	}
+}
+
+func TestProxy_ResponsesMetadataDoesNotSetClientFirstByteBeforeCommit(t *testing.T) {
+	t.Parallel()
+
+	metadataSent := make(chan struct{})
+	releaseSemantic := make(chan struct{})
+	var releaseOnce sync.Once
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-client-byte","status":"in_progress"}}`+"\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(metadataSent)
+		<-releaseSemantic
+		_, _ = fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"hi"}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-client-byte","status":"completed","output":[]}}`+"\n\n")
+	}))
+	release := func() {
+		releaseOnce.Do(func() { close(releaseSemantic) })
+	}
+	defer release()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "metadata-client-byte", upstreamProtocol: "codex", models: "gpt-client-byte", apiKey: "sk-client-byte",
+	}}, map[int]string{0: upstream.URL})
+
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-client-byte", "stream": true, "input": "hi",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-api-key")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		env.engine.ServeHTTP(response, req)
+		close(done)
+	}()
+
+	select {
+	case <-metadataSent:
+	case <-time.After(time.Second):
+		t.Fatal("upstream metadata was not sent")
+	}
+
+	var active *ActiveRequest
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		requests := env.server.activeRequests.List()
+		if len(requests) == 1 && requests[0].BytesReceived > 0 {
+			active = requests[0]
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if active == nil {
+		t.Fatal("active request did not receive metadata bytes")
+	}
+	if active.ClientFirstByteTime != 0 {
+		t.Fatalf("client_first_byte_time=%.6f before deferred response commit, want 0", active.ClientFirstByteTime)
+	}
+
+	release()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("proxy request did not finish after semantic output")
+	}
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"delta":"hi"`) {
+		t.Fatalf("unexpected response status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestProxy_ResponsesMissingRequiredParameterRetriesWithPrunedInput(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan []byte, 2)
+	var calls atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"error":{"code":"missing_required_parameter","message":"Missing required parameter: 'input[1].content[0].text'.","param":"input[1].content[0].text","type":"invalid_request_error"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-after-pruning","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-missing-required", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": true,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "keep-user"},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{
+				map[string]any{"type": "output_text"},
+			}},
+			map[string]any{"type": "message", "role": "user", "content": "keep-follow-up"},
+		},
+	}, nil)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "resp-after-pruning") {
+		t.Fatalf("status=%d body=%s, want completed retried response", w.Code, w.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls=%d, want 2", calls.Load())
+	}
+	first := <-requests
+	retry := <-requests
+	if gjson.GetBytes(first, "input.#").Int() != 3 {
+		t.Fatalf("first request input=%s, want three items", first)
+	}
+	if gjson.GetBytes(retry, "input.#").Int() != 2 ||
+		gjson.GetBytes(retry, "input.0.content").String() != "keep-user" ||
+		gjson.GetBytes(retry, "input.1.content").String() != "keep-follow-up" {
+		t.Fatalf("retry did not remove only invalid input item: %s", retry)
+	}
+}
+
+func TestProxy_ResponsesSSEMissingStoredItemRetriesOnceWithStrippedBody(t *testing.T) {
+	t.Parallel()
+
+	const missingID = "rs_item_missing"
+	requests := make(chan []byte, 2)
+	var calls atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", fmt.Sprintf(
+				`{"type":"error","error":{"type":"invalid_request_error","code":null,"message":"Item with id '%s' not found. Items are not persisted when store is set to false.","param":"input"},"status":404}`,
+				missingID,
+			))
+			return
+		}
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-after-strips","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-missing-items", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": true, "store": false,
+		"input": []any{
+			map[string]any{"type": "reasoning", "id": missingID, "summary": []any{}},
+			map[string]any{"type": "message", "id": "msg_keep", "role": "user", "content": "keep"},
+		},
+	}, nil)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "resp-after-strips") {
+		t.Fatalf("status=%d body=%s, want completed response", w.Code, w.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls=%d, want initial request plus one retry", calls.Load())
+	}
+	first := <-requests
+	second := <-requests
+	if !gjson.GetBytes(first, "input.#(id==\""+missingID+"\").id").Exists() {
+		t.Fatalf("initial request lost missing item: %s", first)
+	}
+	if gjson.GetBytes(second, "input.#").Int() != 1 ||
+		gjson.GetBytes(second, "input.0.id").String() != "msg_keep" {
+		t.Fatalf("retry did not remove only %s: %s", missingID, second)
+	}
+}
+
+func TestProxy_ResponsesSSEMissingStoredItemRetriesOnce(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	requests := make(chan []byte, responsesMissingStoredItemRetryLimit+2)
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		missingID := gjson.GetBytes(body, "input.0.id").String()
+		if missingID == "" {
+			_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-after-unbounded-retries","status":"completed","output":[]}}`+"\n\n")
+			return
+		}
+		_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", fmt.Sprintf(
+			`{"type":"error","error":{"type":"invalid_request_error","code":null,"message":"Item with id '%s' not found. Items are not persisted when store is set to false.","param":"input"},"status":404}`,
+			missingID,
+		))
+	}))
+	defer upstream.Close()
+
+	input := make([]any, 0, responsesMissingStoredItemRetryLimit+1)
+	for index := range responsesMissingStoredItemRetryLimit + 1 {
+		input = append(input, map[string]any{
+			"type": "reasoning", "id": fmt.Sprintf("rs_item_missing_%02d", index), "summary": []any{},
+		})
+	}
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-missing-item-limit", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": true, "store": false, "input": input,
+	}, nil)
+
+	wantCalls := int32(responsesMissingStoredItemRetryLimit + 1)
+	if calls.Load() != wantCalls {
+		t.Fatalf("upstream calls=%d, want initial request plus %d retries (%d total); status=%d body=%s",
+			calls.Load(), responsesMissingStoredItemRetryLimit, wantCalls, w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "resp-after-unbounded-retries") {
+		t.Fatalf("retry loop stripped beyond the fixed limit: %s", w.Body.String())
+	}
+	var last []byte
+	for range wantCalls {
+		last = <-requests
+	}
+	if gjson.GetBytes(last, "input.#").Int() != 1 ||
+		gjson.GetBytes(last, "input.0.id").String() != fmt.Sprintf("rs_item_missing_%02d", responsesMissingStoredItemRetryLimit) {
+		t.Fatalf("last bounded retry body=%s, want final unstripped item", last)
+	}
+}
+
+func TestProxy_ResponsesHTTPMissingStoredItemRetriesOnce(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	requests := make(chan []byte, responsesMissingStoredItemRetryLimit+2)
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		calls.Add(1)
+		missingID := gjson.GetBytes(body, "input.0.id").String()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprintf(w,
+			`{"error":{"type":"invalid_request_error","code":null,"message":"Item with id '%s' not found. Items are not persisted when store is set to false.","param":"input"}}`,
+			missingID,
+		)
+	}))
+	defer upstream.Close()
+
+	input := make([]any, 0, responsesMissingStoredItemRetryLimit+1)
+	for index := range responsesMissingStoredItemRetryLimit + 1 {
+		input = append(input, map[string]any{
+			"type": "reasoning", "id": fmt.Sprintf("rs_item_missing_%02d", index), "summary": []any{},
+		})
+	}
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-http-missing-item-limit", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "store": false, "input": input,
+	}, nil)
+
+	wantCalls := int32(responsesMissingStoredItemRetryLimit + 1)
+	if calls.Load() != wantCalls {
+		t.Fatalf("upstream calls=%d, want initial request plus %d retries (%d total); status=%d body=%s",
+			calls.Load(), responsesMissingStoredItemRetryLimit, wantCalls, w.Code, w.Body.String())
+	}
+	var last []byte
+	for range wantCalls {
+		last = <-requests
+	}
+	if gjson.GetBytes(last, "input.#").Int() != 1 ||
+		gjson.GetBytes(last, "input.0.id").String() != fmt.Sprintf("rs_item_missing_%02d", responsesMissingStoredItemRetryLimit) {
+		t.Fatalf("last bounded retry body=%s, want final unstripped item", last)
 	}
 }
 

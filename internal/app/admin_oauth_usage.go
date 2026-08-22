@@ -17,6 +17,7 @@ import (
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
 	"ccLoad/internal/codexauth"
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/xaiauth"
@@ -44,6 +45,7 @@ const (
 var (
 	errOAuthUsageUnsupported         = errors.New("usage: channel does not use a supported OAuth provider")
 	errZAIUsageManagerUnavailable    = errors.New("usage: Z.ai credential manager is unavailable")
+	errCursorUsageManagerUnavailable = errors.New("usage: Cursor credential manager is unavailable")
 	errCodexUsageManagerUnavailable  = errors.New("usage: Codex credential manager is unavailable")
 	errAnthropicManagerUnavailable   = errors.New("usage: Anthropic credential manager is unavailable")
 	errAntigravityManagerUnavailable = errors.New("usage: Antigravity credential manager is unavailable")
@@ -193,8 +195,11 @@ type oauthUsageSummary struct {
 	Windows               []oauthUsageWindow      `json:"windows"`
 	RateLimitResetCredits *codexQuotaResetCredits `json:"rate_limit_reset_credits,omitempty"`
 	Warnings              []string                `json:"warnings,omitempty"`
-	XAIBilling            *xaiBillingSummary      `json:"xai_billing,omitempty"`
-	QuotaCostUsage        *oauthcost.Usage        `json:"quota_cost_usage,omitempty"`
+	// DisplayMessage 是上游账单状态文案（例如 Cursor 的额度用尽提示），
+	// 不是采样失败。前端单独渲染，不得塞进 Warnings。
+	DisplayMessage string             `json:"display_message,omitempty"`
+	XAIBilling     *xaiBillingSummary `json:"xai_billing,omitempty"`
+	QuotaCostUsage *oauthcost.Usage   `json:"quota_cost_usage,omitempty"`
 }
 
 type persistedOAuthUsageSnapshot struct {
@@ -1318,7 +1323,8 @@ func oauthUsageHTTPStatus(err error) int {
 		errors.Is(err, errAnthropicManagerUnavailable),
 		errors.Is(err, errAntigravityManagerUnavailable),
 		errors.Is(err, errXAIUsageManagerUnavailable),
-		errors.Is(err, errZAIUsageManagerUnavailable):
+		errors.Is(err, errZAIUsageManagerUnavailable),
+		errors.Is(err, errCursorUsageManagerUnavailable):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, errOAuthUsagePersistFailed):
 		return http.StatusInternalServerError
@@ -1404,7 +1410,10 @@ func (s *Server) persistOAuthUsage(
 			return attachOAuthQuotaCostUsage(persisted, state.quotaCostUsage), nil
 		}
 
-		nextQuotaCostUsage := reconcileOAuthQuotaCostUsage(state.quotaCostUsage, summary, sampledAt)
+		var nextQuotaCostUsage *oauthcost.Usage
+		if state.tracksQuotaCost {
+			nextQuotaCostUsage = reconcileOAuthQuotaCostUsage(state.quotaCostUsage, summary, sampledAt)
+		}
 		storedSummary := *summary
 		storedSummary.QuotaCostUsage = nil
 		snapshot, err := json.Marshal(persistedOAuthUsageSnapshot{
@@ -1448,6 +1457,14 @@ func (s *Server) invalidateOAuthCredential(channelID int64, provider string) {
 		s.antigravityCredentials.invalidate(channelID)
 	case xaiauth.ChannelType:
 		s.xaiCredentials.invalidate(channelID)
+	case zaiauth.ChannelType:
+		if s.zaiCredentials != nil {
+			s.zaiCredentials.invalidate(channelID)
+		}
+	case cursorauth.ChannelType:
+		if s.cursorCredentials != nil {
+			s.cursorCredentials.invalidate(channelID)
+		}
 	}
 }
 
@@ -1572,6 +1589,15 @@ func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oau
 			return nil, oauthUsageCredentialRefreshError(err, "usage: Z.ai credential refresh failed")
 		}
 		return requestZAIUsage(ctx, s.zaiUsageService(cfg), credential.APIKey)
+	case cfg.UsesCursorOAuth():
+		if s.cursorCredentials == nil {
+			return nil, errCursorUsageManagerUnavailable
+		}
+		credential, err := s.cursorCredentials.credential(ctx, cfg, false)
+		if err != nil {
+			return nil, oauthUsageCredentialRefreshError(err, "usage: Cursor credential refresh failed")
+		}
+		return requestCursorUsage(ctx, s.cursorUsageService(cfg), credential.AccessToken)
 	default:
 		return nil, errOAuthUsageUnsupported
 	}
@@ -1622,6 +1648,45 @@ func normalizeZAIUsage(limits []zaiauth.QuotaLimit) (*oauthUsageSummary, error) 
 	}
 	if len(summary.Windows) == 0 {
 		return nil, errors.New("usage: Z.ai response has no quota windows")
+	}
+	return summary, nil
+}
+
+func (s *Server) cursorUsageService(cfg *model.Config) *cursorauth.Service {
+	service := cursorauth.NewService(s.getClientForChannel(cfg))
+	if s.cursorService != nil {
+		service.APIBaseURL = s.cursorService.APIBaseURL
+	}
+	return service
+}
+
+func requestCursorUsage(ctx context.Context, service *cursorauth.Service, accessToken string) (*oauthUsageSummary, error) {
+	usage, err := service.FetchPeriodUsage(ctx, accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("usage: Cursor quota request failed: %w", err)
+	}
+	return normalizeCursorUsage(usage)
+}
+
+func normalizeCursorUsage(usage *cursorauth.PeriodUsage) (*oauthUsageSummary, error) {
+	if usage == nil || len(usage.Windows) == 0 {
+		return nil, errors.New("usage: Cursor response has no quota windows")
+	}
+	summary := &oauthUsageSummary{
+		Provider:       cursorauth.ChannelType,
+		PlanType:       usage.PlanType,
+		DisplayMessage: strings.TrimSpace(usage.DisplayMessage),
+		Windows:        make([]oauthUsageWindow, 0, len(usage.Windows)),
+	}
+	for _, window := range usage.Windows {
+		summary.Windows = append(summary.Windows, oauthUsageWindow{
+			LimitName:          window.Name,
+			Kind:               window.Kind,
+			UsedPercent:        window.UsedPercent,
+			RemainingPercent:   window.RemainingPercent,
+			LimitWindowSeconds: window.LimitWindowSeconds,
+			ResetAt:            window.ResetAt,
+		})
 	}
 	return summary, nil
 }
