@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/storage"
 	"ccLoad/internal/util"
 
@@ -51,6 +53,41 @@ type codexCredentialManager struct {
 	now              func() time.Time
 	passiveLocks     [64]sync.Mutex
 	passiveSamples   map[int64]map[string]time.Time
+}
+
+// codexCredentialRefreshError keeps the exact persisted credential snapshot
+// used by a failed refresh. Runtime rejection handling can then disable that
+// snapshot atomically without touching a concurrently reauthorized channel.
+type codexCredentialRefreshError struct {
+	cause      error
+	authType   string
+	credential string
+}
+
+func (e *codexCredentialRefreshError) Error() string {
+	if e == nil || e.cause == nil {
+		return "Codex credential refresh failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *codexCredentialRefreshError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func newCodexCredentialRefreshError(cfg *model.Config, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	if cfg == nil {
+		return cause
+	}
+	return &codexCredentialRefreshError{
+		cause: cause, authType: cfg.GetAuthType(), credential: cfg.OAuthCredential,
+	}
 }
 
 type codexPassiveUsageUpdate struct {
@@ -100,7 +137,9 @@ func (m *codexCredentialManager) credentialForRejectedAccessToken(
 	}
 	if credential.IsPersonalAccessToken() {
 		if forceRefresh {
-			return cloneCodexCredential(credential), codexauth.ErrPersonalAccessTokenCannotRefresh
+			return cloneCodexCredential(credential), newCodexCredentialRefreshError(
+				cfg, codexauth.ErrPersonalAccessTokenCannotRefresh,
+			)
 		}
 		return cloneCodexCredential(credential), nil
 	}
@@ -164,7 +203,10 @@ func (m *codexCredentialManager) credentialForRejectedAccessToken(
 					return cloneCodexCredential(winner), nil
 				}
 			}
-			return nil, fmt.Errorf("refresh Codex credential for channel %d: %w", currentCfg.ID, refreshErr)
+			return nil, newCodexCredentialRefreshError(
+				currentCfg,
+				fmt.Errorf("refresh Codex credential for channel %d: %w", currentCfg.ID, refreshErr),
+			)
 		}
 		return m.persistRefreshResult(refreshCtx, currentCfg, current, refreshed)
 	})
@@ -307,6 +349,7 @@ func cloneCodexCredential(credential *codexauth.Credential) *codexauth.Credentia
 	clone := *credential
 	clone.PassiveUsage = codexauth.ClonePassiveUsage(credential.PassiveUsage)
 	clone.OAuthUsage = append([]byte(nil), credential.OAuthUsage...)
+	clone.QuotaCostUsage = oauthcost.Clone(credential.QuotaCostUsage)
 	clone.QuotaOverdraft = codexauth.CloneQuotaOverdraft(credential.QuotaOverdraft)
 	return &clone
 }
@@ -438,6 +481,21 @@ func (m *codexCredentialManager) setQuotaOverdraftEnabled(
 	})
 }
 
+func (m *codexCredentialManager) clearQuotaOverdraftWindow(ctx context.Context, channelID int64) error {
+	_, err := m.updateQuotaOverdraft(ctx, channelID, func(
+		overdraft *codexauth.QuotaOverdraft,
+		existed bool,
+		_ *codexauth.Credential,
+	) (bool, error) {
+		if !existed || overdraft.ActiveUntil == 0 {
+			return false, nil
+		}
+		overdraft.ActiveUntil = 0
+		return true, nil
+	})
+	return err
+}
+
 func (m *codexCredentialManager) recordQuotaOverdraftSuccess(
 	ctx context.Context,
 	channelID int64,
@@ -541,7 +599,12 @@ func (m *codexCredentialManager) updatePassiveUsage(
 		updatedCredential := *current
 		var changed bool
 		updatedCredential.PassiveUsage, changed = mergeCodexPassiveUsage(current.PassiveUsage, update.Windows, updateTime)
-		if !changed {
+		nextQuotaCostUsage := reconcileOAuthQuotaCostUsage(
+			current.QuotaCostUsage, codexPassiveUsageSummary(&updatedCredential), updateTime,
+		)
+		quotaCostChanged := !reflect.DeepEqual(current.QuotaCostUsage, nextQuotaCostUsage)
+		updatedCredential.QuotaCostUsage = nextQuotaCostUsage
+		if !changed && !quotaCostChanged {
 			return false, nil
 		}
 		payload, err := updatedCredential.JSON()
@@ -660,7 +723,26 @@ func codexPassiveUsageWindowKey(window codexauth.PassiveUsageWindow) string {
 func codexPassiveUsageWindowValueEqual(a, b codexauth.PassiveUsageWindow) bool {
 	return strings.EqualFold(strings.TrimSpace(a.Scope), strings.TrimSpace(b.Scope)) &&
 		a.LimitName == b.LimitName && a.Kind == b.Kind && a.UsedPercent == b.UsedPercent &&
-		a.LimitWindowSeconds == b.LimitWindowSeconds && a.ResetAt == b.ResetAt
+		a.LimitWindowSeconds == b.LimitWindowSeconds && codexPassiveResetSamePeriod(a, b)
+}
+
+// codexPassiveResetSamePeriod 判断两次采样的 reset 时间是否指向同一个上游周期。
+// 同一个周期有两种精度的表达：响应头给绝对 reset-at，SSE rate_limits 事件只给
+// resets_in_seconds（换算成 sampledAt+n，每次都不同）。逐秒比较会把这种抖动当成
+// 真实变化，于是几乎每个请求都要重写一次凭证。周期滚动会把 reset 整整推进一个
+// 窗口时长，容差取半个窗口足以把它和秒级噪声区分开。
+func codexPassiveResetSamePeriod(a, b codexauth.PassiveUsageWindow) bool {
+	if a.ResetAt == b.ResetAt {
+		return true
+	}
+	if a.ResetAt <= 0 || b.ResetAt <= 0 || a.LimitWindowSeconds <= 0 {
+		return false
+	}
+	delta := a.ResetAt - b.ResetAt
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta*2 < a.LimitWindowSeconds
 }
 
 func copyCodexHTTPHeaders(dst, src http.Header) {

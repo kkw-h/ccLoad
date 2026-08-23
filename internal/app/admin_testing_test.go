@@ -28,6 +28,7 @@ import (
 	"ccLoad/internal/testutil"
 	"ccLoad/internal/util"
 	"ccLoad/internal/xaiauth"
+	"ccLoad/internal/zaiauth"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -423,7 +424,7 @@ func TestOAuthCredentialCleanupRunsConcurrentlyAndDeletesOnlyRefreshFailures(t *
 	startCleanup := func() oauthCredentialCleanupJobStart {
 		t.Helper()
 		req := newRequest(http.MethodPost, "/admin/oauth/credentials/cleanup/jobs", strings.NewReader(
-			`{"auth_type":"codex_oauth","model":"gpt-5.4"}`,
+			`{"auth_type":"codex_oauth","model":"gpt-5.4","action":"delete"}`,
 		))
 		req.Header.Set("Idempotency-Key", "cleanup-test-request")
 		req.Header.Set("Content-Type", "application/json")
@@ -445,15 +446,26 @@ func TestOAuthCredentialCleanupRunsConcurrentlyAndDeletesOnlyRefreshFailures(t *
 		return response.Data
 	}
 	started := startCleanup()
-	if started.Total != 10 || started.AuthType != model.AuthTypeCodexOAuth || started.Model != "gpt-5.4" {
+	if started.Total != 10 || started.AuthType != model.AuthTypeCodexOAuth || started.Model != "gpt-5.4" ||
+		started.Action != oauthCredentialCleanupActionDelete {
 		t.Fatalf("cleanup selection=%+v", started)
 	}
 	recovered := startCleanup()
 	if recovered != started {
 		t.Fatalf("idempotent start=%+v, want %+v", recovered, started)
 	}
+	actionConflictReq := newRequest(http.MethodPost, "/admin/oauth/credentials/cleanup/jobs", strings.NewReader(
+		`{"auth_type":"codex_oauth","model":"gpt-5.4","action":"disable"}`,
+	))
+	actionConflictReq.Header.Set("Idempotency-Key", "cleanup-test-request")
+	actionConflictReq.Header.Set("Content-Type", "application/json")
+	actionConflictContext, actionConflictResponse := newTestContext(t, actionConflictReq)
+	srv.HandleStartOAuthCredentialCleanupJob(actionConflictContext)
+	if actionConflictResponse.Code != http.StatusConflict {
+		t.Fatalf("idempotency action conflict status=%d body=%s", actionConflictResponse.Code, actionConflictResponse.Body.String())
+	}
 	conflictReq := newRequest(http.MethodPost, "/admin/oauth/credentials/cleanup/jobs", strings.NewReader(
-		`{"auth_type":"codex_oauth","model":"gpt-other"}`,
+		`{"auth_type":"codex_oauth","model":"gpt-other","action":"delete"}`,
 	))
 	conflictReq.Header.Set("Idempotency-Key", "cleanup-test-request")
 	conflictReq.Header.Set("Content-Type", "application/json")
@@ -563,6 +575,15 @@ func TestOAuthCredentialCleanupRunsConcurrentlyAndDeletesOnlyRefreshFailures(t *
 	srv.HandleStartOAuthCredentialCleanupJob(unknownModelContext)
 	if unknownModelResponse.Code != http.StatusBadRequest {
 		t.Fatalf("unknown cleanup model status=%d body=%s", unknownModelResponse.Code, unknownModelResponse.Body.String())
+	}
+	invalidActionRequest := newRequest(http.MethodPost, "/admin/oauth/credentials/cleanup/jobs", strings.NewReader(
+		`{"auth_type":"codex_oauth","model":"gpt-other","action":"archive"}`,
+	))
+	invalidActionRequest.Header.Set("Content-Type", "application/json")
+	invalidActionContext, invalidActionResponse := newTestContext(t, invalidActionRequest)
+	srv.HandleStartOAuthCredentialCleanupJob(invalidActionContext)
+	if invalidActionResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid cleanup action status=%d body=%s", invalidActionResponse.Code, invalidActionResponse.Body.String())
 	}
 
 	secondRequest := newRequest(http.MethodPost, "/admin/oauth/credentials/cleanup/jobs", strings.NewReader(
@@ -755,8 +776,10 @@ func TestOAuthCredentialCleanupCancelDuringRefreshKeepsChannel(t *testing.T) {
 	}
 }
 
-func TestOAuthCredentialCleanupDeletesRejectedPersonalAccessToken(t *testing.T) {
+func TestOAuthCredentialCleanupDisablesRejectedPersonalAccessTokenByDefault(t *testing.T) {
+	var upstreamAttempts atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAttempts.Add(1)
 		if r.Header.Get("Authorization") != "Bearer at-cleanup-pat" {
 			t.Errorf("PAT cleanup authorization = %q", r.Header.Get("Authorization"))
 		}
@@ -788,39 +811,70 @@ func TestOAuthCredentialCleanupDeletesRejectedPersonalAccessToken(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	request := newRequest(http.MethodPost, "/admin/oauth/credentials/cleanup/jobs", strings.NewReader(
-		`{"auth_type":"codex_oauth","model":"gpt-pat"}`,
-	))
-	request.Header.Set("Content-Type", "application/json")
-	requestContext, response := newTestContext(t, request)
-	srv.HandleStartOAuthCredentialCleanupJob(requestContext)
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("start PAT cleanup status=%d body=%s", response.Code, response.Body.String())
-	}
-	var started struct {
-		Data oauthCredentialCleanupJobStart `json:"data"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &started); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	var view oauthCredentialCleanupJobView
-	for time.Now().Before(deadline) {
-		view, _, err = srv.oauthCredentialCleanupJobs.Get(started.Data.JobID, 0)
-		if err != nil {
+	runCleanup := func(action string) (oauthCredentialCleanupJobStart, oauthCredentialCleanupJobView) {
+		t.Helper()
+		body := `{"auth_type":"codex_oauth","model":"gpt-pat"}`
+		if action != "" {
+			body = fmt.Sprintf(`{"auth_type":"codex_oauth","model":"gpt-pat","action":%q}`, action)
+		}
+		request := newRequest(http.MethodPost, "/admin/oauth/credentials/cleanup/jobs", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		requestContext, response := newTestContext(t, request)
+		srv.HandleStartOAuthCredentialCleanupJob(requestContext)
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("start PAT cleanup status=%d body=%s", response.Code, response.Body.String())
+		}
+		var started struct {
+			Data oauthCredentialCleanupJobStart `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &started); err != nil {
 			t.Fatal(err)
 		}
-		if view.Status != oauthCredentialCleanupJobRunning {
-			break
+		deadline := time.Now().Add(3 * time.Second)
+		var view oauthCredentialCleanupJobView
+		for time.Now().Before(deadline) {
+			var err error
+			view, _, err = srv.oauthCredentialCleanupJobs.Get(started.Data.JobID, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.Status != oauthCredentialCleanupJobRunning {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
+		return started.Data, view
+	}
+
+	started, view := runCleanup("")
+	if started.Action != oauthCredentialCleanupActionDisable {
+		t.Fatalf("default cleanup action=%q, want disable", started.Action)
 	}
 	if view.Status != oauthCredentialCleanupJobSucceeded || len(view.Events) == 0 ||
-		view.Events[len(view.Events)-1].Deleted != 1 {
+		view.Events[len(view.Events)-1].Disabled != 1 || view.Events[len(view.Events)-1].Deleted != 0 {
 		t.Fatalf("PAT cleanup view=%+v", view)
 	}
+	persisted, err := srv.store.GetConfig(context.Background(), created.ID)
+	if err != nil || persisted.Enabled {
+		t.Fatalf("default cleanup did not disable revoked personal access token: channel=%+v err=%v", persisted, err)
+	}
+
+	_, repeated := runCleanup("")
+	if repeated.Status != oauthCredentialCleanupJobSucceeded || len(repeated.Events) == 0 ||
+		repeated.Events[len(repeated.Events)-1].Skipped != 1 || repeated.Events[len(repeated.Events)-1].Disabled != 0 {
+		t.Fatalf("repeated disable cleanup view=%+v", repeated)
+	}
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("repeated disable cleanup upstream attempts=%d, want 1", got)
+	}
+
+	deletedStart, deleted := runCleanup(oauthCredentialCleanupActionDelete)
+	if deletedStart.Action != oauthCredentialCleanupActionDelete || deleted.Status != oauthCredentialCleanupJobSucceeded ||
+		len(deleted.Events) == 0 || deleted.Events[len(deleted.Events)-1].Deleted != 1 {
+		t.Fatalf("delete cleanup start=%+v view=%+v", deletedStart, deleted)
+	}
 	if _, err := srv.store.GetConfig(context.Background(), created.ID); err == nil {
-		t.Fatal("cleanup kept a revoked personal access token channel")
+		t.Fatal("delete cleanup kept the disabled revoked PAT channel")
 	}
 }
 
@@ -1837,6 +1891,51 @@ func TestTestChannelAPI_StreamFirstValidContentTimeoutIgnoresHeartbeats(t *testi
 	}
 }
 
+func TestTestChannelAPI_ResponsesMetadataDoesNotStopFirstContentTimeout(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+			_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"late"}`+"\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.firstByteTimeout = 30 * time.Millisecond
+	result := srv.testChannelAPI(context.Background(), &model.Config{
+		ID:           9533,
+		Name:         "responses-metadata-first-content-timeout-test",
+		URLs:         model.ChannelURLs{{URL: upstream.URL, Protocols: []string{"codex"}}},
+		Priority:     1,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5.6-sol"}},
+		Enabled:      true,
+	}, "sk-test", &testutil.TestChannelRequest{
+		Model:          "gpt-5.6-sol",
+		ClientProtocol: "codex",
+		Content:        "hello",
+		Stream:         true,
+	})
+
+	if success, _ := result["success"].(bool); success {
+		t.Fatalf("Responses metadata must not count as valid content, result=%+v", result)
+	}
+	if statusCode, _ := getResultInt(result["status_code"]); statusCode != util.StatusFirstByteTimeout {
+		t.Fatalf("status_code=%d, want %d, result=%+v", statusCode, util.StatusFirstByteTimeout, result)
+	}
+	if _, ok := result["first_byte_duration_ms"]; ok {
+		t.Fatalf("Responses metadata must not set first_byte_duration_ms, result=%+v", result)
+	}
+}
+
 func TestTestChannelAPI_StreamFirstValidContentTimeoutEOFReturns598(t *testing.T) {
 	srv := newInMemoryServer(t)
 	srv.firstByteTimeout = 10 * time.Millisecond
@@ -2327,7 +2426,7 @@ func TestHandleChannelTest_AntigravityCapacityUsesProviderFallbackPolicy(t *test
 	if got, _ := resp.Data["response_text"].(string); got != "fallback test answer" {
 		t.Fatalf("response_text=%q data=%+v", got, resp.Data)
 	}
-	if got, _ := resp.Data["retry_strategy"].(string); got != "模型容量重试 1 次" {
+	if got, _ := resp.Data["retry_strategy"].(string); got != "model_capacity_retry_1" {
 		t.Fatalf("retry_strategy=%q data=%+v", got, resp.Data)
 	}
 
@@ -2370,7 +2469,7 @@ func TestHandleChannelTest_AntigravityCapacityExhaustionAppliesCooldownOnce(t *t
 	if got, _ := resp.Data["status_code"].(float64); got != http.StatusTooManyRequests {
 		t.Fatalf("status_code=%v data=%+v", resp.Data["status_code"], resp.Data)
 	}
-	if got, _ := resp.Data["retry_strategy"].(string); got != "模型容量重试 1 次" {
+	if got, _ := resp.Data["retry_strategy"].(string); got != "model_capacity_retry_1" {
 		t.Fatalf("retry_strategy=%q data=%+v", got, resp.Data)
 	}
 	if got := calls.Load(); got != 2 {
@@ -5571,5 +5670,179 @@ func TestHandleChannelImageGeneration_ClassifiesHTTP200StructuredError(t *testin
 	}
 	if fallbackCalls.Load() != 0 {
 		t.Fatalf("key-scoped structured error fell back to another URL %d times", fallbackCalls.Load())
+	}
+}
+
+// TestDownstreamEndpointPath 锁住渠道基础 URL 带子路径时的端点还原：协议族谓词
+// 判定的是下游端点，拿上游完整路径去判定会让 ZCode 这类渠道的指纹路径整体失效。
+func TestDownstreamEndpointPath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		fullURL string
+		baseURL string
+		want    string
+	}{
+		{
+			name:    "zcode base url carries a sub path",
+			fullURL: "https://zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages?beta=true",
+			baseURL: "https://zcode.z.ai/api/v1/ultra-zai/anthropic",
+			want:    "/v1/messages",
+		},
+		{
+			name:    "plain base url",
+			fullURL: "https://api.anthropic.com/v1/messages?beta=true",
+			baseURL: "https://api.anthropic.com",
+			want:    "/v1/messages",
+		},
+		{
+			name:    "base url with trailing slash",
+			fullURL: "https://gw.example.test/claude/v1/messages",
+			baseURL: "https://gw.example.test/claude/",
+			want:    "/v1/messages",
+		},
+		{
+			name:    "xai base url already ends with /v1",
+			fullURL: "https://cli-chat-proxy.grok.com/v1/v1/responses",
+			baseURL: "https://cli-chat-proxy.grok.com/v1",
+			want:    "/v1/responses",
+		},
+		{
+			name:    "exact url is the endpoint itself",
+			fullURL: "https://chatgpt.com/backend-api/codex/responses",
+			baseURL: "https://chatgpt.com/backend-api/codex/responses#",
+			want:    "/backend-api/codex/responses",
+		},
+		{
+			name:    "base url path is not a prefix",
+			fullURL: "https://api.example.test/v1/messages",
+			baseURL: "https://other.example.test/mismatch",
+			want:    "/v1/messages",
+		},
+		{
+			name:    "base path /v1 does not steal /v1beta",
+			fullURL: "https://host.example.test/v1beta/models/x:generateContent",
+			baseURL: "https://host.example.test/v1",
+			want:    "/v1beta/models/x:generateContent",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := downstreamEndpointPath(test.fullURL, test.baseURL); got != test.want {
+				t.Fatalf("downstreamEndpointPath(%q, %q) = %q, want %q",
+					test.fullURL, test.baseURL, got, test.want)
+			}
+		})
+	}
+}
+
+func TestAdminTestZAICodingPlanEmitsZCodeWireContract(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := newZAITestChannel()
+	cfg.ModelEntries = []model.ModelEntry{{Model: "glm-4.7"}}
+	testReq := &testutil.TestChannelRequest{
+		Model: "glm-4.7", Content: "hello", ClientProtocol: util.ProtocolAnthropic,
+	}
+
+	cfgForBuild, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "key-id.secret", testReq, util.ProtocolAnthropic, util.ProtocolAnthropic, zaiauth.CodingPlanProxyBaseURL,
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	if plan.endpointPath != "/v1/messages" {
+		t.Fatalf("endpointPath = %q, want /v1/messages after stripping the ZCode base path", plan.endpointPath)
+	}
+	identity := decodeZAIRequestIdentity(t, plan.requestBody)
+	if identity.DeviceID != cfg.ZAIDeviceID {
+		t.Fatalf("metadata.user_id device = %q, want ZCode fingerprint %q", identity.DeviceID, cfg.ZAIDeviceID)
+	}
+
+	req, cancel, err := srv.newTestUpstreamRequest(context.Background(), cfgForBuild, testReq, plan)
+	if err != nil {
+		t.Fatalf("newTestUpstreamRequest: %v", err)
+	}
+	defer cancel()
+
+	if got := headerValueFold(req.Header, "x-api-key"); got != "key-id.secret" {
+		t.Fatalf("x-api-key = %q", got)
+	}
+	if got := headerValueFold(req.Header, "User-Agent"); got != "ZCode/"+zaiauth.AppVersion {
+		t.Fatalf("User-Agent = %q, want ZCode identity", got)
+	}
+	if got := headerValueFold(req.Header, "x-session-id"); got == "" {
+		t.Fatal("x-session-id missing")
+	}
+	if got := headerValueFold(req.Header, "Authorization"); got != "" {
+		t.Fatalf("Authorization = %q, ZCode authenticates with x-api-key only", got)
+	}
+}
+
+func TestAdminTestNativeAnthropicDoesNotDoubleAppendHeaderRules(t *testing.T) {
+	srv := newInMemoryServer(t)
+	credentialJSON, err := (&anthropicauth.Credential{
+		Type: anthropicauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired: "2030-01-01T00:00:00Z", AccountUUID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := anthropicauth.ParseCredential([]byte(credentialJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "11111111-2222-4333-8444-555555555555"
+	userID := fmt.Sprintf(`{"device_id":%q,"account_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","session_id":%q}`,
+		credential.DeviceID, sessionID)
+	const helperBetas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+	cfg := &model.Config{
+		AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://api.anthropic.com"}},
+		CustomRequestRules: &model.CustomRequestRules{Headers: []model.CustomHeaderRule{
+			{Action: model.RuleActionAppend, Name: "Anthropic-Beta", Value: "context-1m-2025-08-07"},
+		}},
+	}
+	plan := &channelTestRequestPlan{
+		upstreamProtocol: util.ProtocolAnthropic,
+		apiKey:           "oauth-access",
+		fullURL:          "https://api.anthropic.com/v1/messages",
+		endpointPath:     "/v1/messages",
+		requestBody: []byte(fmt.Sprintf(
+			`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"helper probe"}],"metadata":{"user_id":%q}}`,
+			userID,
+		)),
+		headers: http.Header{
+			"Accept": {"application/json"}, "Accept-Encoding": {"gzip"}, "Content-Type": {"application/json"},
+			"User-Agent": {"claude-cli/2.1.220 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {helperBetas},
+			"Anthropic-Version": {"2023-06-01"}, "Anthropic-Dangerous-Direct-Browser-Access": {"true"},
+			"X-Claude-Code-Session-Id": {sessionID}, "X-Client-Request-Id": {"66666666-7777-4888-8999-aaaaaaaaaaaa"},
+			"X-Stainless-Lang": {"js"}, "X-Stainless-Runtime": {"node"}, "X-Stainless-Package-Version": {"0.94.0"},
+			"X-Stainless-Runtime-Version": {"v26.3.0"}, "X-Stainless-OS": {"MacOS"}, "X-Stainless-Arch": {"arm64"},
+			"X-Stainless-Retry-Count": {"0"}, "X-Stainless-Timeout": {"600"},
+		},
+	}
+
+	req, cancel, err := srv.newTestUpstreamRequest(context.Background(), cfg, &testutil.TestChannelRequest{Model: "claude-haiku-4-5-20251001"}, plan)
+	if err != nil {
+		t.Fatalf("newTestUpstreamRequest: %v", err)
+	}
+	defer cancel()
+
+	var betaValues []string
+	for name, values := range req.Header {
+		if strings.EqualFold(name, "anthropic-beta") {
+			betaValues = append(betaValues, values...)
+		}
+	}
+	betas := strings.Join(betaValues, ", ")
+	if !strings.Contains(betas, helperBetas) {
+		t.Fatalf("anthropic-beta = %q, want the native helper profile preserved", betas)
+	}
+	if strings.Contains(betas, "claude-code-20250219") {
+		t.Fatalf("anthropic-beta = %q, helper request was rebuilt as a cloaked CLI fingerprint", betas)
+	}
+	if strings.Count(betas, "context-1m-2025-08-07") != 1 {
+		t.Fatalf("anthropic-beta = %q, append rule must not run twice on the native admin-test path", betas)
 	}
 }

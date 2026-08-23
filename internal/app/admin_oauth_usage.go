@@ -18,13 +18,17 @@ import (
 	"ccLoad/internal/antigravityauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/xaiauth"
+	"ccLoad/internal/zaiauth"
 
 	"github.com/gin-gonic/gin"
 )
 
 const (
 	codexUsageURL              = "https://chatgpt.com/backend-api/wham/usage"
+	codexResetCreditsURL       = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+	codexResetCreditConsumeURL = codexResetCreditsURL + "/consume"
 	codexUsageUserAgent        = codexUserAgent
 	anthropicUsageUserAgent    = "claude-code/" + anthropicCLIVersion
 	antigravityUsageURL        = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
@@ -39,6 +43,7 @@ const (
 
 var (
 	errOAuthUsageUnsupported         = errors.New("usage: channel does not use a supported OAuth provider")
+	errZAIUsageManagerUnavailable    = errors.New("usage: Z.ai credential manager is unavailable")
 	errCodexUsageManagerUnavailable  = errors.New("usage: Codex credential manager is unavailable")
 	errAnthropicManagerUnavailable   = errors.New("usage: Anthropic credential manager is unavailable")
 	errAntigravityManagerUnavailable = errors.New("usage: Antigravity credential manager is unavailable")
@@ -111,9 +116,10 @@ type codexAdditionalRateLimit struct {
 }
 
 type codexUsagePayload struct {
-	PlanType             string                     `json:"plan_type"`
-	RateLimit            *codexUsageRateLimit       `json:"rate_limit"`
-	AdditionalRateLimits []codexAdditionalRateLimit `json:"additional_rate_limits"`
+	PlanType              string                     `json:"plan_type"`
+	RateLimit             *codexUsageRateLimit       `json:"rate_limit"`
+	AdditionalRateLimits  []codexAdditionalRateLimit `json:"additional_rate_limits"`
+	RateLimitResetCredits *codexQuotaResetCredits    `json:"rate_limit_reset_credits"`
 }
 
 type anthropicUsageRawWindow struct {
@@ -175,16 +181,20 @@ type oauthUsageWindow struct {
 	RemainingPercent   float64 `json:"remaining_percent"`
 	LimitWindowSeconds int64   `json:"limit_window_seconds"`
 	ResetAt            int64   `json:"reset_at"`
+	// StandardCostMicroUSD 是该窗口自身的累计标准成本，仅在响应中内联，不入持久化快照。
+	StandardCostMicroUSD *int64 `json:"standard_cost_microusd,omitempty"`
 }
 
 type oauthUsageSummary struct {
-	Provider          string             `json:"provider"`
-	PlanType          string             `json:"plan_type,omitempty"`
-	SubscriptionTier  string             `json:"subscription_tier,omitempty"`
-	EntitlementStatus string             `json:"entitlement_status,omitempty"`
-	Windows           []oauthUsageWindow `json:"windows"`
-	Warnings          []string           `json:"warnings,omitempty"`
-	XAIBilling        *xaiBillingSummary `json:"xai_billing,omitempty"`
+	Provider              string                  `json:"provider"`
+	PlanType              string                  `json:"plan_type,omitempty"`
+	SubscriptionTier      string                  `json:"subscription_tier,omitempty"`
+	EntitlementStatus     string                  `json:"entitlement_status,omitempty"`
+	Windows               []oauthUsageWindow      `json:"windows"`
+	RateLimitResetCredits *codexQuotaResetCredits `json:"rate_limit_reset_credits,omitempty"`
+	Warnings              []string                `json:"warnings,omitempty"`
+	XAIBilling            *xaiBillingSummary      `json:"xai_billing,omitempty"`
+	QuotaCostUsage        *oauthcost.Usage        `json:"quota_cost_usage,omitempty"`
 }
 
 type persistedOAuthUsageSnapshot struct {
@@ -653,14 +663,34 @@ func requestCodexUsage(ctx context.Context, client *http.Client, credential *cod
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, errors.New("usage: Codex response is invalid")
 	}
-	return normalizeCodexUsage(&payload, credential.PlanType)
+	summary, err := normalizeCodexUsage(&payload, credential.PlanType)
+	if err != nil {
+		return nil, err
+	}
+	resetCredits, resetErr := requestCodexResetCredits(ctx, client, credential, time.Now())
+	if resetErr != nil {
+		summary.RateLimitResetCredits = cloneCodexQuotaResetCredits(payload.RateLimitResetCredits)
+		return summary, nil
+	}
+	summary.RateLimitResetCredits = resetCredits
+	return summary, nil
 }
 
 func newCodexUsageRequest(ctx context.Context, credential *codexauth.Credential) (*http.Request, error) {
+	return newCodexQuotaRequest(ctx, http.MethodGet, codexUsageURL, nil, credential)
+}
+
+func newCodexQuotaRequest(
+	ctx context.Context,
+	method string,
+	target string,
+	body io.Reader,
+	credential *codexauth.Credential,
+) (*http.Request, error) {
 	if credential == nil || strings.TrimSpace(credential.AccessToken) == "" {
 		return nil, errors.New("usage: Codex request is unavailable")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexUsageURL, nil)
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		return nil, err
 	}
@@ -668,6 +698,8 @@ func newCodexUsageRequest(ctx context.Context, credential *codexauth.Credential)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", codexUsageUserAgent)
+	req.Header.Set("OpenAI-Beta", "codex-1")
+	req.Header.Set("Originator", codexOriginator)
 	if credential.AccountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", credential.AccountID)
 	}
@@ -1285,7 +1317,8 @@ func oauthUsageHTTPStatus(err error) int {
 	case errors.Is(err, errCodexUsageManagerUnavailable),
 		errors.Is(err, errAnthropicManagerUnavailable),
 		errors.Is(err, errAntigravityManagerUnavailable),
-		errors.Is(err, errXAIUsageManagerUnavailable):
+		errors.Is(err, errXAIUsageManagerUnavailable),
+		errors.Is(err, errZAIUsageManagerUnavailable):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, errOAuthUsagePersistFailed):
 		return http.StatusInternalServerError
@@ -1347,14 +1380,6 @@ func (s *Server) persistOAuthUsage(
 	if s == nil || s.store == nil || cfg == nil || summary == nil {
 		return nil, errors.New("OAuth usage persistence is unavailable")
 	}
-	snapshot, err := json.Marshal(persistedOAuthUsageSnapshot{
-		RequestedAt: requestedAt.UTC().Format(time.RFC3339Nano),
-		SampledAt:   sampledAt.UTC().Format(time.RFC3339Nano),
-		Summary:     *summary,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("encode OAuth usage snapshot: %w", err)
-	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1365,64 +1390,32 @@ func (s *Server) persistOAuthUsage(
 			return nil, fmt.Errorf("reload OAuth credential: %w", err)
 		}
 
-		var authType string
-		var payload string
-		switch {
-		case currentCfg.UsesCodexOAuth() && summary.Provider == codexauth.ChannelType:
-			authType = model.AuthTypeCodexOAuth
-			credential, parseErr := codexauth.ParseCredential([]byte(currentCfg.OAuthCredential))
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			if persisted, ok := s.currentOAuthUsageAtOrAfter(
-				currentCfg.ID, credential.OAuthUsage, summary.Provider, requestedAt,
-			); ok {
-				return persisted, nil
-			}
-			credential.OAuthUsage = append(json.RawMessage(nil), snapshot...)
-			payload, err = credential.JSON()
-		case currentCfg.UsesAnthropicOAuth() && summary.Provider == anthropicauth.ChannelType:
-			authType = model.AuthTypeAnthropicOAuth
-			credential, parseErr := anthropicauth.ParseCredential([]byte(currentCfg.OAuthCredential))
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			if persisted, ok := s.currentOAuthUsageAtOrAfter(
-				currentCfg.ID, credential.OAuthUsage, summary.Provider, requestedAt,
-			); ok {
-				return persisted, nil
-			}
-			credential.OAuthUsage = append(json.RawMessage(nil), snapshot...)
-			payload, err = credential.JSON()
-		case currentCfg.UsesAntigravityOAuth() && summary.Provider == antigravityauth.ChannelType:
-			authType = model.AuthTypeAntigravityOAuth
-			credential, parseErr := antigravityauth.ParseCredential([]byte(currentCfg.OAuthCredential))
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			if persisted, ok := s.currentOAuthUsageAtOrAfter(
-				currentCfg.ID, credential.OAuthUsage, summary.Provider, requestedAt,
-			); ok {
-				return persisted, nil
-			}
-			credential.OAuthUsage = append(json.RawMessage(nil), snapshot...)
-			payload, err = credential.JSON()
-		case currentCfg.UsesXAIOAuth() && summary.Provider == xaiauth.ChannelType:
-			authType = model.AuthTypeXAIOAuth
-			credential, parseErr := xaiauth.ParseCredential([]byte(currentCfg.OAuthCredential))
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			if persisted, ok := s.currentOAuthUsageAtOrAfter(
-				currentCfg.ID, credential.OAuthUsage, summary.Provider, requestedAt,
-			); ok {
-				return persisted, nil
-			}
-			credential.OAuthUsage = append(json.RawMessage(nil), snapshot...)
-			payload, err = credential.JSON()
-		default:
+		state, err := parseOAuthUsageCredentialState(currentCfg)
+		if err != nil {
+			return nil, err
+		}
+		if state.provider != summary.Provider {
 			return nil, errors.New("OAuth credential changed provider while persisting usage")
 		}
+		persisted, _, persistedRequestAt := persistedOAuthUsage(state.oauthUsage, summary.Provider)
+		if persisted != nil && !persistedRequestAt.Before(requestedAt) {
+			s.invalidateOAuthCredential(currentCfg.ID, summary.Provider)
+			s.InvalidateChannelListCache()
+			return attachOAuthQuotaCostUsage(persisted, state.quotaCostUsage), nil
+		}
+
+		nextQuotaCostUsage := reconcileOAuthQuotaCostUsage(state.quotaCostUsage, summary, sampledAt)
+		storedSummary := *summary
+		storedSummary.QuotaCostUsage = nil
+		snapshot, err := json.Marshal(persistedOAuthUsageSnapshot{
+			RequestedAt: requestedAt.UTC().Format(time.RFC3339Nano),
+			SampledAt:   sampledAt.UTC().Format(time.RFC3339Nano),
+			Summary:     storedSummary,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode OAuth usage snapshot: %w", err)
+		}
+		payload, err := state.encode(snapshot, nextQuotaCostUsage)
 		if err != nil {
 			return nil, err
 		}
@@ -1430,7 +1423,7 @@ func (s *Server) persistOAuthUsage(
 			return nil, errors.New("OAuth credential exceeds persistence limit")
 		}
 		updated, err := s.store.CompareAndSwapOAuthCredential(
-			ctx, currentCfg.ID, authType, currentCfg.OAuthCredential, payload,
+			ctx, currentCfg.ID, state.authType, currentCfg.OAuthCredential, payload,
 		)
 		if err != nil {
 			return nil, err
@@ -1441,7 +1434,7 @@ func (s *Server) persistOAuthUsage(
 
 		s.invalidateOAuthCredential(currentCfg.ID, summary.Provider)
 		s.InvalidateChannelListCache()
-		return summary, nil
+		return attachOAuthQuotaCostUsage(summary, nextQuotaCostUsage), nil
 	}
 }
 
@@ -1477,21 +1470,6 @@ func persistedOAuthUsage(raw json.RawMessage, provider string) (*oauthUsageSumma
 	return &snapshot.Summary, sampledAt, requestedAt
 }
 
-func (s *Server) currentOAuthUsageAtOrAfter(
-	channelID int64,
-	raw json.RawMessage,
-	provider string,
-	requestedAt time.Time,
-) (*oauthUsageSummary, bool) {
-	persisted, _, persistedRequestAt := persistedOAuthUsage(raw, provider)
-	if persisted == nil || persistedRequestAt.Before(requestedAt) {
-		return nil, false
-	}
-	s.invalidateOAuthCredential(channelID, provider)
-	s.InvalidateChannelListCache()
-	return persisted, true
-}
-
 func latestOAuthUsage(
 	active *oauthUsageSummary,
 	activeSampledAt time.Time,
@@ -1506,7 +1484,9 @@ func latestOAuthUsage(
 	}
 	passiveTime, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(passiveSampledAt))
 	if err == nil && passiveTime.After(activeSampledAt) {
-		return passive
+		merged := *passive
+		merged.RateLimitResetCredits = cloneCodexQuotaResetCredits(active.RateLimitResetCredits)
+		return &merged
 	}
 	return active
 }
@@ -1583,7 +1563,65 @@ func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oau
 			}
 		}
 		return nil, errors.New("usage: xAI credential was rejected")
+	case cfg.UsesZAIOAuth():
+		if s.zaiCredentials == nil {
+			return nil, errZAIUsageManagerUnavailable
+		}
+		credential, err := s.zaiCredentials.credential(ctx, cfg, false)
+		if err != nil {
+			return nil, oauthUsageCredentialRefreshError(err, "usage: Z.ai credential refresh failed")
+		}
+		return requestZAIUsage(ctx, s.zaiUsageService(cfg), credential.APIKey)
 	default:
 		return nil, errOAuthUsageUnsupported
 	}
+}
+
+// zaiUsageService reuses the channel's transport so a channel proxy applies to
+// quota reads too.
+func (s *Server) zaiUsageService(cfg *model.Config) *zaiauth.Service {
+	service := zaiauth.NewService(s.getClientForChannel(cfg))
+	if s.zaiService != nil {
+		service.QuotaLimitURL = s.zaiService.QuotaLimitURL
+	}
+	return service
+}
+
+// requestZAIUsage reads the Coding Plan allowance windows.
+func requestZAIUsage(ctx context.Context, service *zaiauth.Service, apiKey string) (*oauthUsageSummary, error) {
+	limits, err := service.FetchQuotaLimits(ctx, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("usage: Z.ai quota request failed: %w", err)
+	}
+	return normalizeZAIUsage(limits)
+}
+
+// normalizeZAIUsage projects the Coding Plan windows onto ccLoad's summary.
+// Upstream reports a consumed percentage per window and no token counts, so the
+// summary carries percentages only.
+func normalizeZAIUsage(limits []zaiauth.QuotaLimit) (*oauthUsageSummary, error) {
+	summary := &oauthUsageSummary{
+		Provider: zaiauth.ChannelType,
+		PlanType: zaiCodingPlanName,
+		Windows:  make([]oauthUsageWindow, 0, len(limits)),
+	}
+	for _, limit := range limits {
+		usedPercent := min(max(limit.UsedPercent, 0), 100)
+		resetAt := int64(0)
+		if limit.ResetAtMillis > 0 {
+			resetAt = limit.ResetAtMillis / 1000
+		}
+		summary.Windows = append(summary.Windows, oauthUsageWindow{
+			LimitName:          limit.Name(),
+			Kind:               string(limit.Kind()),
+			UsedPercent:        usedPercent,
+			RemainingPercent:   100 - usedPercent,
+			LimitWindowSeconds: limit.WindowSeconds(),
+			ResetAt:            resetAt,
+		})
+	}
+	if len(summary.Windows) == 0 {
+		return nil, errors.New("usage: Z.ai response has no quota windows")
+	}
+	return summary, nil
 }

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -706,12 +707,9 @@ func (s *codexUpstreamWebsocketSession) writeRequest(conn *websocket.Conn, body 
 }
 
 func isCodexWebsocketSemanticEvent(eventType string) bool {
-	switch eventType {
-	case "", "response.created", "response.queued", "response.in_progress":
-		return false
-	default:
-		return true
-	}
+	// eventType != "" 不能省：isResponsesMetadataEvent("") == false，
+	// 省掉后未解析出 type 的 WS 帧会被当成语义输出。
+	return eventType != "" && !isResponsesMetadataEvent(eventType)
 }
 
 func isCodexWebsocketTerminalEvent(eventType string) bool {
@@ -1168,13 +1166,22 @@ func (b *codexWebsocketResponseBody) Close() error {
 }
 
 func writeSyntheticSSEFrame(w io.Writer, payload []byte) error {
-	if _, err := w.Write([]byte("data: ")); err != nil {
+	payload = bytes.ReplaceAll(payload, []byte("\r\n"), []byte("\n"))
+	payload = bytes.TrimRight(payload, "\n")
+	if len(payload) == 0 {
+		_, err := w.Write([]byte("data: \n\n"))
 		return err
 	}
-	if _, err := w.Write(payload); err != nil {
-		return err
+	var buf bytes.Buffer
+	lines := bytes.Split(payload, []byte("\n"))
+	buf.Grow(len(payload) + len(lines)*len("data: ") + 2)
+	for _, line := range lines {
+		buf.WriteString("data: ")
+		buf.Write(line)
+		buf.WriteByte('\n')
 	}
-	_, err := w.Write([]byte("\n\n"))
+	buf.WriteByte('\n')
+	_, err := w.Write(buf.Bytes())
 	return err
 }
 
@@ -1239,6 +1246,7 @@ func (s *codexUpstreamWebsocketSession) streamResponse(
 
 		semanticOutput := false
 		retried := false
+		missingStoredItemRetries := 0
 		for {
 			event, errNext := s.nextRead(ctx, conn)
 			if errNext != nil || event.err != nil {
@@ -1295,6 +1303,27 @@ func (s *codexUpstreamWebsocketSession) streamResponse(
 				}
 				_ = writer.CloseWithError(errRetry)
 				return
+			}
+			if !semanticOutput && ctx.Err() == nil &&
+				missingStoredItemRetries < responsesMissingStoredItemRetryLimit {
+				if retryReplay, ok := codexWebsocketMissingStoredInputRetryBody(replayBody, payload); ok {
+					missingStoredItemRetries++
+					s.invalidate(conn)
+					s.recordReconnect("missing_stored_input_item")
+					connRetry, retryHeaders, errRetry := s.reconnectWithReplay(
+						ctx, dialer, target, replayReq, retryReplay, timeouts,
+					)
+					if errRetry == nil {
+						if onReconnectHandshake != nil && len(retryHeaders) > 0 {
+							onReconnectHandshake(retryHeaders)
+						}
+						conn = connRetry
+						replayBody = retryReplay
+						continue
+					}
+					_ = writer.CloseWithError(errRetry)
+					return
+				}
 			}
 			if isCodexWebsocketTerminalEvent(eventType) {
 				// The HTTP/SSE consumer may stop reading as soon as it sees the

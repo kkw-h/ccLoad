@@ -19,6 +19,7 @@ const {
   getOAuthUsageState,
   refreshOAuthUsage,
   refreshOAuthUsageBatch,
+  resetCodexQuota,
   batchRefreshSelectedOAuthUsage,
   refreshOAuthCredential,
   renderOAuthCredential,
@@ -50,6 +51,7 @@ test('OAuth credential cleanup resumes its SSE stream without restarting the des
     const result = await cleanupOAuthCredentials(
       'codex_oauth',
       'gpt-test',
+      'delete',
       async (url, options) => {
         requests.push({ url, options });
         if (url === '/admin/oauth/credentials/cleanup/jobs') {
@@ -126,7 +128,7 @@ test('OAuth credential cleanup resumes its SSE stream without restarting the des
     );
 
     assert.deepEqual(result, {
-      healthy: 1, refreshed: 0, deleted: 1, failed: 0, skipped: 0, total: 2
+      healthy: 1, refreshed: 0, disabled: 0, deleted: 1, failed: 0, skipped: 0, total: 2
     });
     const starts = requests.filter(request => request.url === '/admin/oauth/credentials/cleanup/jobs');
     assert.equal(starts.length, 3);
@@ -136,7 +138,8 @@ test('OAuth credential cleanup resumes its SSE stream without restarting the des
     for (const start of starts) {
       assert.deepEqual(JSON.parse(start.options.body), {
         auth_type: 'codex_oauth',
-        model: 'gpt-test'
+        model: 'gpt-test',
+        action: 'delete'
       });
     }
     assert.equal(terminalReads, 1);
@@ -157,6 +160,7 @@ test('OAuth credential cleanup does not start after another cleanup reports busy
       cleanupOAuthCredentials(
         'anthropic_oauth',
         'claude-sonnet-4',
+        'disable',
         async () => {
           requests++;
           return {
@@ -185,6 +189,7 @@ test('OAuth credential cleanup resolves cancelled SSE with partial progress', as
     const result = await cleanupOAuthCredentials(
       'xai_oauth',
       'grok-4',
+      'disable',
       async url => {
         if (url === '/admin/oauth/credentials/cleanup/jobs') {
           return {
@@ -217,6 +222,7 @@ test('OAuth credential cleanup resolves cancelled SSE with partial progress', as
     assert.deepEqual(result, {
       healthy: 1,
       refreshed: 0,
+      disabled: 0,
       deleted: 0,
       failed: 0,
       skipped: 0,
@@ -238,6 +244,7 @@ test('OAuth credential cleanup follows SSE without waiting for a lost stop respo
     const result = await cleanupOAuthCredentials(
       'codex_oauth',
       'gpt-5',
+      'disable',
       async url => {
         if (url === '/admin/oauth/credentials/cleanup/jobs') {
           return {
@@ -303,6 +310,110 @@ test('OAuth credential cleanup cancellation retries a lost successful response',
     assert.equal(requests[0].options.method, 'POST');
   } finally {
     global.window = previousWindow;
+  }
+});
+
+test('completed OAuth credential cleanup keeps a valid model selected and can start again', async () => {
+  const previous = new Map();
+  const setGlobal = (key, value) => {
+    previous.set(key, Object.getOwnPropertyDescriptor(global, key));
+    Object.defineProperty(global, key, { configurable: true, writable: true, value });
+  };
+  const makeTarget = properties => ({
+    dataset: {}, listeners: {},
+    addEventListener(type, listener) { this.listeners[type] = listener; },
+    removeAttribute(name) { delete this[name]; },
+    setAttribute(name, value) { this[name] = value; },
+    ...properties
+  });
+  const form = makeTarget({});
+  const label = { dataset: {}, textContent: '' };
+  const button = makeTarget({
+    disabled: false,
+    querySelector() { return label; }
+  });
+  const authType = makeTarget({
+    value: 'codex_oauth',
+    disabled: false,
+    selectedOptions: [{ textContent: 'Codex' }]
+  });
+  const model = makeTarget({
+    value: 'gpt-test',
+    disabled: false,
+    options: [{ value: '' }, { value: 'gpt-test' }],
+    replaceChildren(...options) { this.options = options; },
+    focus() {}
+  });
+  const action = makeTarget({ value: 'disable', disabled: false });
+  const results = {
+    children: [],
+    append(item) { this.children.push(item); },
+    replaceChildren() { this.children = []; }
+  };
+  const elements = new Map([
+    ['oauthCredentialCleanupForm', form],
+    ['oauthCredentialCleanupBtn', button],
+    ['oauthCredentialCleanupAuthType', authType],
+    ['oauthCredentialCleanupModel', model],
+    ['oauthCredentialCleanupAction', action],
+    ['oauthCredentialCleanupProgress', { hidden: true, dataset: {} }],
+    ['oauthCredentialCleanupProgressBar', { max: 1, value: 0 }],
+    ['oauthCredentialCleanupProgressCounter', { textContent: '' }],
+    ['oauthCredentialCleanupProgressDetail', { textContent: '' }],
+    ['oauthCredentialCleanupProgressCounts', { textContent: '' }],
+    ['oauthCredentialCleanupResults', results]
+  ]);
+  let starts = 0;
+  setGlobal('document', {
+    getElementById: id => elements.get(id) || null,
+    querySelectorAll: () => [],
+    createElement: () => ({ value: '', textContent: '' })
+  });
+  setGlobal('window', {
+    t: key => key,
+    confirm: () => true,
+    showSuccess() {},
+    showError() {}
+  });
+  setGlobal('fetchDataWithAuth', async () => ({ models: ['gpt-test'] }));
+  setGlobal('fetchWithAuth', async url => {
+    if (url === '/admin/oauth/credentials/cleanup/jobs') {
+      starts++;
+      return {
+        ok: true,
+        status: 202,
+        async text() {
+          return JSON.stringify({ success: true, data: { job_id: `cleanup-${starts}`, total: 1 } });
+        }
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return 'event: complete\ndata: {"event":"complete","sequence":1,"processed":1,"total":1,"healthy":1,"status":"succeeded"}\n\n';
+      }
+    };
+  });
+  setGlobal('reloadChannelsList', async () => {});
+
+  try {
+    setupOAuthActions();
+    authType.listeners.change();
+    await new Promise(resolve => setImmediate(resolve));
+    await form.listeners.submit({ preventDefault() {} });
+
+    assert.equal(model.value, 'gpt-test');
+    assert.equal(model.disabled, false);
+    assert.equal(button.disabled, false);
+
+    await form.listeners.submit({ preventDefault() {} });
+    assert.equal(starts, 2);
+  } finally {
+    for (const [key, descriptor] of previous) {
+      if (descriptor === undefined) delete global[key];
+      else Object.defineProperty(global, key, descriptor);
+    }
   }
 });
 
@@ -1630,6 +1741,80 @@ test('failed OAuth usage refresh remains retryable', async () => {
     assert.deepEqual(getOAuthUsageState(43), { status: 'error', error: 'quota unavailable' });
   } finally {
     global.filterChannels = previousFilterChannels;
+  }
+});
+
+test('Codex quota reset preserves current usage while consuming and replaces it with refreshed usage', async () => {
+  const previousFilterChannels = global.filterChannels;
+  const previousWindow = global.window;
+  global.filterChannels = () => {};
+  global.window = { t: key => key };
+  try {
+    const currentUsage = {
+      provider: 'codex',
+      windows: [{ limit_name: 'codex', remaining_percent: 0 }],
+      rate_limit_reset_credits: {
+        available_count: 1,
+        credits: [{ expires_at: '2099-01-03T04:05:06Z' }]
+      }
+    };
+    await refreshOAuthUsage(44, async () => currentUsage, { reload: false });
+
+    let resolveReset;
+    let captured;
+    const resetPromise = resetCodexQuota(44, (url, options) => {
+      captured = { url, options };
+      return new Promise(resolve => { resolveReset = resolve; });
+    }, { reload: false });
+    assert.deepEqual(getOAuthUsageState(44), {
+      status: 'ready', data: currentUsage, reset_status: 'loading', reset_error: ''
+    });
+
+    const refreshedUsage = {
+      provider: 'codex',
+      windows: [{ limit_name: 'codex', remaining_percent: 100 }],
+      rate_limit_reset_credits: { available_count: 0 }
+    };
+    resolveReset({ reset: true, usage: refreshedUsage });
+    const result = await resetPromise;
+    assert.deepEqual(captured, {
+      url: '/admin/channels/44/codex-quota-reset',
+      options: { method: 'POST' }
+    });
+    assert.equal(result.usage.windows[0].remaining_percent, 100);
+    assert.deepEqual(getOAuthUsageState(44), {
+      status: 'ready', data: refreshedUsage, reset_status: 'ready'
+    });
+  } finally {
+    global.filterChannels = previousFilterChannels;
+    global.window = previousWindow;
+  }
+});
+
+test('failed Codex quota reset keeps the last good usage and remains retryable', async () => {
+  const previousFilterChannels = global.filterChannels;
+  const previousWindow = global.window;
+  global.filterChannels = () => {};
+  global.window = { t: key => key };
+  try {
+    const currentUsage = {
+      provider: 'codex', windows: [],
+      rate_limit_reset_credits: { available_count: 1 }
+    };
+    await refreshOAuthUsage(45, async () => currentUsage, { reload: false });
+    await assert.rejects(
+      resetCodexQuota(45, async () => { throw new Error('consume unavailable'); }, { reload: false }),
+      /consume unavailable/
+    );
+    assert.deepEqual(getOAuthUsageState(45), {
+      status: 'ready',
+      data: currentUsage,
+      reset_status: 'error',
+      reset_error: 'consume unavailable'
+    });
+  } finally {
+    global.filterChannels = previousFilterChannels;
+    global.window = previousWindow;
   }
 });
 

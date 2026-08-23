@@ -426,23 +426,32 @@ func TestProxy_NativeAnthropicAPIKeyRebuildsAndNormalizesWire(t *testing.T) {
 	if got := upstreamHeaders.Get("User-Agent"); got != "claude-cli/2.1.220 (external, cli)" {
 		t.Fatalf("User-Agent=%q", got)
 	}
-	if got := headerValueFold(upstreamHeaders, "Anthropic-Beta"); strings.Contains(got, "oauth-2025-04-20") {
-		t.Fatalf("Anthropic-Beta=%q contains OAuth capability", got)
-	} else {
-		for _, required := range []string{
-			"claude-code-20250219", "advanced-tool-use-2025-11-20", "fast-mode-2026-02-01", "cache-diagnosis-2026-04-07",
-		} {
-			if !strings.Contains(got, required) {
-				t.Fatalf("Anthropic-Beta=%q missing %q", got, required)
-			}
+	betas := headerValueFold(upstreamHeaders, "Anthropic-Beta")
+	// 指纹只由「是不是 Claude Code CLI 线协议」决定，与凭证形态无关：API Key 渠道
+	// 同样声明 OAuth 三件套。
+	for _, required := range []string{
+		"claude-code-20250219", "oauth-2025-04-20", "fallback-credit-2026-06-01",
+		"advanced-tool-use-2025-11-20", "fast-mode-2026-02-01", "cache-diagnosis-2026-04-07",
+	} {
+		if !strings.Contains(betas, required) {
+			t.Fatalf("Anthropic-Beta=%q missing %q", betas, required)
 		}
+	}
+	// 调用方没声明 cache_control.ttl，网关不主动开 1h 窗口，也就不声明对应的 beta。
+	if strings.Contains(betas, "extended-cache-ttl-2025-04-11") {
+		t.Fatalf("Anthropic-Beta=%q declared extended cache TTL for a caller that never asked", betas)
 	}
 	if upstreamHeaders.Get("X-Claude-Code-Session-Id") != nativeSessionID || headerValueFold(upstreamHeaders, "x-client-request-id") == "" ||
 		upstreamHeaders.Get("X-Stainless-Runtime-Version") != "v26.3.0" {
 		t.Fatalf("Claude Code identity headers=%v", upstreamHeaders)
 	}
-	if got := gjson.GetBytes(upstreamBody, "system.1.text").String(); got != "keep this native prompt" {
-		t.Fatalf("native prompt=%q body=%s", got, upstreamBody)
+	// 下游 UA 不是 claude-cli，网关按 Claude Code CLI 指纹重写 body：system 换成
+	// 三段式 CLI 提示，调用方原本的 system 降级为 messages 前缀而不是被丢弃。
+	if got := gjson.GetBytes(upstreamBody, "system.1.text").String(); got != anthropicClaudeCodeIdentityPrompt {
+		t.Fatalf("CLI identity prompt=%q body=%s", got, upstreamBody)
+	}
+	if got := gjson.GetBytes(upstreamBody, "messages.0.content").String(); !strings.Contains(got, "keep this native prompt") {
+		t.Fatalf("caller system prompt was dropped: %s", upstreamBody)
 	}
 	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); strings.Contains(got, "cch=00000;") || !strings.Contains(got, " cch=") {
 		t.Fatalf("CCH was not rebuilt: %q", got)
@@ -456,16 +465,19 @@ func TestProxy_NativeAnthropicAPIKeyRebuildsAndNormalizesWire(t *testing.T) {
 		gjson.GetBytes(upstreamBody, "output_config.effort").String() != "medium" {
 		t.Fatalf("thinking was not normalized: %s", upstreamBody)
 	}
-	if gjson.GetBytes(upstreamBody, "messages.1.content.0.signature").Exists() ||
-		gjson.GetBytes(upstreamBody, "messages.1.content.0.type").String() != "tool_use" {
+	if gjson.GetBytes(upstreamBody, "messages.3.content.0.signature").Exists() ||
+		gjson.GetBytes(upstreamBody, "messages.3.content.0.type").String() != "tool_use" {
 		t.Fatalf("tool history provenance was not sanitized: %s", upstreamBody)
 	}
-	for _, path := range []string{
-		"tools.0.cache_control.type", "system.1.cache_control.type", "messages.0.content.0.cache_control.type",
-	} {
-		if got := gjson.GetBytes(upstreamBody, path).String(); got != "ephemeral" {
-			t.Fatalf("cache breakpoint %s=%q body=%s", path, got, upstreamBody)
-		}
+	// 断点落在 system 尾段与最后一条可缓存消息上；调用方没要 1h，两处都是默认 5m
+	// 窗口（无 ttl 字段），与 header 里缺席的 extended-cache-ttl beta 同源。
+	if !gjson.GetBytes(upstreamBody, "system.2.cache_control").Exists() ||
+		gjson.GetBytes(upstreamBody, "system.2.cache_control.ttl").Exists() {
+		t.Fatalf("system cache breakpoint=%s", upstreamBody)
+	}
+	if !gjson.GetBytes(upstreamBody, "messages.4.content.0.cache_control").Exists() ||
+		gjson.GetBytes(upstreamBody, "messages.4.content.0.cache_control.ttl").Exists() {
+		t.Fatalf("rolling cache breakpoint=%s", upstreamBody)
 	}
 }
 
@@ -538,13 +550,10 @@ func TestProxy_AnthropicCredentialsSeparateCodexThreads(t *testing.T) {
 				if _, err := uuid.Parse(request.sessionID); err != nil {
 					t.Fatalf("Anthropic session ID=%q, want UUID: %v", request.sessionID, err)
 				}
-				bodySessionID := anthropicSessionIDFromBody(request.body)
-				if test.authType == model.AuthTypeAnthropicOAuth {
-					if bodySessionID != request.sessionID {
-						t.Fatalf("OAuth body session=%q header session=%q body=%s", bodySessionID, request.sessionID, request.body)
-					}
-				} else if gjson.GetBytes(request.body, "metadata.user_id").Exists() {
-					t.Fatalf("API key converter fabricated metadata identity: %s", request.body)
+				// header 与 body 的会话身份必须同值，OAuth 与 API Key 同构：
+				// isNativeAnthropicClaudeCodeRequest 正是按这个等式识别原生请求。
+				if bodySessionID := anthropicSessionIDFromBody(request.body); bodySessionID != request.sessionID {
+					t.Fatalf("body session=%q header session=%q body=%s", bodySessionID, request.sessionID, request.body)
 				}
 			}
 		})
@@ -686,8 +695,22 @@ func TestProxy_AnthropicCompatibleGatewayOwnsLegacySystemTurns(t *testing.T) {
 	}
 }
 
-func TestProxy_NativeAnthropicPreservesExplicitCachePolicy(t *testing.T) {
+// TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy 守住原生 Claude Code
+// 请求的直通契约：调用方已经自带完整 CLI 指纹时，网关只重签 CCH，不重写 body。
+// 与 TestProxy_AnthropicOAuthPreservesNativePromptAcross400Retry 对称——直通判定
+// 看的是请求形态，不是凭证形态，API Key 渠道同样适用。
+func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 	t.Parallel()
+	const nativeSessionID = "e03895ad-8b34-4a84-bbf6-002e8909b17b"
+
+	identity, err := json.Marshal(map[string]string{
+		"device_id":    "3934be64e8c64eca962e5841b999eeebb24c7f889371b4d95306f39301f07bc9",
+		"account_uuid": "9b079a70-8780-5404-bbaf-d74217f5adfd",
+		"session_id":   nativeSessionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var upstreamBody []byte
 	env := setupProxyTestEnv(t, []testChannel{{
@@ -706,10 +729,14 @@ func TestProxy_NativeAnthropicPreservesExplicitCachePolicy(t *testing.T) {
 
 	response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
 		"model": "claude-sonnet-4-6",
-		"system": []any{map[string]any{
-			"type": "text", "text": "explicit cache only",
-			"cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"},
-		}},
+		"system": []any{
+			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=00000;"},
+			map[string]any{
+				"type": "text", "text": "explicit cache only",
+				"cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"},
+			},
+		},
+		"metadata": map[string]any{"user_id": string(identity)},
 		"messages": []any{
 			map[string]any{"role": "user", "content": "first"},
 			map[string]any{"role": "assistant", "content": "ok"},
@@ -717,17 +744,29 @@ func TestProxy_NativeAnthropicPreservesExplicitCachePolicy(t *testing.T) {
 		},
 		"tools":      []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}},
 		"max_tokens": 1024,
-	}, map[string]string{"anthropic-version": "2023-06-01"})
+	}, map[string]string{
+		"anthropic-version":        "2023-06-01",
+		"User-Agent":               "claude-cli/2.1.220 (external, cli)",
+		"X-App":                    "cli",
+		"Anthropic-Beta":           "claude-code-20250219",
+		"X-Claude-Code-Session-Id": nativeSessionID,
+	})
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if gjson.GetBytes(upstreamBody, "system.0.cache_control.ttl").String() != "1h" {
+	if got := gjson.GetBytes(upstreamBody, "system.#").Int(); got != 2 {
+		t.Fatalf("native system blocks=%d body=%s", got, upstreamBody)
+	}
+	if gjson.GetBytes(upstreamBody, "system.1.cache_control.ttl").String() != "1h" {
 		t.Fatalf("explicit cache breakpoint changed: %s", upstreamBody)
 	}
 	if gjson.GetBytes(upstreamBody, "tools.0.cache_control").Exists() ||
-		gjson.GetBytes(upstreamBody, "messages.0.content.0.cache_control").Exists() {
+		gjson.GetBytes(upstreamBody, "messages.2.content.0.cache_control").Exists() {
 		t.Fatalf("automatic cache breakpoints were added beside explicit policy: %s", upstreamBody)
+	}
+	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); strings.Contains(got, "cch=00000;") || !strings.Contains(got, " cch=") {
+		t.Fatalf("CCH was not rebuilt: %q", got)
 	}
 }
 
@@ -2163,7 +2202,7 @@ func TestProxy_AntigravityOAuthCapacityRetrySuccessWritesOneLog(t *testing.T) {
 	if entry.StatusCode != http.StatusOK {
 		t.Fatalf("log status=%d, want 200", entry.StatusCode)
 	}
-	if entry.Message != "ok [模型容量重试 1 次]" {
+	if entry.Message != "ok [model_capacity_retry_1]" {
 		t.Fatalf("log message=%q, want capacity retry count", entry.Message)
 	}
 	logs, err := env.store.ListLogs(
@@ -3003,6 +3042,9 @@ func TestProxy_OAuthRefreshFailureChecksExistingAccessToken(t *testing.T) {
 					if response.Code != http.StatusOK {
 						t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 					}
+					if !configs[0].Enabled {
+						t.Fatal("usable existing access token disabled channel")
+					}
 					if cooling {
 						t.Fatalf("usable existing access token caused cooldown until %s", until)
 					}
@@ -3010,6 +3052,25 @@ func TestProxy_OAuthRefreshFailureChecksExistingAccessToken(t *testing.T) {
 				}
 				if response.Code != http.StatusUnauthorized {
 					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				if tt.authType == model.AuthTypeCodexOAuth {
+					if configs[0].Enabled {
+						t.Fatal("terminally rejected Codex credential left channel enabled")
+					}
+					if cooling {
+						t.Fatalf("disabled Codex channel retained cooldown until %s", until)
+					}
+					_ = doProxyRequest(t, env.engine, tt.path, tt.request, nil)
+					if got := refreshAttempts.Load(); got != 1 {
+						t.Fatalf("disabled channel refresh attempts=%d, want 1", got)
+					}
+					if got := upstreamAttempts.Load(); got != 1 {
+						t.Fatalf("disabled channel upstream attempts=%d, want 1", got)
+					}
+					return
+				}
+				if !configs[0].Enabled {
+					t.Fatal("non-Codex refresh failure disabled channel")
 				}
 				if !cooling {
 					t.Fatal("rejected existing access token did not cool channel")
@@ -3019,6 +3080,113 @@ func TestProxy_OAuthRefreshFailureChecksExistingAccessToken(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestProxy_CodexTransientRefreshFailureCoolsInsteadOfDisables(t *testing.T) {
+	const accessToken = "stale-access-token"
+	var upstreamAttempts atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAttempts.Add(1)
+		if got := r.Header.Get("Authorization"); got != "Bearer "+accessToken {
+			t.Errorf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"type":"authentication_error","message":"expired"}}`)
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "codex-transient-refresh", upstreamProtocol: "codex", models: "gpt-test", priority: 100,
+		authType:        model.AuthTypeCodexOAuth,
+		oauthCredential: expiredProxyOAuthCredential(t, model.AuthTypeCodexOAuth, accessToken),
+	}}, map[int]string{0: upstream.URL})
+	var refreshAttempts atomic.Int32
+	refreshClient := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		refreshAttempts.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":"temporarily_unavailable"}`)),
+			Request:    req,
+		}, nil
+	})}
+	service := codexauth.NewService(refreshClient)
+	service.TokenURL = "https://oauth.test/token"
+	env.server.codexCredentials.service = service
+	env.server.codexCredentials.clientFor = func(*model.Config) *http.Client { return refreshClient }
+
+	response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": false, "input": "hello",
+	}, nil)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := refreshAttempts.Load(); got != 1 {
+		t.Fatalf("refresh attempts=%d, want 1", got)
+	}
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts=%d, want 1", got)
+	}
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil || len(configs) != 1 || !configs[0].Enabled {
+		t.Fatalf("transient refresh failure disabled channel: configs=%+v err=%v", configs, err)
+	}
+	cooldowns, err := env.store.GetAllChannelCooldowns(context.Background())
+	if err != nil || cooldowns[configs[0].ID].IsZero() {
+		t.Fatalf("transient refresh failure did not cool channel: cooldowns=%+v err=%v", cooldowns, err)
+	}
+}
+
+func TestProxy_RejectedCodexPersonalAccessTokenDisablesChannel(t *testing.T) {
+	const accessToken = "at-static-rejected"
+	var upstreamAttempts atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAttempts.Add(1)
+		if got := r.Header.Get("Authorization"); got != "Bearer "+accessToken {
+			t.Errorf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"type":"authentication_error","message":"expired"}}`)
+	}))
+	defer upstream.Close()
+
+	credential, err := (&codexauth.Credential{
+		Type: codexauth.ChannelType, AuthMode: codexauth.AuthModePersonalAccessToken,
+		AccessToken: accessToken, ChatGPTUserID: "pat-user", AccountID: "pat-account",
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "codex-pat-rejected", upstreamProtocol: "codex", models: "gpt-test", priority: 100,
+		authType: model.AuthTypeCodexOAuth, oauthCredential: credential,
+	}}, map[int]string{0: upstream.URL})
+	var tokenEndpointCalls atomic.Int32
+	refreshClient := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		tokenEndpointCalls.Add(1)
+		return nil, fmt.Errorf("unexpected token endpoint request: %s", req.URL)
+	})}
+	env.server.codexCredentials.service = codexauth.NewService(refreshClient)
+	env.server.codexCredentials.clientFor = func(*model.Config) *http.Client { return refreshClient }
+
+	response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": false, "input": "hello",
+	}, nil)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts=%d, want 1", got)
+	}
+	if got := tokenEndpointCalls.Load(); got != 0 {
+		t.Fatalf("PAT token endpoint calls=%d, want 0", got)
+	}
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil || len(configs) != 1 || configs[0].Enabled {
+		t.Fatalf("rejected PAT channel was not disabled: configs=%+v err=%v", configs, err)
 	}
 }
 
@@ -9806,6 +9974,409 @@ func TestProxy_SSEErrorEventBeforeClientOutput_RetriesNextChannel(t *testing.T) 
 	}
 	if secondCalls.Load() != 1 {
 		t.Fatalf("expected second channel to be tried once, got %d", secondCalls.Load())
+	}
+}
+
+func TestProxy_ResponsesMetadataThenSSEError_RetriesNextChannel(t *testing.T) {
+	t.Parallel()
+
+	var firstCalls atomic.Int32
+	upstream1 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: response.created\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-ch1-created","status":"in_progress"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: error\n")
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":2}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream1.Close()
+
+	var secondCalls atomic.Int32
+	upstream2 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-ch2","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream2.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "ch1-created-then-overloaded", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1", priority: 100},
+		{name: "ch2-ok", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-2", priority: 50},
+	}, map[int]string{0: upstream1.URL, 1: upstream2.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model":  "gpt-test",
+		"stream": true,
+		"input":  "hi",
+	}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 after retrying next channel, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "resp-ch2") {
+		t.Fatalf("expected completed response from second channel, got: %s", body)
+	}
+	if strings.Contains(body, "resp-ch1-created") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("expected first channel metadata/error not to leak to client, body: %s", body)
+	}
+	if firstCalls.Load() != 1 || secondCalls.Load() != 1 {
+		t.Fatalf("upstream calls first=%d second=%d, want 1/1", firstCalls.Load(), secondCalls.Load())
+	}
+}
+
+func TestProxy_ResponsesMetadataCountsAsFirstByteWithoutCommitting(t *testing.T) {
+	t.Parallel()
+
+	semanticDelay := 300 * time.Millisecond
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: response.created\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-first-byte","status":"in_progress"}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(semanticDelay)
+		_, _ = fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"hi"}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-first-byte","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "metadata-first-byte", upstreamProtocol: "codex", models: "gpt-first-byte", apiKey: "sk-first-byte",
+	}}, map[int]string{0: upstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-first-byte", "stream": true, "input": "hi",
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "resp-first-byte") || !strings.Contains(body, `"hi"`) {
+		t.Fatalf("expected created+delta, got: %s", body)
+	}
+
+	entry := waitForProxyLog(t, env, "gpt-first-byte")
+	if entry.FirstByteTime <= 0 || entry.FirstByteTime >= semanticDelay.Seconds() {
+		t.Fatalf("first_byte_time=%.3f should be upstream created, not semantic delay %.3f; duration=%.3f",
+			entry.FirstByteTime, semanticDelay.Seconds(), entry.Duration)
+	}
+	if entry.Duration < semanticDelay.Seconds() {
+		t.Fatalf("duration=%.3f shorter than semantic delay, test setup invalid", entry.Duration)
+	}
+}
+
+func TestProxy_ResponsesMetadataDoesNotSetClientFirstByteBeforeCommit(t *testing.T) {
+	t.Parallel()
+
+	metadataSent := make(chan struct{})
+	releaseSemantic := make(chan struct{})
+	var releaseOnce sync.Once
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-client-byte","status":"in_progress"}}`+"\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(metadataSent)
+		<-releaseSemantic
+		_, _ = fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"hi"}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-client-byte","status":"completed","output":[]}}`+"\n\n")
+	}))
+	release := func() {
+		releaseOnce.Do(func() { close(releaseSemantic) })
+	}
+	defer release()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "metadata-client-byte", upstreamProtocol: "codex", models: "gpt-client-byte", apiKey: "sk-client-byte",
+	}}, map[int]string{0: upstream.URL})
+
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-client-byte", "stream": true, "input": "hi",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-api-key")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		env.engine.ServeHTTP(response, req)
+		close(done)
+	}()
+
+	select {
+	case <-metadataSent:
+	case <-time.After(time.Second):
+		t.Fatal("upstream metadata was not sent")
+	}
+
+	var active *ActiveRequest
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		requests := env.server.activeRequests.List()
+		if len(requests) == 1 && requests[0].BytesReceived > 0 {
+			active = requests[0]
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if active == nil {
+		t.Fatal("active request did not receive metadata bytes")
+	}
+	if active.ClientFirstByteTime != 0 {
+		t.Fatalf("client_first_byte_time=%.6f before deferred response commit, want 0", active.ClientFirstByteTime)
+	}
+
+	release()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("proxy request did not finish after semantic output")
+	}
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"delta":"hi"`) {
+		t.Fatalf("unexpected response status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestProxy_ResponsesMissingRequiredParameterRetriesWithPrunedInput(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan []byte, 2)
+	var calls atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"error":{"code":"missing_required_parameter","message":"Missing required parameter: 'input[1].content[0].text'.","param":"input[1].content[0].text","type":"invalid_request_error"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-after-pruning","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-missing-required", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": true,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "keep-user"},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{
+				map[string]any{"type": "output_text"},
+			}},
+			map[string]any{"type": "message", "role": "user", "content": "keep-follow-up"},
+		},
+	}, nil)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "resp-after-pruning") {
+		t.Fatalf("status=%d body=%s, want completed retried response", w.Code, w.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls=%d, want 2", calls.Load())
+	}
+	first := <-requests
+	retry := <-requests
+	if gjson.GetBytes(first, "input.#").Int() != 3 {
+		t.Fatalf("first request input=%s, want three items", first)
+	}
+	if gjson.GetBytes(retry, "input.#").Int() != 2 ||
+		gjson.GetBytes(retry, "input.0.content").String() != "keep-user" ||
+		gjson.GetBytes(retry, "input.1.content").String() != "keep-follow-up" {
+		t.Fatalf("retry did not remove only invalid input item: %s", retry)
+	}
+}
+
+func TestProxy_ResponsesSSEMissingStoredItemRetriesOnceWithStrippedBody(t *testing.T) {
+	t.Parallel()
+
+	const missingID = "rs_item_missing"
+	requests := make(chan []byte, 2)
+	var calls atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", fmt.Sprintf(
+				`{"type":"error","error":{"type":"invalid_request_error","code":null,"message":"Item with id '%s' not found. Items are not persisted when store is set to false.","param":"input"},"status":404}`,
+				missingID,
+			))
+			return
+		}
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-after-strips","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-missing-items", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": true, "store": false,
+		"input": []any{
+			map[string]any{"type": "reasoning", "id": missingID, "summary": []any{}},
+			map[string]any{"type": "message", "id": "msg_keep", "role": "user", "content": "keep"},
+		},
+	}, nil)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "resp-after-strips") {
+		t.Fatalf("status=%d body=%s, want completed response", w.Code, w.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls=%d, want initial request plus one retry", calls.Load())
+	}
+	first := <-requests
+	second := <-requests
+	if !gjson.GetBytes(first, "input.#(id==\""+missingID+"\").id").Exists() {
+		t.Fatalf("initial request lost missing item: %s", first)
+	}
+	if gjson.GetBytes(second, "input.#").Int() != 1 ||
+		gjson.GetBytes(second, "input.0.id").String() != "msg_keep" {
+		t.Fatalf("retry did not remove only %s: %s", missingID, second)
+	}
+}
+
+func TestProxy_ResponsesSSEMissingStoredItemRetriesOnce(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	requests := make(chan []byte, responsesMissingStoredItemRetryLimit+2)
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		missingID := gjson.GetBytes(body, "input.0.id").String()
+		if missingID == "" {
+			_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-after-unbounded-retries","status":"completed","output":[]}}`+"\n\n")
+			return
+		}
+		_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", fmt.Sprintf(
+			`{"type":"error","error":{"type":"invalid_request_error","code":null,"message":"Item with id '%s' not found. Items are not persisted when store is set to false.","param":"input"},"status":404}`,
+			missingID,
+		))
+	}))
+	defer upstream.Close()
+
+	input := make([]any, 0, responsesMissingStoredItemRetryLimit+1)
+	for index := range responsesMissingStoredItemRetryLimit + 1 {
+		input = append(input, map[string]any{
+			"type": "reasoning", "id": fmt.Sprintf("rs_item_missing_%02d", index), "summary": []any{},
+		})
+	}
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-missing-item-limit", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": true, "store": false, "input": input,
+	}, nil)
+
+	wantCalls := int32(responsesMissingStoredItemRetryLimit + 1)
+	if calls.Load() != wantCalls {
+		t.Fatalf("upstream calls=%d, want initial request plus %d retries (%d total); status=%d body=%s",
+			calls.Load(), responsesMissingStoredItemRetryLimit, wantCalls, w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "resp-after-unbounded-retries") {
+		t.Fatalf("retry loop stripped beyond the fixed limit: %s", w.Body.String())
+	}
+	var last []byte
+	for range wantCalls {
+		last = <-requests
+	}
+	if gjson.GetBytes(last, "input.#").Int() != 1 ||
+		gjson.GetBytes(last, "input.0.id").String() != fmt.Sprintf("rs_item_missing_%02d", responsesMissingStoredItemRetryLimit) {
+		t.Fatalf("last bounded retry body=%s, want final unstripped item", last)
+	}
+}
+
+func TestProxy_ResponsesHTTPMissingStoredItemRetriesOnce(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	requests := make(chan []byte, responsesMissingStoredItemRetryLimit+2)
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- bytes.Clone(body)
+		calls.Add(1)
+		missingID := gjson.GetBytes(body, "input.0.id").String()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprintf(w,
+			`{"error":{"type":"invalid_request_error","code":null,"message":"Item with id '%s' not found. Items are not persisted when store is set to false.","param":"input"}}`,
+			missingID,
+		)
+	}))
+	defer upstream.Close()
+
+	input := make([]any, 0, responsesMissingStoredItemRetryLimit+1)
+	for index := range responsesMissingStoredItemRetryLimit + 1 {
+		input = append(input, map[string]any{
+			"type": "reasoning", "id": fmt.Sprintf("rs_item_missing_%02d", index), "summary": []any{},
+		})
+	}
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "responses-http-missing-item-limit", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1",
+	}}, map[int]string{0: upstream.URL})
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "store": false, "input": input,
+	}, nil)
+
+	wantCalls := int32(responsesMissingStoredItemRetryLimit + 1)
+	if calls.Load() != wantCalls {
+		t.Fatalf("upstream calls=%d, want initial request plus %d retries (%d total); status=%d body=%s",
+			calls.Load(), responsesMissingStoredItemRetryLimit, wantCalls, w.Code, w.Body.String())
+	}
+	var last []byte
+	for range wantCalls {
+		last = <-requests
+	}
+	if gjson.GetBytes(last, "input.#").Int() != 1 ||
+		gjson.GetBytes(last, "input.0.id").String() != fmt.Sprintf("rs_item_missing_%02d", responsesMissingStoredItemRetryLimit) {
+		t.Fatalf("last bounded retry body=%s, want final unstripped item", last)
 	}
 }
 

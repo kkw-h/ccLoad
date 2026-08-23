@@ -542,6 +542,20 @@ function formatOAuthUsagePercent(value) {
   return Number.isInteger(percent) ? String(percent) : percent.toFixed(1).replace(/\.0$/, '');
 }
 
+// 累计标准成本按美元显示，与渠道日消费同一形状，无需本地化前缀。
+function formatOAuthAccumulatedCost(standardCostMicroUSD) {
+  const microUSD = Number(standardCostMicroUSD);
+  if (!Number.isFinite(microUSD) || microUSD < 0) return '';
+  return `$${(microUSD / 1_000_000).toFixed(1)}`;
+}
+
+// 累计成本按上游窗口标识（limit_name|kind）取用：同一时长可能对应多个互不相干的窗口。
+function oauthAccumulatedCostByKey(quotaCostUsage, key) {
+  const windows = Array.isArray(quotaCostUsage?.windows) ? quotaCostUsage.windows : [];
+  const match = windows.find(item => item?.key === key);
+  return match ? match.standard_cost_microusd : null;
+}
+
 function formatOAuthUsageResetAt(resetAt) {
   const timestamp = Number(resetAt);
   if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
@@ -569,6 +583,11 @@ function formatOAuthUsageLimitName(limitName) {
   const normalized = String(limitName || '').trim().toLowerCase();
   if (!normalized || normalized === 'codex') return '';
   if (normalized === 'codex-spark') return 'GPT-5.3-Codex-Spark';
+  if (normalized === 'gemini models') return 'Gemini';
+  // Z.ai 的 token 窗口只有时长有信息量，时长已单独渲染，避免出现「five_hour 5小时」。
+  if (normalized === 'five_hour' || normalized === 'weekly') return '';
+  if (normalized === 'mcp_limit') return 'MCP';
+  if (normalized === 'claude and gpt models') return 'Claude';
   return String(limitName).trim();
 }
 
@@ -602,11 +621,61 @@ function oauthUsageLevel(remainingPercent) {
   return 'empty';
 }
 
-function buildOAuthUsageRefreshButton(channelID, loading = false) {
+function buildOAuthUsageRefreshButton(channelID, loading = false, disabled = false) {
   const text = loading
     ? window.t('channels.oauth.usageRefreshing')
     : window.t('channels.oauth.usageRefresh');
-  return `<button type="button" class="ch-oauth-usage__refresh channel-action-btn" data-action="refresh-oauth-usage" data-channel-id="${channelID}"${loading ? ' disabled aria-busy="true"' : ''}>${escapeChannelRefreshText(text)}</button>`;
+  return `<button type="button" class="ch-oauth-usage__refresh channel-action-btn" data-action="refresh-oauth-usage" data-channel-id="${channelID}"${loading || disabled ? ' disabled' : ''}${loading ? ' aria-busy="true"' : ''}>${escapeChannelRefreshText(text)}</button>`;
+}
+
+function formatCodexResetCreditExpiry(expiresAt) {
+  const date = new Date(String(expiresAt || '').trim());
+  if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) return null;
+  const pad = value => String(value).padStart(2, '0');
+  return {
+    timestamp: date.getTime(),
+    text: `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  };
+}
+
+function buildCodexResetCreditsHtml(data, state, channelID) {
+  const resetCredits = data?.rate_limit_reset_credits || {};
+  const rawCount = Number(resetCredits.available_count);
+  const normalizedCount = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
+  const hasCreditList = Array.isArray(resetCredits.credits);
+  const expiries = (hasCreditList ? resetCredits.credits : [])
+    .map(credit => formatCodexResetCreditExpiry(credit?.expires_at))
+    .filter(Boolean)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const availableCount = hasCreditList ? Math.min(normalizedCount, expiries.length) : normalizedCount;
+  if (availableCount <= 0) return '';
+  const visibleExpiries = expiries.slice(0, availableCount);
+  const earliest = visibleExpiries[0]?.text || '';
+  const resetting = state?.reset_status === 'loading';
+  const stale = state?.reset_status === 'stale';
+  const disabled = resetting || stale;
+  const buttonText = resetting
+    ? window.t('channels.oauth.resettingQuota')
+    : window.t('channels.oauth.resetQuota');
+  const expiryText = earliest
+    ? window.t('channels.oauth.resetCreditExpiresEarliest', { time: earliest })
+    : window.t('channels.oauth.resetCreditExpiresUnknown');
+  const resetError = String(state?.reset_error || '').trim();
+  const expiryDetails = visibleExpiries.length > 1
+    ? `<details class="ch-oauth-usage__credit-expiries">
+        <summary>${escapeChannelRefreshText(window.t('channels.oauth.resetCreditExpiresAll', { count: visibleExpiries.length }))}</summary>
+        <ul>${visibleExpiries.map(expiry => `<li>${escapeChannelRefreshText(expiry.text)}</li>`).join('')}</ul>
+      </details>`
+    : '';
+  return `<div class="ch-oauth-usage__credits">
+    <div class="ch-oauth-usage__credits-summary">
+      <span class="ch-oauth-usage__credit-count">${escapeChannelRefreshText(window.t('channels.oauth.resetCredits', { count: availableCount }))}</span>
+      <span class="ch-oauth-usage__credit-expiry">${escapeChannelRefreshText(expiryText)}</span>
+      <button type="button" class="ch-oauth-usage__reset-action channel-action-btn" data-action="reset-codex-quota" data-channel-id="${channelID}" data-reset-count="${availableCount}" data-reset-expiry="${escapeChannelRefreshText(earliest)}"${disabled ? ' disabled' : ''}${resetting ? ' aria-busy="true"' : ''}>${escapeChannelRefreshText(buttonText)}</button>
+    </div>
+    ${expiryDetails}
+    ${resetError ? `<div class="ch-oauth-usage__error" role="status">${escapeChannelRefreshText(resetError)}</div>` : ''}
+  </div>`;
 }
 
 function formatXAIUsagePercent(value) {
@@ -644,9 +713,10 @@ function buildXAIUsageInlineRow(label, value) {
   </div>`;
 }
 
-function buildXAIUsageRow(label, usedPercent, amount, resetAt) {
+function buildXAIUsageRow(label, usedPercent, amount, resetAt, accumulatedCostMicroUSD) {
   const percent = formatXAIUsagePercent(usedPercent);
   const reset = formatXAIUsageReset(resetAt);
+  const accumulatedCost = formatOAuthAccumulatedCost(accumulatedCostMicroUSD);
   const numericUsed = xaiUsageNumber(usedPercent);
   const remaining = numericUsed !== null ? Math.min(100, Math.max(0, 100 - numericUsed)) : 0;
   const ariaLabel = numericUsed === null
@@ -657,7 +727,10 @@ function buildXAIUsageRow(label, usedPercent, amount, resetAt) {
     });
   return `<div class="ch-oauth-usage__window">
     <div class="ch-oauth-usage__meta">
-      <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+      <span class="ch-oauth-usage__heading">
+        <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+        ${accumulatedCost ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(accumulatedCost)}</span>` : ''}
+      </span>
       <span class="ch-oauth-usage__details">
         <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(window.t('channels.oauth.usageUsed', { percent }))}</span>
         ${amount ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(amount)}</span>` : ''}
@@ -682,7 +755,8 @@ function buildXAIUsageRows(data) {
       window.t('channels.oauth.usageWeekly'),
       billing.weekly_usage_percent,
       '',
-      billing.weekly_reset_at
+      billing.weekly_reset_at,
+      oauthAccumulatedCostByKey(data?.quota_cost_usage, 'xai|weekly')
     ));
   }
   const products = Array.isArray(billing.product_usage) ? billing.product_usage : [];
@@ -720,14 +794,15 @@ function buildXAIUsageRows(data) {
       window.t('channels.oauth.usageMonthlyCredits'),
       monthlyPercent,
       `${formatXAIUsageMoney(billing.included_used_cents)} / ${formatXAIUsageMoney(billing.monthly_limit_cents)}`,
-      billing.monthly_reset_at
+      billing.monthly_reset_at,
+      oauthAccumulatedCostByKey(data?.quota_cost_usage, 'xai|monthly')
     ));
   }
   return rows;
 }
 
 function buildOAuthUsageStatusHtml(channel) {
-  if (!['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth'].includes(channel?.auth_type) ||
+  if (!['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth'].includes(channel?.auth_type) ||
       (typeof isTokenChannelsReadOnly === 'function' && isTokenChannelsReadOnly())) {
     return '';
   }
@@ -750,20 +825,29 @@ function buildOAuthUsageStatusHtml(channel) {
 
   const windows = Array.isArray(state.data?.windows) ? state.data.windows : [];
   const isXAI = channel?.auth_type === 'xai_oauth' || state.data?.provider === 'xai';
+  const isCodex = channel?.auth_type === 'codex_oauth';
   const rows = isXAI ? buildXAIUsageRows(state.data) : windows.map(windowInfo => {
     const remaining = Math.min(100, Math.max(0, Number(windowInfo?.remaining_percent) || 0));
     const percent = formatOAuthUsagePercent(remaining);
     const duration = formatOAuthUsageWindowDuration(windowInfo?.limit_window_seconds);
     const limitName = formatOAuthUsageLimitName(windowInfo?.limit_name);
-    const label = limitName ? `${limitName} · ${duration}` : duration;
+    // 名称与时长的连接方式交给语言包：中文直接相连，英文才需要空格。
+    const label = limitName
+      ? window.t('channels.oauth.usageLabel', { name: limitName, duration })
+      : duration;
     const resetAt = formatOAuthUsageResetAt(windowInfo?.reset_at);
+    const accumulatedCost = formatOAuthAccumulatedCost(windowInfo?.standard_cost_microusd);
     const ariaLabel = window.t('channels.oauth.usageRemaining', { label, percent });
     return `<div class="ch-oauth-usage__window">
       <div class="ch-oauth-usage__meta">
-        <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
-        <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(percent)}%</span>
-        ${isXAI ? `<span>${escapeChannelRefreshText(window.t('channels.oauth.usageAvailable'))}</span>` : ''}
-        ${resetAt ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(resetAt)}</span>` : ''}
+        <span class="ch-oauth-usage__heading">
+          <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+          ${accumulatedCost ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(accumulatedCost)}</span>` : ''}
+        </span>
+        <span class="ch-oauth-usage__details">
+          <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(percent)}%</span>
+          ${resetAt ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(resetAt)}</span>` : ''}
+        </span>
       </div>
       <div class="ch-oauth-usage__track" role="progressbar" aria-label="${escapeChannelRefreshText(ariaLabel)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeChannelRefreshText(percent)}">
         <span class="ch-oauth-usage__fill ch-oauth-usage__fill--${oauthUsageLevel(remaining)}" style="width:${remaining}%"></span>
@@ -774,8 +858,9 @@ function buildOAuthUsageStatusHtml(channel) {
     ? state.data.warnings.filter(Boolean).map(warning => `<li>${escapeChannelRefreshText(warning)}</li>`).join('')
     : '';
   return `<div class="ch-oauth-usage">
-    <div class="ch-oauth-usage__toolbar">${buildOAuthUsageRefreshButton(channel.id)}</div>
+    <div class="ch-oauth-usage__toolbar">${buildOAuthUsageRefreshButton(channel.id, false, state.reset_status === 'loading')}</div>
     ${rows.join('')}
+    ${isCodex ? buildCodexResetCreditsHtml(state.data, state, channel.id) : ''}
     ${warnings ? `<div role="status"><span>${escapeChannelRefreshText(window.t('channels.oauth.usageWarnings'))}</span><ul>${warnings}</ul></div>` : ''}
   </div>`;
 }
@@ -1037,7 +1122,7 @@ function initChannelEventDelegation() {
     if (!btn) return;
 
     const action = btn.dataset.action;
-    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'refresh-oauth-usage', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
+    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'refresh-oauth-usage', 'reset-codex-quota', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
       return;
     }
     const channelId = parseInt(btn.dataset.channelId);
@@ -1055,6 +1140,23 @@ function initChannelEventDelegation() {
         if (typeof refreshOAuthUsage === 'function') {
           refreshOAuthUsage(channelId).catch(error => {
             if (window.showError) window.showError(error?.message || window.t('channels.oauth.usageFailed'));
+          });
+        }
+        break;
+      case 'reset-codex-quota':
+        if (typeof resetCodexQuota === 'function') {
+          const count = Math.max(0, Number(btn.dataset.resetCount) || 0);
+          const expiry = btn.dataset.resetExpiry || window.t('channels.oauth.resetCreditExpiresUnknown');
+          const confirmed = window.confirm(window.t('channels.oauth.resetConfirm', { count, time: expiry }));
+          if (!confirmed) break;
+          resetCodexQuota(channelId).then(result => {
+            const hasWarnings = Array.isArray(result?.warnings) && result.warnings.length > 0;
+            const message = !result?.usage || hasWarnings
+              ? window.t('channels.oauth.resetSuccessNeedsRefresh')
+              : window.t('channels.oauth.resetSuccess');
+            if (window.showSuccess) window.showSuccess(message);
+          }).catch(error => {
+            if (window.showError) window.showError(error?.message || window.t('channels.oauth.resetFailed'));
           });
         }
         break;

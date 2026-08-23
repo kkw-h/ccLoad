@@ -2,11 +2,16 @@ package sql_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
 
+	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
+	sqlstore "ccLoad/internal/storage/sql"
 )
 
 func newJSONTime(t time.Time) model.JSONTime {
@@ -68,6 +73,225 @@ func TestLog_AddAndList(t *testing.T) {
 	}
 	if len(filtered) != 1 || total != 1 || filtered[0].ClientProtocol != "openai" {
 		t.Fatalf("filtered logs=%+v total=%d, want one openai log", filtered, total)
+	}
+}
+
+// 生产渠道 526（Antigravity）的真实额度采样快照：四个窗口分属 Gemini 与
+// Claude/GPT 两个模型族，是 bootstrap 与分族累加的重放输入。
+const prodAntigravityOAuthUsage = `{
+	"requested_at": "2026-08-17T10:44:54.310977442Z",
+	"sampled_at": "2026-08-17T10:44:54.744271195Z",
+	"summary": {
+		"provider": "antigravity",
+		"windows": [
+			{"limit_name":"Gemini Models","kind":"gemini-weekly","used_percent":68.84384,"remaining_percent":31.15616,"limit_window_seconds":604800,"reset_at":1787319675},
+			{"limit_name":"Gemini Models","kind":"gemini-5h","used_percent":8.13866,"remaining_percent":91.86134,"limit_window_seconds":18000,"reset_at":1786969942},
+			{"limit_name":"Claude and GPT models","kind":"3p-weekly","used_percent":0,"remaining_percent":100,"limit_window_seconds":604800,"reset_at":1787369662},
+			{"limit_name":"Claude and GPT models","kind":"3p-5h","used_percent":0,"remaining_percent":100,"limit_window_seconds":18000,"reset_at":1786981494}
+		]
+	}
+}`
+
+// 窗口边界只来自上游额度采样，但采样一旦落盘就必须立刻可用于累加：
+// 凭证已持久化 oauth_usage 却还要等人工刷新才建计数器，中间的消耗会被静默丢弃。
+func TestLog_BootstrapsOAuthQuotaWindowsFromSampledUsage(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t, "oauth-quota-bootstrap.db")
+	ctx := context.Background()
+	credential := &antigravityauth.Credential{
+		Type: antigravityauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired:    time.Unix(1787369662, 0).UTC().Format(time.RFC3339),
+		OAuthUsage: json.RawMessage(prodAntigravityOAuthUsage),
+		// 生产上这里是空对象：采样已落盘，计数器却从未建立。
+		QuotaCostUsage: &oauthcost.Usage{},
+	}
+	credentialJSON, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "oauth-quota-bootstrap", AuthType: model.AuthTypeAntigravityOAuth,
+		OAuthCredential: credentialJSON,
+		URLs:            model.ChannelURLs{{URL: "https://daily-cloudcode-pa.googleapis.com"}},
+		Enabled:         true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowCost := func(key string) int64 {
+		t.Helper()
+		cfg, getErr := store.GetConfig(ctx, created.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		got, parseErr := antigravityauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		window := oauthcost.Find(got.QuotaCostUsage, key)
+		if window == nil {
+			t.Fatalf("quota cost window %q missing: %#v", key, got.QuotaCostUsage)
+		}
+		return window.StandardCostMicroUSD
+	}
+
+	// 渠道 526 的真实日志：Gemini 与 Claude 消耗必须落进各自的模型族窗口。
+	geminiInFiveHour := time.UnixMilli(1786951952200).UTC()
+	geminiAfterFiveHour := time.UnixMilli(1787015339534).UTC()
+	claudeLog := time.UnixMilli(1787016073365).UTC()
+	if err := store.BatchAddLogs(ctx, []*model.LogEntry{
+		{Time: newJSONTime(geminiInFiveHour), ChannelID: created.ID, Model: "gemini-3.6-flash",
+			ActualModel: "gemini-3.6-flash-high", StatusCode: http.StatusOK, Cost: 0.03110985},
+		{Time: newJSONTime(geminiAfterFiveHour), ChannelID: created.ID, Model: "gemini-3.7-flash",
+			ActualModel: "gemini-3.7-flash-high", StatusCode: http.StatusOK, Cost: 0.002982},
+		{Time: newJSONTime(claudeLog), ChannelID: created.ID, Model: "claude-opus-4-6",
+			ActualModel: "claude-opus-4-6-thinking", StatusCode: http.StatusOK, Cost: 0.044465},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 周窗口覆盖全部三条日志的时间点，按族各收各的。
+	if got := windowCost("gemini models|gemini-weekly"); got != 31110+2982 {
+		t.Fatalf("gemini weekly cost = %d, want %d", got, 31110+2982)
+	}
+	if got := windowCost("claude and gpt models|3p-weekly"); got != 44465 {
+		t.Fatalf("3p weekly cost = %d, want 44465", got)
+	}
+	// 5h 窗口在第二条 Gemini 日志前已滚转，只保留新周期内的消耗。
+	if got := windowCost("gemini models|gemini-5h"); got != 2982 {
+		t.Fatalf("gemini 5h cost = %d, want 2982", got)
+	}
+	if got := windowCost("claude and gpt models|3p-5h"); got != 44465 {
+		t.Fatalf("3p 5h cost = %d, want 44465", got)
+	}
+}
+
+func TestLog_BatchAccumulatesOAuthQuotaStandardCostByPeriod(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t, "oauth-quota-cost.db")
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	resetAt := now.Add(time.Hour)
+	credential := &codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired: now.Add(24 * time.Hour).Format(time.RFC3339),
+		QuotaCostUsage: &oauthcost.Usage{
+			Windows: []*oauthcost.Window{
+				{
+					Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
+					StartedAt: resetAt.Add(-7 * 24 * time.Hour).Unix(), ResetAt: resetAt.Unix(),
+				},
+				{
+					Key: "codex|monthly", WindowSeconds: 30 * 24 * 60 * 60,
+					StartedAt: resetAt.AddDate(0, -1, 0).Unix(), ResetAt: resetAt.Unix(),
+				},
+			},
+		},
+	}
+	credentialJSON, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "oauth-quota-cost", AuthType: model.AuthTypeCodexOAuth,
+		OAuthCredential: credentialJSON,
+		URLs:            model.ChannelURLs{{URL: "https://api.example.com", Protocols: []string{"codex"}}},
+		Enabled:         true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs := []*model.LogEntry{
+		{Time: newJSONTime(now), ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 1.25, CostMultiplier: 10},
+		{Time: newJSONTime(now.Add(time.Second)), ChannelID: created.ID, StatusCode: http.StatusNoContent, Cost: 0.75, CostMultiplier: 0.1},
+		{Time: newJSONTime(now.Add(2 * time.Second)), ChannelID: created.ID, StatusCode: http.StatusBadGateway, Cost: 9},
+		{Time: newJSONTime(now.Add(3 * time.Second)), ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 9, LogSource: model.LogSourceManualTest},
+	}
+	if err := store.BatchAddLogs(ctx, logs); err != nil {
+		t.Fatal(err)
+	}
+	assertCosts := func(want int64) *codexauth.Credential {
+		t.Helper()
+		cfg, getErr := store.GetConfig(ctx, created.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		got, parseErr := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		weekly := oauthcost.Find(got.QuotaCostUsage, "codex|secondary")
+		monthly := oauthcost.Find(got.QuotaCostUsage, "codex|monthly")
+		if weekly == nil || monthly == nil {
+			t.Fatalf("quota cost usage missing: %#v", got.QuotaCostUsage)
+		}
+		if weekly.StandardCostMicroUSD != want || monthly.StandardCostMicroUSD != want {
+			t.Fatalf("quota costs = weekly %d monthly %d, want %d",
+				weekly.StandardCostMicroUSD, monthly.StandardCostMicroUSD, want)
+		}
+		return got
+	}
+	assertCosts(20_000_000)
+
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time: newJSONTime(resetAt), ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 0.5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rolled := assertCosts(500_000)
+	if oauthcost.Find(rolled.QuotaCostUsage, "codex|secondary").StartedAt != resetAt.Unix() ||
+		oauthcost.Find(rolled.QuotaCostUsage, "codex|monthly").StartedAt != resetAt.Unix() {
+		t.Fatalf("period did not roll at reset: %#v", rolled.QuotaCostUsage)
+	}
+
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time: newJSONTime(resetAt.Add(-time.Second)), ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCosts(500_000)
+
+	manualResetAt := resetAt.Add(time.Minute)
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time: newJSONTime(manualResetAt.Add(time.Second)), ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 0.25,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ResetOAuthQuotaCostUsage(ctx, created.ID, manualResetAt); err != nil {
+		t.Fatal(err)
+	}
+	reset := assertCosts(250_000)
+	if oauthcost.Find(reset.QuotaCostUsage, "codex|secondary").CountFromAt != manualResetAt.Unix() ||
+		oauthcost.Find(reset.QuotaCostUsage, "codex|monthly").CountFromAt != manualResetAt.Unix() {
+		t.Fatalf("manual reset cutoff missing: %#v", reset.QuotaCostUsage)
+	}
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time: newJSONTime(manualResetAt.Add(-time.Second)), ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCosts(250_000)
+
+	db := store.(*sqlstore.SQLStore)
+	if _, err := db.ExecContext(ctx, `UPDATE channels SET oauth_credential = ? WHERE id = ?`,
+		`{"quota_cost_usage":`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time: newJSONTime(resetAt.Add(time.Second)), Model: "rollback-marker",
+		ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 1,
+	}); err == nil {
+		t.Fatal("invalid credential should roll back the log and quota update")
+	}
+	var rollbackLogs int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM logs WHERE model = ?`, "rollback-marker").Scan(&rollbackLogs); err != nil {
+		t.Fatal(err)
+	}
+	if rollbackLogs != 0 {
+		t.Fatalf("rolled back log count = %d, want 0", rollbackLogs)
 	}
 }
 

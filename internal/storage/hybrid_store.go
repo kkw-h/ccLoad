@@ -215,6 +215,34 @@ func (h *HybridStore) CompareAndSwapOAuthCredential(
 	return true, nil
 }
 
+func (h *HybridStore) ResetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error {
+	h.oauthCredentialMu.Lock()
+	defer h.oauthCredentialMu.Unlock()
+	if err := h.sqlite.ResetOAuthQuotaCostUsage(ctx, channelID, resetAt); err != nil {
+		return err
+	}
+	h.markChannelDirty(channelID, false)
+	return nil
+}
+
+func (h *HybridStore) DisableOAuthChannelIfCredentialMatches(
+	ctx context.Context,
+	channelID int64,
+	expectedAuthType, expectedCredential string,
+) (bool, error) {
+	h.oauthCredentialMu.Lock()
+	defer h.oauthCredentialMu.Unlock()
+
+	disabled, err := h.sqlite.DisableOAuthChannelIfCredentialMatches(
+		ctx, channelID, expectedAuthType, expectedCredential,
+	)
+	if err != nil || !disabled {
+		return disabled, err
+	}
+	h.markChannelDirty(channelID, false)
+	return true, nil
+}
+
 func (h *HybridStore) UpdateOAuthModelStateIfCredentialMatches(
 	ctx context.Context,
 	channelID int64,
@@ -287,6 +315,21 @@ func (h *HybridStore) DeleteConfigIfOAuthSnapshotMatches(
 		return deleted, err
 	}
 	h.markChannelDirty(expected.ID, true)
+	return true, nil
+}
+
+func (h *HybridStore) DisableConfigIfOAuthSnapshotMatches(
+	ctx context.Context,
+	expected *model.Config,
+) (bool, error) {
+	h.oauthCredentialMu.Lock()
+	defer h.oauthCredentialMu.Unlock()
+
+	disabled, err := h.sqlite.DisableConfigIfOAuthSnapshotMatches(ctx, expected)
+	if err != nil || !disabled {
+		return disabled, err
+	}
+	h.markChannelDirty(expected.ID, false)
 	return true, nil
 }
 
@@ -541,12 +584,19 @@ func (h *HybridStore) AddLog(ctx context.Context, e *model.LogEntry) error {
 	if e.Time.IsZero() {
 		e.Time = model.JSONTime{Time: time.Now()}
 	}
-	if err := h.sqlite.AddLog(ctx, e); err != nil {
+	h.oauthCredentialMu.Lock()
+	updatedChannelIDs, err := h.sqlite.AddLogWithOAuthQuotaCost(ctx, e)
+	if err != nil {
+		h.oauthCredentialMu.Unlock()
 		return err
 	}
+	for _, channelID := range updatedChannelIDs {
+		h.markChannelDirty(channelID, false)
+	}
+	h.oauthCredentialMu.Unlock()
 	entry := cloneLogEntryForSync(e)
 	h.primarySync.enqueueBestEffort("logs/latest", "logs", func(syncCtx context.Context) error {
-		return h.primary.AddLog(syncCtx, entry)
+		return h.primary.AddLogReplica(syncCtx, entry)
 	})
 	return nil
 }
@@ -558,12 +608,19 @@ func (h *HybridStore) BatchAddLogs(ctx context.Context, logs []*model.LogEntry) 
 			entry.Time = model.JSONTime{Time: now}
 		}
 	}
-	if err := h.sqlite.BatchAddLogs(ctx, logs); err != nil {
+	h.oauthCredentialMu.Lock()
+	updatedChannelIDs, err := h.sqlite.BatchAddLogsWithOAuthQuotaCost(ctx, logs)
+	if err != nil {
+		h.oauthCredentialMu.Unlock()
 		return err
 	}
+	for _, channelID := range updatedChannelIDs {
+		h.markChannelDirty(channelID, false)
+	}
+	h.oauthCredentialMu.Unlock()
 	entries := cloneLogEntriesForSync(logs)
 	h.primarySync.enqueueBestEffort("logs/latest", "logs", func(syncCtx context.Context) error {
-		return h.primary.BatchAddLogs(syncCtx, entries)
+		return h.primary.BatchAddLogsReplica(syncCtx, entries)
 	})
 	return nil
 }
@@ -773,8 +830,8 @@ func (h *HybridStore) UpdateTokenLastUsed(ctx context.Context, tokenHash string,
 	return nil
 }
 
-func (h *HybridStore) UpdateTokenStats(ctx context.Context, tokenHash string, outcome model.TokenStatOutcome, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64) error {
-	if err := h.sqlite.UpdateTokenStats(ctx, tokenHash, outcome, duration, isStreaming, firstByteTime, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens, costUSD, effectiveCostUSD); err != nil {
+func (h *HybridStore) UpdateTokenStats(ctx context.Context, tokenHash string, outcome model.TokenStatOutcome, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64, completedAt time.Time) error {
+	if err := h.sqlite.UpdateTokenStats(ctx, tokenHash, outcome, duration, isStreaming, firstByteTime, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens, costUSD, effectiveCostUSD, completedAt); err != nil {
 		return err
 	}
 	token, err := h.sqlite.GetAuthTokenByValue(ctx, tokenHash)

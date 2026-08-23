@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
@@ -109,6 +110,7 @@ func (s *failingTokenStatsStore) UpdateTokenStats(
 	int64,
 	float64,
 	float64,
+	time.Time,
 ) error {
 	return s.err
 }
@@ -130,6 +132,7 @@ func TestApplyTokenStatsUpdateAddsCostToCacheWhenStoreFails(t *testing.T) {
 	srv.applyTokenStatsUpdate(tokenStatsUpdate{
 		tokenHash:      tokenHash,
 		outcome:        model.TokenStatSuccess(),
+		completedAt:    time.Now(),
 		costUSD:        0.0002,
 		costMultiplier: 1,
 	})

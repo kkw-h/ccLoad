@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	sqlstore "ccLoad/internal/storage/sql"
 )
 
@@ -125,9 +127,12 @@ func TestHybridStore_ChannelFinalStateConvergesToPrimary(t *testing.T) {
 		cfg, cfgErr := primary.GetConfig(ctx, created.ID)
 		keys, keysErr := primary.GetAPIKeys(ctx, created.ID)
 		disabled, disabledErr := primary.LoadDisabledURLs(ctx)
+		// The model cooldown replicates as its own queued entity, so waiting on
+		// the channel state alone can observe a queue that is still draining.
 		return cfgErr == nil && cfg.Name == "final" &&
 			keysErr == nil && len(keys) == 1 && keys[0].Disabled &&
-			disabledErr == nil && len(disabled[created.ID]) == 1
+			disabledErr == nil && len(disabled[created.ID]) == 1 &&
+			hybrid.RuntimeMetrics().PrimarySyncPending == 0
 	})
 	if pending := hybrid.RuntimeMetrics().PrimarySyncPending; pending != 0 {
 		t.Fatalf("同步后仍有 %d 个待处理任务", pending)
@@ -149,6 +154,70 @@ func TestHybridStore_ChannelFinalStateConvergesToPrimary(t *testing.T) {
 		t.Fatalf("模型冷却终态不一致: local=(%d,%d) primary=(%d,%d)",
 			localUntil, localDuration, primaryUntil, primaryDuration)
 	}
+}
+
+func TestHybridStore_OAuthQuotaCostConvergesWithoutReplicaDoubleCount(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	credentialJSON, err := (&codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired: now.Add(time.Hour).Format(time.RFC3339),
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
+			Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
+			StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix(),
+		}}},
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name: "oauth-cost", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		_, getErr := primary.GetConfig(ctx, created.ID)
+		return getErr == nil
+	})
+
+	if err := hybrid.AddLog(ctx, &model.LogEntry{
+		Time: model.JSONTime{Time: now}, ChannelID: created.ID, StatusCode: 200,
+		Cost: 2.25, CostMultiplier: 9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readCost := func(store *sqlstore.SQLStore) (int64, bool) {
+		cfg, getErr := store.GetConfig(ctx, created.ID)
+		if getErr != nil {
+			return 0, false
+		}
+		credential, parseErr := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if parseErr != nil {
+			return 0, false
+		}
+		window := oauthcost.Find(credential.QuotaCostUsage, "codex|secondary")
+		if window == nil {
+			return 0, false
+		}
+		return window.StandardCostMicroUSD, true
+	}
+	if cost, ok := readCost(sqlite); !ok || cost != 2_250_000 {
+		t.Fatalf("SQLite quota cost = (%d, %t), want 2250000", cost, ok)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		cost, ok := readCost(primary)
+		if !ok || cost != 2_250_000 {
+			return false
+		}
+		logs, listErr := primary.ListLogs(ctx, now.Add(-time.Minute), 10, 0, nil)
+		return listErr == nil && len(logs) == 1
+	})
 }
 
 func TestHybridStore_CreateUpdateDeleteKeepsTombstone(t *testing.T) {
@@ -361,6 +430,26 @@ func TestHybridStore_OAuthCASHasSingleSQLiteWinner(t *testing.T) {
 		primaryConfig, primaryErr := primary.GetConfig(ctx, created.ID)
 		return primaryErr == nil && primaryConfig.OAuthCredential == got.OAuthCredential &&
 			hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+	if err := hybrid.SetChannelCooldown(ctx, created.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := hybrid.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := hybrid.DisableConfigIfOAuthSnapshotMatches(ctx, snapshot)
+	if err != nil || !disabled {
+		t.Fatalf("disable OAuth winner = (%v, %v), want (true, nil)", disabled, err)
+	}
+	local, err := hybrid.GetConfig(ctx, created.ID)
+	if err != nil || local.Enabled || local.CooldownUntil != 0 || local.CooldownDurationMs != 0 {
+		t.Fatalf("SQLite rejected OAuth state = (%+v, %v)", local, err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		primaryConfig, primaryErr := primary.GetConfig(ctx, created.ID)
+		return primaryErr == nil && !primaryConfig.Enabled && primaryConfig.CooldownUntil == 0 &&
+			primaryConfig.CooldownDurationMs == 0 && hybrid.RuntimeMetrics().PrimarySyncPending == 0
 	})
 }
 

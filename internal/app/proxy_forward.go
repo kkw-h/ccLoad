@@ -123,8 +123,8 @@ func (s *Server) buildProxyRequest(
 		sourceBody = reqCtx.transformPlan.OriginalBody
 	}
 	body, err := s.prepareTranslatedUpstreamBody(
-		cfg, upstreamProtocol, requestPath, body, sourceBody, hdr,
-		reqCtx != nil && reqCtx.anthropicOAuthBodyFinalized,
+		cfg, upstreamProtocol, requestPath, body, sourceBody, apiKey, hdr,
+		reqCtx != nil && reqCtx.anthropicClaudeCodeWire,
 	)
 	if err != nil {
 		return nil, err
@@ -176,17 +176,9 @@ func (s *Server) buildProxyRequest(
 	if err != nil {
 		return nil, err
 	}
-	officialAnthropicAPIKey := isOfficialAnthropicAPIKeyMessagesRequest(
-		cfg, upstreamProtocol, requestPath, parsedUpstreamURL,
-	)
-	if officialAnthropicAPIKey {
-		body, err = finalizeAnthropicCCH(body)
-		if err != nil {
-			return nil, err
-		}
-	}
+	anthropicClaudeCodeWire := isAnthropicClaudeCodeMessagesRequest(cfg, upstreamProtocol, requestPath)
 	if isAnthropicMessagesRequest(upstreamProtocol, requestPath) {
-		if err = validateAnthropicLegacySystemRequestForUpstream(body, cfg, hdr, parsedUpstreamURL); err != nil {
+		if err = validateAnthropicLegacySystemRequestForUpstream(body, cfg, apiKey, hdr, parsedUpstreamURL); err != nil {
 			return nil, err
 		}
 	}
@@ -219,13 +211,7 @@ func (s *Server) buildProxyRequest(
 		injectAPIKeyHeaders(req, apiKey, runtimeUpstreamProtocol(reqCtx, cfg))
 	}
 
-	// 5. anyrouter渠道：确保anthropic-beta包含context-1m
-	if runtimeUpstreamProtocol(reqCtx, cfg) == util.ProtocolAnthropic &&
-		strings.Contains(strings.ToLower(cfg.Name), "anyrouter") {
-		injectAnthropicBetaFlag(req, "context-1m-2025-08-07")
-	}
-
-	// 5.1 本地协议转换到 Anthropic 上游时，OpenAI/Codex/Gemini 客户端不会携带
+	// 5. 本地协议转换到 Anthropic 上游时，OpenAI/Codex/Gemini 客户端不会携带
 	// anthropic-version。缺失该头会让部分 Claude Code 兼容上游按 OpenAI body 解析。
 	ensureAnthropicVersionHeader(req, runtimeUpstreamProtocol(reqCtx, cfg))
 
@@ -234,6 +220,7 @@ func (s *Server) buildProxyRequest(
 
 	// 6. 自定义请求头规则（认证头黑名单保护）
 	applyHeaderRules(req.Header, cfg.HeaderRules())
+	wireRebuilt := false
 	if cfg.UsesXAIOAuth() {
 		injectXAIResponsesHeaders(req, apiKey, reqCtx.executionIdentity)
 	} else if upstreamProtocol == protocol.Codex {
@@ -242,19 +229,41 @@ func (s *Server) buildProxyRequest(
 		}
 		injectCodexHeaders(req, cfg, apiKey, upstreamStreaming)
 	} else if cfg.UsesAntigravityOAuth() {
+		// injectAntigravityOAuthHeaders 整体替换 req.Header，同样属于重建路径。
 		injectAntigravityOAuthHeaders(req, cfg, s.antigravityUserAgent())
+		wireRebuilt = true
 	} else if isAnthropicOAuthMessagesRequest(cfg, upstreamProtocol, requestPath) {
 		injectAnthropicOAuthHeaders(req, cfg, apiKey, body, hdr)
-	} else if officialAnthropicAPIKey {
-		injectAnthropicAPIKeyHeaders(req, apiKey, body)
+		wireRebuilt = true
+	} else if isZAICodingPlanRequest(cfg, upstreamProtocol, requestPath) {
+		injectZAICodingPlanHeaders(req, cfg, apiKey, body, hdr)
+		wireRebuilt = true
+	} else if anthropicClaudeCodeWire {
+		injectAnthropicAPIKeyHeaders(req, cfg, apiKey, body, hdr)
+		wireRebuilt = true
+	}
+
+	// 6.1 Claude Code CLI / ZCode / Antigravity 指纹路径清空（或整体替换）了请求头再
+	// 重建，步骤 6 的规则产物随之丢失。渠道自定义 header 规则必须最终生效，所以在重建
+	// 之后重跑一次：认证头仍由 authHeaderBlacklist 拦下，override/remove 幂等，append
+	// 也不会重复（前一次的产物已被清空）。
+	if wireRebuilt {
+		applyHeaderRules(req.Header, cfg.HeaderRules())
+	}
+
+	// 6.2 anyrouter 渠道：确保 anthropic-beta 包含 context-1m。必须排在指纹重建
+	// 之后——重建清空了整个请求头，之前注入的 beta flag 会随之丢失。
+	if runtimeUpstreamProtocol(reqCtx, cfg) == util.ProtocolAnthropic &&
+		isAnyrouterChannel(cfg) {
+		injectAnthropicBetaFlag(req, "context-1m-2025-08-07")
 	}
 
 	// 7. 非 Anthropic 上游：移除 Anthropic 协议专属头（anthropic-version/anthropic-beta 等）
 	stripAnthropicProtocolHeaders(req, runtimeUpstreamProtocol(reqCtx, cfg))
 
 	if reqCtx != nil {
-		if isAnthropicOAuthMessagesRequest(cfg, upstreamProtocol, requestPath) {
-			reqCtx.anthropicOAuthBodyFinalized = true
+		if anthropicClaudeCodeWire {
+			reqCtx.anthropicClaudeCodeWire = true
 		}
 		reqCtx.translatedBody = body
 		reqCtx.transformPlan.TranslatedBody = body
@@ -271,6 +280,7 @@ func (s *Server) prepareTranslatedUpstreamBody(
 	requestPath string,
 	body []byte,
 	sourceBody []byte,
+	apiKey string,
 	headers http.Header,
 	anthropicAlreadyFinalized bool,
 ) ([]byte, error) {
@@ -280,28 +290,34 @@ func (s *Server) prepareTranslatedUpstreamBody(
 	body = prepareCodexOAuthResponsesBody(cfg, upstreamProtocol, requestPath, body, headers)
 	if isAnthropicMessagesRequest(upstreamProtocol, requestPath) {
 		var err error
-		if isAnthropicOAuthMessagesRequest(cfg, upstreamProtocol, requestPath) {
-			if anthropicAlreadyFinalized {
-				var request map[string]any
-				if json.Unmarshal(body, &request) == nil {
-					helperShape := nativeAnthropicHaikuHelperShape(body, request, headers, cfg)
-					if helperShape == anthropicHaikuHelperMinimal {
-						return body, nil
-					}
-					if helperShape == anthropicHaikuHelperStructured || isNativeAnthropicClaudeCodeRequest(request, headers, cfg) {
-						return finalizeAnthropicCCH(body)
-					}
+		switch {
+		case !isAnthropicClaudeCodeMessagesRequest(cfg, upstreamProtocol, requestPath):
+			// Z.ai Coding Plan 自带 ZCode 指纹，只做 Anthropic 线协议归一。
+			body, err = normalizeAnthropicMessagesBody(body)
+		case anthropicAlreadyFinalized:
+			var request map[string]any
+			if json.Unmarshal(body, &request) == nil {
+				helperShape := nativeAnthropicHaikuHelperShape(body, request, headers)
+				if helperShape == anthropicHaikuHelperMinimal {
+					return body, nil
 				}
-				body, err = normalizeAnthropicMessagesBody(body, true)
-			} else {
-				body, err = finalizeAnthropicOAuthMessagesBody(body, cfg, headers)
+				if helperShape == anthropicHaikuHelperStructured ||
+					isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey) {
+					return finalizeAnthropicCCH(body)
+				}
 			}
-		} else {
-			body, err = normalizeAnthropicMessagesBody(body, false)
+			body, err = normalizeAnthropicMessagesBody(body)
+		default:
+			body, err = finalizeAnthropicClaudeCodeMessagesBody(body, cfg, apiKey, headers)
 		}
 		if err != nil {
 			return nil, err
 		}
+	}
+	// Z.ai Coding Plan 的 ZCode 设备指纹走 body 的 metadata.user_id。必须留在这个
+	// 共享入口里：挂在代理链路的独立分支上，管理测试就会发出没有指纹的请求。
+	if isZAICodingPlanRequest(cfg, upstreamProtocol, requestPath) {
+		return finalizeZAICodingPlanBody(body, cfg)
 	}
 	if cfg != nil && cfg.UsesAntigravityOAuth() {
 		return prepareAntigravityRequestBody(
@@ -968,14 +984,17 @@ func (s *Server) handleSuccessResponse(
 			if deferredWriter == nil || deferredWriter.Committed() {
 				return nil
 			}
-			if parser.GetLastError() != nil || parser.HasStreamOutput() || parser.IsStreamComplete() {
-				markFirstStreamResponse(reqCtx, readStats, observer)
+			if shouldMarkUpstreamFirstByte(parser) {
+				markFirstStreamResponse(reqCtx, readStats)
 			}
 			if parser.GetLastError() != nil {
 				return errAbortStreamBeforeWrite
 			}
 			if parser.HasStreamOutput() {
-				return deferredWriter.Commit()
+				if err := deferredWriter.Commit(); err != nil {
+					return err
+				}
+				notifyClientFirstByte(observer)
 			}
 			return nil
 		},
@@ -1005,19 +1024,17 @@ func (s *Server) handleSuccessResponse(
 
 	// 提取usage数据和错误事件
 	var streamComplete bool
-	if parser != nil {
-		result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
-		result.ReasoningTokens = parser.GetReasoningTokens()
-		result.Cache5mInputTokens, result.Cache1hInputTokens, result.ServiceTier = parser.GetCacheBreakdown()
-		result.ToolCostUSD = parser.GetToolCostUSD()
-		result.ThinkingEffort = parser.GetThinkingEffort()
+	result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
+	result.ReasoningTokens = parser.GetReasoningTokens()
+	result.Cache5mInputTokens, result.Cache1hInputTokens, result.ServiceTier = parser.GetCacheBreakdown()
+	result.ToolCostUSD = parser.GetToolCostUSD()
+	result.ThinkingEffort = parser.GetThinkingEffort()
 
-		if errorEvent := parser.GetLastError(); errorEvent != nil {
-			result.SSEErrorEvent = errorEvent
-		}
-		streamComplete = parser.IsStreamComplete()
-		result.ResponsesTurnResult, result.HasResponsesTurnResult = parser.GetResponsesTurnResult()
+	if errorEvent := parser.GetLastError(); errorEvent != nil {
+		result.SSEErrorEvent = errorEvent
 	}
+	streamComplete = parser.IsStreamComplete()
+	result.ResponsesTurnResult, result.HasResponsesTurnResult = parser.GetResponsesTurnResult()
 
 	// 生成流诊断消息（仅流请求）
 	if reqCtx.isStreaming {
@@ -1193,14 +1210,17 @@ func (s *Server) handleTranslatedStreamSuccessResponse(
 			if err := parser.Feed(parserEvent); err != nil {
 				return err
 			}
-			if parser.GetLastError() != nil || parser.HasStreamOutput() || parser.IsStreamComplete() {
-				markFirstStreamResponse(reqCtx, readStats, observer)
+			if shouldMarkUpstreamFirstByte(parser) {
+				markFirstStreamResponse(reqCtx, readStats)
 			}
 			if !deferredWriter.Committed() && parser.GetLastError() != nil {
 				return errAbortStreamBeforeWrite
 			}
 			if !deferredWriter.Committed() && parser.HasStreamOutput() {
-				return deferredWriter.Commit()
+				if err := deferredWriter.Commit(); err != nil {
+					return err
+				}
+				notifyClientFirstByte(observer)
 			}
 			return nil
 		},
@@ -1390,7 +1410,10 @@ func attachFirstByteDetector(
 	}
 }
 
-func markFirstStreamResponse(reqCtx *requestContext, readStats *streamReadStats, observer *ForwardObserver) {
+// markFirstStreamResponse 记录上游首个有效响应事件的时间。
+// Responses 元数据也属于上游已返回数据，可以结束上游首字节计时；但此处
+// 不通知客户端，因为 deferredResponseWriter 可能仍在缓冲，客户端尚未收到任何字节。
+func markFirstStreamResponse(reqCtx *requestContext, readStats *streamReadStats) {
 	if !reqCtx.isStreaming || readStats.firstByteSec > 0 {
 		return
 	}
@@ -1400,9 +1423,17 @@ func markFirstStreamResponse(reqCtx *requestContext, readStats *streamReadStats,
 	if readStats.firstByteSec == 0 {
 		readStats.firstByteSec = time.Nanosecond.Seconds()
 	}
+}
+
+func notifyClientFirstByte(observer *ForwardObserver) {
 	if observer != nil && observer.OnFirstByteRead != nil {
 		observer.OnFirstByteRead()
 	}
+}
+
+func shouldMarkUpstreamFirstByte(parser usageParser) bool {
+	return parser.GetLastError() != nil || parser.HasStreamOutput() ||
+		parser.IsStreamComplete() || parser.HasResponsesMetadata()
 }
 
 func shouldProbeSoftError(reqCtx *requestContext, resp *http.Response, upstreamProtocol string) bool {
@@ -1721,8 +1752,8 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	reqCtx.translatedBody = plan.TranslatedBody
 	reqCtx.originalModel = plan.ResponseModel()
 	reqCtx.antigravityOAuth = cfg.UsesAntigravityOAuth()
-	reqCtx.anthropicOAuthBodyFinalized = translatedRequestOverride != nil &&
-		isAnthropicOAuthMessagesRequest(cfg, plan.UpstreamProtocol, plan.UpstreamPath)
+	reqCtx.anthropicClaudeCodeWire = translatedRequestOverride != nil &&
+		isAnthropicClaudeCodeMessagesRequest(cfg, plan.UpstreamProtocol, plan.UpstreamPath)
 	reqCtx.executionIdentity = executionIdentity
 	defer reqCtx.cleanup() // [INFO] 统一清理：定时器 + context（总是安全）
 
@@ -1851,7 +1882,9 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	if resp != nil {
 		s.persistCodexPassiveUsage(reqCtx.ctx, cfg, resp)
 		s.persistAnthropicPassiveUsage(reqCtx.ctx, cfg, resp)
-		if err == nil && cfg.UsesAnthropicOAuth() {
+		// Claude Code 的 Accept-Encoding 声明了 br/zstd，Go transport 只会自动解 gzip，
+		// 剩下的必须自己解——发了那个头就得负责解码。
+		if err == nil && reqCtx.anthropicClaudeCodeWire {
 			err = decodeAnthropicResponse(resp)
 		}
 	}
@@ -2246,6 +2279,7 @@ func (s *Server) forwardAttempt(
 
 	forceReturnClient := false
 	retryStrategies := make([]string, 0, 2)
+	missingStoredItemRetries := 0
 	for !quotaOverdraftReplayed {
 		retrySourcePlan := plan
 		// Rebuild an optimized Codex multi-agent request from the original plan on
@@ -2258,6 +2292,12 @@ func (s *Server) forwardAttempt(
 		if !ok || hasRetryStrategy(retryStrategies, retryStrategy) {
 			break
 		}
+		if strings.HasPrefix(retryStrategy, stripMissingStoredInputItemStrategy+":") {
+			if missingStoredItemRetries >= responsesMissingStoredItemRetryLimit {
+				break
+			}
+			missingStoredItemRetries++
+		}
 		retryStrategies = append(retryStrategies, retryStrategy)
 		retryPlan := plan
 		retryPlan.TranslatedBody = retryBody
@@ -2267,17 +2307,20 @@ func (s *Server) forwardAttempt(
 			retryPlan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt, executionIdentity,
 			retryBody,
 		)
+		plan = retryPlan
 		if res != nil && res.DebugData != nil {
 			reqCtx.debugData = res.DebugData
 		}
 		if err == nil && res != nil && res.Status >= 200 && res.Status < 300 {
 			res.RetryStrategy = strings.Join(retryStrategies, ",")
-			break
+			if len(res.SSEErrorEvent) == 0 {
+				break
+			}
+			continue
 		}
 		if upstreamProtocol != protocol.Anthropic {
 			forceReturnClient = true
 		}
-		plan = retryPlan
 		if err != nil || res == nil {
 			break
 		}
@@ -2289,7 +2332,7 @@ func (s *Server) forwardAttempt(
 		res.ServiceTier = "priority"
 	}
 	if res != nil && antigravityCapacityRetries > 0 {
-		capacityRetryStrategy := fmt.Sprintf("模型容量重试 %d 次", antigravityCapacityRetries)
+		capacityRetryStrategy := modelCapacityRetryStrategy(antigravityCapacityRetries)
 		if res.RetryStrategy == "" {
 			res.RetryStrategy = capacityRetryStrategy
 		} else {
@@ -2622,6 +2665,12 @@ func retryBodyForRejectedRequest(
 	if retryBody, strategy, ok := anthropicRetryBodyFor400(upstreamProtocol, plan, res); ok {
 		return retryBody, strategy, true
 	}
+	if retryBody, strategy, ok := responsesRetryBodyForMissingRequiredParameter(plan, res); ok {
+		return retryBody, strategy, true
+	}
+	if retryBody, strategy, ok := responsesRetryBodyForMissingStoredInputItem(plan, res); ok {
+		return retryBody, strategy, true
+	}
 	if cfg != nil && cfg.UsesAntigravityOAuth() && res != nil && !res.ResponseCommitted {
 		if retryBody, strategy, ok := antigravitySignatureRetryBody(plan.TranslatedBody, res.Body, res.Status); ok {
 			return retryBody, strategy, true
@@ -2652,6 +2701,12 @@ func codexRetryBodyFor400(
 		}
 	}
 	return nil, "", false
+}
+
+// modelCapacityRetryStrategy 与其余重试策略保持同一形状：英文 snake_case 标识符，
+// 便于日志和渠道测试结果按前缀统一解析。
+func modelCapacityRetryStrategy(retries int) string {
+	return fmt.Sprintf("model_capacity_retry_%d", retries)
 }
 
 func hasRetryStrategy(strategies []string, strategy string) bool {
@@ -3336,6 +3391,9 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	if cfg.UsesAnthropicOAuth() {
 		return s.tryAnthropicOAuthChannel(ctx, cfg, reqCtx, w)
 	}
+	if cfg.UsesZAIOAuth() {
+		return s.tryZAIOAuthChannel(ctx, cfg, reqCtx, w)
+	}
 
 	// 查询渠道的API Keys（缓存优先，缓存不可用自动降级到数据库查询）
 	apiKeys, err := s.getAPIKeys(ctx, cfg.ID)
@@ -3427,7 +3485,8 @@ func (s *Server) tryOAuthChannel(
 	reqCtx *proxyRequestContext,
 	w http.ResponseWriter,
 	provider string,
-	loadCredential func(forceRefresh bool) (*model.Config, string, error),
+	disableRejectedCredential bool,
+	loadCredential func(forceRefresh bool, rejectedAccessToken string) (*model.Config, string, error),
 	credentialRejected func(*proxyResult) bool,
 ) (*proxyResult, error) {
 	urls := cfg.GetURLs()
@@ -3439,7 +3498,7 @@ func (s *Server) tryOAuthChannel(
 	var rejectedAccessToken string
 	var rejectedResult *proxyResult
 	for attempt := 0; attempt < 2; attempt++ {
-		runtimeCfg, accessToken, credentialErr := loadCredential(attempt == 1)
+		runtimeCfg, accessToken, credentialErr := loadCredential(attempt == 1, rejectedAccessToken)
 		accessToken = strings.TrimSpace(accessToken)
 		if runtimeCfg == nil {
 			runtimeCfg = cfg
@@ -3447,6 +3506,13 @@ func (s *Server) tryOAuthChannel(
 		if credentialErr != nil {
 			log.Printf("[WARN] %s OAuth credential refresh failed: channel_id=%d err=%v", provider, cfg.ID, credentialErr)
 			if accessToken == "" || (rejectedResult != nil && accessToken == rejectedAccessToken) {
+				if disableRejectedCredential && s.disableTerminalOAuthCredential(ctx, cfg, provider, credentialErr) {
+					if rejectedResult != nil {
+						rejectedResult.nextAction = cooldown.ActionRetryChannel
+						return rejectedResult, nil
+					}
+					return oauthCredentialUnavailableResult(cfg, provider), nil
+				}
 				s.cooldownRejectedOAuthCredential(ctx, cfg, provider)
 				if rejectedResult != nil {
 					rejectedResult.nextAction = cooldown.ActionRetryChannel
@@ -3469,6 +3535,11 @@ func (s *Server) tryOAuthChannel(
 		}
 		if result != nil && credentialRejected(result) {
 			if credentialErr != nil || attempt == 1 {
+				if disableRejectedCredential && credentialErr != nil &&
+					s.disableTerminalOAuthCredential(ctx, cfg, provider, credentialErr) {
+					result.nextAction = cooldown.ActionRetryChannel
+					return result, nil
+				}
 				s.cooldownRejectedOAuthCredential(ctx, cfg, provider)
 				result.nextAction = cooldown.ActionRetryChannel
 				return result, nil
@@ -3490,6 +3561,39 @@ func (s *Server) tryOAuthChannel(
 		break
 	}
 	return nil, ErrAllKeysExhausted
+}
+
+func (s *Server) disableTerminalOAuthCredential(
+	ctx context.Context,
+	cfg *model.Config,
+	provider string,
+	refreshErr error,
+) bool {
+	if !oauthRefreshTokenRejected(refreshErr) {
+		return false
+	}
+	var failedRefresh *codexCredentialRefreshError
+	if !errors.As(refreshErr, &failedRefresh) || strings.TrimSpace(failedRefresh.credential) == "" {
+		return false
+	}
+
+	disableCtx, cancel := cooldownWriteContext(ctx)
+	defer cancel()
+	disabled, err := s.store.DisableOAuthChannelIfCredentialMatches(
+		disableCtx, cfg.ID, failedRefresh.authType, failedRefresh.credential,
+	)
+	if err != nil {
+		log.Printf("[ERROR] 禁用 OAuth 凭证失效渠道失败: provider=%s channel_id=%d err=%v", provider, cfg.ID, err)
+		return false
+	}
+	if disabled {
+		log.Printf("[DISABLED] OAuth 凭证已被上游永久拒绝: provider=%s channel_id=%d", provider, cfg.ID)
+	} else {
+		log.Printf("[INFO] OAuth 凭证快照已变化，跳过禁用: provider=%s channel_id=%d", provider, cfg.ID)
+	}
+	s.invalidateChannelRelatedCache(cfg.ID)
+	s.InvalidateChannelListCache()
+	return true
 }
 
 func (s *Server) cooldownRejectedOAuthCredential(ctx context.Context, cfg *model.Config, provider string) {
@@ -3524,8 +3628,14 @@ func (s *Server) tryCodexOAuthChannel(
 	w http.ResponseWriter,
 ) (*proxyResult, error) {
 	cfg = s.withOAuthBaseURLOverride(cfg)
-	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Codex", func(forceRefresh bool) (*model.Config, string, error) {
-		credential, err := s.codexCredentials.credential(ctx, cfg, forceRefresh)
+	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Codex", true, func(forceRefresh bool, rejectedAccessToken string) (*model.Config, string, error) {
+		var credential *codexauth.Credential
+		var err error
+		if forceRefresh {
+			credential, err = s.codexCredentials.credentialAfterUnauthorized(ctx, cfg, rejectedAccessToken)
+		} else {
+			credential, err = s.codexCredentials.credential(ctx, cfg, false)
+		}
 		if credential == nil {
 			return cfg, "", err
 		}
@@ -3546,7 +3656,7 @@ func (s *Server) tryXAIOAuthChannel(
 	w http.ResponseWriter,
 ) (*proxyResult, error) {
 	cfg = s.withOAuthBaseURLOverride(cfg)
-	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "xAI", func(forceRefresh bool) (*model.Config, string, error) {
+	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "xAI", false, func(forceRefresh bool, _ string) (*model.Config, string, error) {
 		credential, err := s.xaiCredentials.credential(ctx, cfg, forceRefresh)
 		if credential == nil {
 			return cfg, "", err
@@ -3564,7 +3674,7 @@ func (s *Server) tryAnthropicOAuthChannel(
 	w http.ResponseWriter,
 ) (*proxyResult, error) {
 	cfg = s.withOAuthBaseURLOverride(cfg)
-	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Anthropic", func(forceRefresh bool) (*model.Config, string, error) {
+	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Anthropic", false, func(forceRefresh bool, _ string) (*model.Config, string, error) {
 		credential, err := s.anthropicCredentials.credential(ctx, cfg, forceRefresh)
 		if credential == nil {
 			return cfg, "", err
@@ -3572,6 +3682,28 @@ func (s *Server) tryAnthropicOAuthChannel(
 		return cfg, credential.AccessToken, err
 	}, func(result *proxyResult) bool {
 		return result != nil && result.status == http.StatusUnauthorized
+	})
+}
+
+// tryZAIOAuthChannel forwards through a Z.ai Coding Plan credential. The
+// Coding Plan key is static, so a rejection re-derives it from the stored
+// account authorization instead of refreshing a token.
+func (s *Server) tryZAIOAuthChannel(
+	ctx context.Context,
+	cfg *model.Config,
+	reqCtx *proxyRequestContext,
+	w http.ResponseWriter,
+) (*proxyResult, error) {
+	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Z.ai", false, func(forceRefresh bool, _ string) (*model.Config, string, error) {
+		credential, err := s.zaiCredentials.credential(ctx, cfg, forceRefresh)
+		if credential == nil {
+			return cfg, "", err
+		}
+		runtimeCfg := cfg.Clone()
+		runtimeCfg.ZAIDeviceID = credential.DeviceID
+		return runtimeCfg, credential.APIKey, err
+	}, func(result *proxyResult) bool {
+		return result != nil && !result.succeeded && zaiCredentialRejected(result.status)
 	})
 }
 
@@ -3593,7 +3725,7 @@ func (s *Server) tryAntigravityOAuthChannel(
 	}
 	cfg = withAntigravityDefaultFallbackURLs(cfg)
 	cfg = s.withOAuthBaseURLOverride(cfg)
-	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Antigravity", func(forceRefresh bool) (*model.Config, string, error) {
+	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Antigravity", false, func(forceRefresh bool, _ string) (*model.Config, string, error) {
 		credential, err := s.antigravityCredentials.credential(ctx, cfg, forceRefresh)
 		if credential == nil {
 			return cfg, "", err

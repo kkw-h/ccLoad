@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
+	"ccLoad/internal/zaiauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -318,6 +321,9 @@ func (s *Server) fetchModelsForChannel(ctx context.Context, cfg *model.Config, o
 	if cfg.UsesAnthropicOAuth() {
 		return fetchAnthropicOAuthModels(cfg, overrideProtocol)
 	}
+	if cfg.UsesZAIOAuth() {
+		return s.fetchZAIOAuthModels(ctx, cfg, overrideProtocol)
+	}
 	if cfg.UsesAntigravityOAuth() {
 		return s.fetchAntigravityModelsWithURLFallback(ctx, cfg, overrideProtocol)
 	}
@@ -334,6 +340,75 @@ func (s *Server) fetchModelsForChannel(ctx context.Context, cfg *model.Config, o
 		return nil, fmt.Errorf("该渠道没有可用的API Key")
 	}
 	return s.fetchModelsWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, apiKeys)
+}
+
+// fetchZAIOAuthModels lists the Coding Plan lineup live from the account
+// catalog. The built-in lineup is only a fallback for an unreachable catalog,
+// so a model that Z.ai adds to the plan shows up without a ccLoad release.
+func (s *Server) fetchZAIOAuthModels(
+	ctx context.Context,
+	cfg *model.Config,
+	overrideProtocol string,
+) (*FetchModelsResponse, error) {
+	overrideProtocol = strings.ToLower(strings.TrimSpace(overrideProtocol))
+	if overrideProtocol != "" {
+		if !protocol.IsValid(protocol.Protocol(overrideProtocol)) {
+			return nil, fmt.Errorf("不支持的上游协议: %s", overrideProtocol)
+		}
+		if util.NormalizeProtocol(overrideProtocol) != util.ProtocolAnthropic {
+			return nil, fmt.Errorf("模型发现: Z.ai Coding Plan 仅支持 anthropic 协议")
+		}
+	}
+
+	names, source := zaiauth.DefaultModels, "predefined"
+	credential, err := zaiauth.ParseCredential([]byte(cfg.OAuthCredential))
+	if err != nil {
+		return nil, fmt.Errorf("模型发现: 解析 Z.ai 凭证失败: %w", err)
+	}
+	if live, listErr := s.zaiCodingPlanModels(ctx, credential.APIKey); listErr != nil {
+		log.Printf("[WARN] Z.ai 模型目录不可用，回退内置列表 (channel=%d): %v", cfg.ID, listErr)
+	} else {
+		names, source = live, "api"
+	}
+
+	models := make([]model.ModelEntry, len(names))
+	for i, name := range names {
+		models[i] = model.ModelEntry{Model: name}
+	}
+	channelURL := ""
+	if len(cfg.URLs) > 0 {
+		channelURL = cfg.URLs[0].RuntimeURL()
+	}
+	return &FetchModelsResponse{
+		Models: models, Protocol: util.ProtocolAnthropic, Source: source,
+		Debug: &FetchModelsDebug{
+			NormalizedProtocol: util.ProtocolAnthropic,
+			Fetcher:            "zai_coding_plan_catalog", ChannelURL: channelURL,
+		},
+	}, nil
+}
+
+// zaiCodingPlanModels resolves the Coding Plan lineup, newest source first:
+// the account catalog (authoritative), then models.dev (keyless, tracks the
+// plan without a ccLoad release), and only then the built-in lineup.
+func (s *Server) zaiCodingPlanModels(ctx context.Context, apiKey string) ([]string, error) {
+	if s == nil || s.zaiService == nil {
+		return nil, errors.New("z.ai model discovery is unavailable")
+	}
+	models, err := s.zaiService.ListModels(ctx, apiKey)
+	if err == nil && len(models) > 0 {
+		return models, nil
+	}
+	accountErr := err
+	models, err = s.zaiService.ListCommunityModels(ctx)
+	if err == nil && len(models) > 0 {
+		log.Printf("[INFO] Z.ai 账号目录不可用，改用 models.dev 目录: %v", accountErr)
+		return models, nil
+	}
+	if accountErr != nil {
+		return nil, accountErr
+	}
+	return nil, err
 }
 
 func fetchAnthropicOAuthModels(cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
