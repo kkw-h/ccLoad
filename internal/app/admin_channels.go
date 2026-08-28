@@ -14,10 +14,12 @@ import (
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
 	"ccLoad/internal/codexauth"
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/util"
 	"ccLoad/internal/xaiauth"
 	"ccLoad/internal/zaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
@@ -163,19 +165,22 @@ func (s *Server) handleListChannels(c *gin.Context) {
 	}
 
 	ectx := &channelEnrichmentContext{
-		server:              s,
-		now:                 now,
-		healthEnabled:       healthEnabled,
-		priorityMap:         priorityMap,
-		successRateMap:      successRateMap,
-		channelCooldownsMap: cooldowns.channels,
-		keyCooldownsMap:     cooldowns.keys,
-		modelCooldownsMap:   cooldowns.models,
-		apiKeysMap:          allAPIKeys,
+		server:               s,
+		now:                  now,
+		healthEnabled:        healthEnabled,
+		priorityMap:          priorityMap,
+		successRateMap:       successRateMap,
+		channelCooldownsMap:  cooldowns.channels,
+		keyCooldownsMap:      cooldowns.keys,
+		modelCooldownsMap:    cooldowns.models,
+		protocolProbeRetries: s.protocolCapabilities.unsupportedRetrySummaries(now),
+		apiKeysMap:           allAPIKeys,
 	}
 	out := make([]ChannelWithCooldown, 0, len(cfgs))
 	for _, cfg := range cfgs {
-		out = append(out, ectx.enrichChannel(cfg))
+		channel := ectx.enrichChannel(cfg)
+		channel.ManagementAccount = s.managementAccountView(cfg)
+		out = append(out, channel)
 	}
 
 	// 填充空的重定向模型为请求模型（方便前端编辑时显示）
@@ -329,15 +334,16 @@ func paginateChannels(cfgs []*model.Config, c *gin.Context) []*model.Config {
 
 // channelEnrichmentContext 聚合 enrichChannel 所需的批量预计算数据，避免长参数列表。
 type channelEnrichmentContext struct {
-	server              *Server
-	now                 time.Time
-	healthEnabled       bool
-	priorityMap         map[int64]float64
-	successRateMap      map[int64]float64
-	channelCooldownsMap map[int64]time.Time
-	keyCooldownsMap     map[int64]map[int]time.Time
-	modelCooldownsMap   map[int64]map[string]time.Time
-	apiKeysMap          map[int64][]*model.APIKey
+	server               *Server
+	now                  time.Time
+	healthEnabled        bool
+	priorityMap          map[int64]float64
+	successRateMap       map[int64]float64
+	channelCooldownsMap  map[int64]time.Time
+	keyCooldownsMap      map[int64]map[int]time.Time
+	modelCooldownsMap    map[int64]map[string]time.Time
+	protocolProbeRetries map[int64]protocolProbeRetrySummary
+	apiKeysMap           map[int64][]*model.APIKey
 }
 
 // enrichChannel 把单个 cfg 拼装为 ChannelWithCooldown：
@@ -391,6 +397,7 @@ func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWi
 	}
 	oc.KeyCooldowns = keyCooldowns
 	oc.ModelCooldowns = activeModelCooldownInfos(ectx.modelCooldownsMap[cfg.ID], ectx.now)
+	applyProtocolProbeRetrySummary(&oc, ectx.protocolProbeRetries[cfg.ID], ectx.now)
 	return oc
 }
 
@@ -433,6 +440,16 @@ func (s *Server) adminChannelModelEntries(entries []model.ModelEntry) []AdminCha
 		out = append(out, responseEntry)
 	}
 	return out
+}
+
+func applyProtocolProbeRetrySummary(channel *ChannelWithCooldown, summary protocolProbeRetrySummary, now time.Time) {
+	if channel == nil || summary.count <= 0 || !summary.retryAt.After(now) {
+		return
+	}
+	retryAt := summary.retryAt
+	channel.ProtocolProbeRetryCount = summary.count
+	channel.ProtocolProbeRetryAt = &retryAt
+	channel.ProtocolProbeRetryRemainingMS = max(1, retryAt.Sub(now).Milliseconds())
 }
 
 type channelOAuthMetadata struct {
@@ -500,6 +517,22 @@ func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata 
 			return channelOAuthMetadata{}
 		}
 		usage, _, _ := persistedOAuthUsage(credential.OAuthUsage, zaiauth.ChannelType)
+		return channelOAuthMetadata{oauthUsage: usage}
+	}
+	if cfg.UsesCursorOAuth() {
+		credential, err := cursorauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return channelOAuthMetadata{}
+		}
+		usage, _, _ := persistedOAuthUsage(credential.OAuthUsage, cursorauth.ChannelType)
+		return channelOAuthMetadata{oauthUsage: usage}
+	}
+	if cfg.UsesZedOAuth() {
+		credential, err := zedauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return channelOAuthMetadata{}
+		}
+		usage, _, _ := persistedOAuthUsage(credential.OAuthUsage, zedauth.ChannelType)
 		return channelOAuthMetadata{oauthUsage: usage}
 	}
 	if !cfg.UsesCodexOAuth() {
@@ -620,8 +653,21 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "invalid request: "+err.Error())
 		return
 	}
+	if req.forbiddenCredentialFields {
+		RespondErrorMsg(c, http.StatusConflict, "credential fields must be submitted through management_account")
+		return
+	}
+	if req.managementAccountSet && req.AuthType != model.AuthTypeAPIKey {
+		RespondErrorMsg(c, http.StatusConflict, "OAuth channels cannot use management_account")
+		return
+	}
 	if req.AuthType != model.AuthTypeAPIKey {
 		RespondErrorMsg(c, http.StatusBadRequest, "OAuth channels must be created by login or credential import")
+		return
+	}
+	managementRaw, err := prepareChannelManagementCreate(&req)
+	if err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
 		return
 	}
 
@@ -629,6 +675,11 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 	created, err := s.store.CreateConfig(c.Request.Context(), req.ToConfig())
 	if err != nil {
 		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.saveCreatedChannelManagement(c.Request.Context(), created, managementRaw); err != nil {
+		s.rollbackCreatedChannel(c.Request.Context(), created.ID)
+		RespondErrorMsg(c, http.StatusInternalServerError, "failed to save management account")
 		return
 	}
 
@@ -642,13 +693,16 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 	keysToCreate := make([]*model.APIKey, 0, len(apiKeyEntries))
 	for i, entry := range apiKeyEntries {
 		keysToCreate = append(keysToCreate, &model.APIKey{
-			ChannelID:   created.ID,
-			KeyIndex:    i,
-			APIKey:      entry.APIKey,
-			Note:        entry.Note,
-			KeyStrategy: keyStrategy,
-			CreatedAt:   model.JSONTime{Time: now},
-			UpdatedAt:   model.JSONTime{Time: now},
+			ChannelID:       created.ID,
+			KeyIndex:        i,
+			APIKey:          entry.APIKey,
+			Note:            entry.Note,
+			AllowedModels:   append([]string(nil), entry.AllowedModels...),
+			ModelScopeEmpty: entry.ModelScopeEmpty,
+			KeyStrategy:     keyStrategy,
+			Disabled:        entry.ModelScopeEmpty,
+			CreatedAt:       model.JSONTime{Time: now},
+			UpdatedAt:       model.JSONTime{Time: now},
 		})
 	}
 	if len(keysToCreate) > 0 {
@@ -721,8 +775,9 @@ func (s *Server) buildChannelDetail(ctx context.Context, id int64, cfg *model.Co
 		allModelCooldowns = make(map[int64]map[string]time.Time)
 	}
 
+	now := time.Now()
 	metadata := channelOAuthMetadataFromCredential(cfg)
-	return ChannelWithCooldown{
+	detail := ChannelWithCooldown{
 		Config:                       cfg,
 		Models:                       s.adminChannelModelEntries(cfg.ModelEntries),
 		CodexPlanType:                metadata.planType,
@@ -732,10 +787,13 @@ func (s *Server) buildChannelDetail(ctx context.Context, id int64, cfg *model.Co
 		AntigravityPaidTier:          metadata.antigravityPaidTier,
 		XAIEmail:                     metadata.xaiEmail,
 		XAISubscriptionTier:          metadata.xaiSubscriptionTier,
+		ManagementAccount:            s.managementAccountView(cfg),
 		XAIEntitlementStatus:         metadata.xaiEntitlementStatus,
 		KeyStrategy:                  channelKeyStrategy(apiKeys),
-		ModelCooldowns:               activeModelCooldownInfos(allModelCooldowns[id], time.Now()),
-	}, apiKeys, nil
+		ModelCooldowns:               activeModelCooldownInfos(allModelCooldowns[id], now),
+	}
+	applyProtocolProbeRetrySummary(&detail, s.protocolCapabilities.unsupportedRetrySummaries(now)[id], now)
+	return detail, apiKeys, nil
 }
 
 // handleGetChannelKeys 获取渠道的所有 API Keys
@@ -800,6 +858,18 @@ func channelKeysForAdmin(cfg *model.Config, storedKeys []*model.APIKey) ([]*mode
 			return nil, err
 		}
 		accessToken, note = credential.APIKey, "Z.ai Coding Plan Key"
+	case cfg.UsesCursorOAuth():
+		credential, err := cursorauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return nil, err
+		}
+		accessToken, note = credential.AccessToken, "Cursor session"
+	case cfg.UsesZedOAuth():
+		credential, err := zedauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return nil, err
+		}
+		accessToken, note = credential.AccessToken, "Zed LLM JWT"
 	}
 
 	return []*model.APIKey{{
@@ -985,8 +1055,13 @@ func (s *Server) handleAPIKeyToggle(c *gin.Context, disable bool) {
 		return
 	}
 
-	if _, err := s.store.GetAPIKey(c.Request.Context(), id, keyIndex); err != nil {
+	key, err := s.store.GetAPIKey(c.Request.Context(), id, keyIndex)
+	if err != nil {
 		RespondErrorMsg(c, http.StatusNotFound, "api key not found")
+		return
+	}
+	if !disable && key.ModelScopeEmpty {
+		RespondErrorMsg(c, http.StatusConflict, "configure at least one model or allow all models before enabling this key")
 		return
 	}
 
@@ -1040,6 +1115,7 @@ func (s *Server) handleUpdateChannelModelDisabled(c *gin.Context, id int64, mode
 		return
 	}
 
+	s.InvalidateAPIKeysCache(id)
 	s.InvalidateChannelListCache()
 	RespondJSON(c, http.StatusOK, upd)
 }
@@ -1105,8 +1181,33 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		RespondErrorMsg(c, http.StatusBadRequest, "invalid request format")
 		return
 	}
-	if strings.TrimSpace(req.AuthType) == "" {
+	rawAuthType := strings.TrimSpace(req.AuthType)
+	if rawAuthType == "" {
 		req.AuthType = existing.GetAuthType()
+	} else {
+		req.AuthType = model.NormalizeAuthType(rawAuthType)
+		if req.AuthType == "" {
+			RespondErrorMsg(c, http.StatusBadRequest, "invalid auth_type")
+			return
+		}
+	}
+	if req.forbiddenCredentialFields {
+		RespondErrorMsg(c, http.StatusConflict, "credential fields must be submitted through management_account")
+		return
+	}
+	if req.managementAccountSet && req.AuthType != model.AuthTypeAPIKey {
+		RespondErrorMsg(c, http.StatusConflict, "OAuth channels cannot use management_account")
+		return
+	}
+	if req.managementAccountSet {
+		if req.ManagementAccount == nil {
+			RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
+			return
+		}
+		if _, _, err := mergeChannelManagementSettings(existing.OAuthCredential, req.ManagementAccount); err != nil {
+			RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
+			return
+		}
 	}
 	if existing.UsesOAuth() {
 		if req.AuthType != existing.GetAuthType() {
@@ -1138,6 +1239,23 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		}
 		req.Models = filterCodexOAuthModelEntries(req.Models, credential.PlanType)
 	}
+	var oldKeys []*model.APIKey
+	if !existing.UsesOAuth() {
+		oldKeys, err = s.getAPIKeys(c.Request.Context(), id)
+		if err != nil {
+			RespondError(c, http.StatusInternalServerError, err)
+			return
+		}
+		submittedKeys := req.normalizeAPIKeys()
+		preserveOmittedAPIKeyAllowedModels(submittedKeys, oldKeys)
+		req.APIKeys = submittedKeys
+		req.APIKey = strings.Join(apiKeyStrings(submittedKeys), ",")
+	}
+	// Normalize submitted scopes before validation so a stale editor cannot
+	// resurrect models that were removed from the channel in the meantime.
+	req.APIKeys = req.normalizeAPIKeys()
+	normalizeAPIKeyScopesForModels(req.APIKeys, req.Models)
+	req.APIKey = strings.Join(apiKeyStrings(req.APIKeys), ",")
 
 	if err := req.Validate(); err != nil {
 		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
@@ -1145,16 +1263,12 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	}
 
 	// 检测api_key是否变化（需要重建API Keys）
-	oldKeys, err := s.getAPIKeys(c.Request.Context(), id)
-	if err != nil {
-		log.Printf("[WARN] 查询旧API Keys失败: %v", err)
-		oldKeys = []*model.APIKey{}
-	}
 	if existing.UsesOAuth() {
 		oldKeys = nil
 	}
 
 	newKeys := req.normalizeAPIKeys()
+	normalizeAPIKeyScopesForModels(newKeys, req.Models)
 	keyStrategy := strings.TrimSpace(req.KeyStrategy)
 	if keyStrategy == "" {
 		keyStrategy = model.KeyStrategySequential
@@ -1172,14 +1286,26 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	}
 
 	notesByIndex := make(map[int]string)
+	scopesByIndex := make(map[int]model.APIKeyModelScope)
 	if !keyChanged {
 		for i, oldKey := range oldKeys {
 			if oldKey.Note != newKeys[i].Note {
 				notesByIndex[oldKey.KeyIndex] = newKeys[i].Note
 			}
+			if !slices.Equal(oldKey.AllowedModels, newKeys[i].AllowedModels) || oldKey.ModelScopeEmpty != newKeys[i].ModelScopeEmpty {
+				scopesByIndex[oldKey.KeyIndex] = model.APIKeyModelScope{
+					AllowedModels:   append([]string(nil), newKeys[i].AllowedModels...),
+					ModelScopeEmpty: newKeys[i].ModelScopeEmpty,
+					// Only preserve a manually disabled key. A key disabled because
+					// its previous scope became empty is re-enabled by an explicit
+					// scope edit.
+					Disabled: (oldKey.Disabled && !oldKey.ModelScopeEmpty) || newKeys[i].ModelScopeEmpty,
+				}
+			}
 		}
 	}
 	noteChanged := len(notesByIndex) > 0
+	modelsChanged := len(scopesByIndex) > 0
 
 	// [INFO] 修复 (2025-10-11): 检测策略变化
 	strategyChanged := false
@@ -1205,33 +1331,46 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	if existing.UsesOAuth() {
 		// OAuth 凭证只由登录、导入和刷新链路维护。
 	} else if keyChanged {
-		disabledByAPIKey := make(map[string]bool, len(oldKeys))
+		existingByValue := make(map[string][]*model.APIKey, len(oldKeys))
 		for _, oldKey := range oldKeys {
-			if oldKey.Disabled {
-				disabledByAPIKey[oldKey.APIKey] = true
+			if oldKey != nil {
+				existingByValue[oldKey.APIKey] = append(existingByValue[oldKey.APIKey], oldKey)
 			}
 		}
+		nextOccurrence := make(map[string]int, len(existingByValue))
 
 		// Key内容/数量变化：删除旧Key并重建
-		_ = s.store.DeleteAllAPIKeys(c.Request.Context(), id)
+		if err := s.store.DeleteAllAPIKeys(c.Request.Context(), id); err != nil {
+			RespondError(c, http.StatusInternalServerError, fmt.Errorf("delete old API keys before rebuild: %w", err))
+			return
+		}
 
 		// 批量创建新的API Keys（优化：单次事务插入替代循环单条插入）
 		now := time.Now()
 		apiKeys := make([]*model.APIKey, 0, len(newKeys))
 		for i, key := range newKeys {
+			var wasDisabled bool
+			occurrence := nextOccurrence[key.APIKey]
+			if matches := existingByValue[key.APIKey]; occurrence < len(matches) {
+				wasDisabled = matches[occurrence].Disabled && !matches[occurrence].ModelScopeEmpty
+				nextOccurrence[key.APIKey] = occurrence + 1
+			}
 			apiKeys = append(apiKeys, &model.APIKey{
-				ChannelID:   id,
-				KeyIndex:    i,
-				APIKey:      key.APIKey,
-				Note:        key.Note,
-				KeyStrategy: keyStrategy,
-				Disabled:    disabledByAPIKey[key.APIKey],
-				CreatedAt:   model.JSONTime{Time: now},
-				UpdatedAt:   model.JSONTime{Time: now},
+				ChannelID:       id,
+				KeyIndex:        i,
+				APIKey:          key.APIKey,
+				Note:            key.Note,
+				AllowedModels:   append([]string(nil), key.AllowedModels...),
+				ModelScopeEmpty: key.ModelScopeEmpty,
+				KeyStrategy:     keyStrategy,
+				Disabled:        wasDisabled || key.ModelScopeEmpty,
+				CreatedAt:       model.JSONTime{Time: now},
+				UpdatedAt:       model.JSONTime{Time: now},
 			})
 		}
 		if err := s.store.CreateAPIKeysBatch(c.Request.Context(), apiKeys); err != nil {
-			log.Printf("[WARN] 批量创建API Keys失败 (channel=%d, count=%d): %v", id, len(apiKeys), err)
+			RespondError(c, http.StatusInternalServerError, fmt.Errorf("rebuild API keys: %w", err))
+			return
 		}
 	} else {
 		// Key内容未变化：策略和备注都是独立元数据，不能重建 Key 导致禁用状态丢失。
@@ -1244,6 +1383,18 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			if err := s.store.UpdateAPIKeyNotes(c.Request.Context(), id, notesByIndex); err != nil {
 				log.Printf("[WARN] 批量更新API Key备注失败 (channel=%d): %v", id, err)
 			}
+		}
+		if modelsChanged {
+			if err := s.store.UpdateAPIKeyModelScopes(c.Request.Context(), id, scopesByIndex); err != nil {
+				RespondError(c, http.StatusInternalServerError, fmt.Errorf("update API key model scopes: %w", err))
+				return
+			}
+		}
+	}
+	if req.managementAccountSet {
+		if _, err := s.channelManagement.SaveSettings(c.Request.Context(), upd, req.ManagementAccount); err != nil {
+			RespondErrorMsg(c, http.StatusInternalServerError, "failed to save management account")
+			return
 		}
 	}
 
@@ -1261,6 +1412,67 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	s.cleanupOrphanedURLStates(c.Request.Context(), id, upd.GetURLs())
 
 	RespondJSON(c, http.StatusOK, upd)
+}
+
+func preserveOmittedAPIKeyAllowedModels(submitted []ChannelAPIKeyRequest, existing []*model.APIKey) {
+	byValue := make(map[string]*model.APIKey, len(existing))
+	for _, key := range existing {
+		if key != nil {
+			if _, seen := byValue[key.APIKey]; !seen {
+				byValue[key.APIKey] = key
+			}
+		}
+	}
+	for i := range submitted {
+		if submitted[i].allowedModelsSet {
+			continue
+		}
+		oldKey := byValue[submitted[i].APIKey]
+		if i < len(existing) && existing[i] != nil && existing[i].APIKey == submitted[i].APIKey {
+			oldKey = existing[i]
+		}
+		if oldKey != nil {
+			submitted[i].AllowedModels = append([]string(nil), oldKey.AllowedModels...)
+			submitted[i].ModelScopeEmpty = oldKey.ModelScopeEmpty
+		}
+	}
+}
+
+// normalizeAPIKeyScopesForModels removes scopes that no longer exist in the
+// submitted model table. This is the backend safety net for stale editors: a
+// key rebuild must not reintroduce a model deleted from the channel.
+func normalizeAPIKeyScopesForModels(keys []ChannelAPIKeyRequest, entries []model.ModelEntry) {
+	configured := make(map[string]struct{}, len(entries))
+	wildcard := false
+	for _, entry := range entries {
+		name := strings.ToLower(strings.TrimSpace(model.RoutingModelName(entry.Model)))
+		if name == "*" {
+			wildcard = true
+			continue
+		}
+		if name != "" {
+			configured[name] = struct{}{}
+		}
+	}
+	if wildcard {
+		return
+	}
+	for i := range keys {
+		if keys[i].ModelScopeEmpty || len(keys[i].AllowedModels) == 0 {
+			continue
+		}
+		kept := keys[i].AllowedModels[:0]
+		for _, allowed := range keys[i].AllowedModels {
+			name := strings.ToLower(strings.TrimSpace(model.RoutingModelName(allowed)))
+			if _, ok := configured[name]; ok {
+				kept = append(kept, allowed)
+			}
+		}
+		keys[i].AllowedModels = kept
+		if len(kept) == 0 {
+			keys[i].ModelScopeEmpty = true
+		}
+	}
 }
 
 // resetAllChannelCooldowns 清除渠道、Key、模型和 URL 冷却，并立即失效相关缓存。
@@ -1454,6 +1666,7 @@ func (s *Server) HandleAddModels(c *gin.Context) {
 		return
 	}
 
+	s.InvalidateAPIKeysCache(channelID)
 	s.InvalidateChannelListCache()
 	RespondJSON(c, http.StatusOK, gin.H{"total": len(cfg.ModelEntries)})
 }
@@ -1500,6 +1713,7 @@ func (s *Server) HandleDeleteModels(c *gin.Context) {
 		return
 	}
 
+	s.InvalidateAPIKeysCache(channelID)
 	s.InvalidateChannelListCache()
 	RespondJSON(c, http.StatusOK, gin.H{"remaining": len(remaining)})
 }
@@ -1715,6 +1929,11 @@ func (s *Server) HandleBatchPatchChannels(c *gin.Context) {
 		return
 	}
 	if result.Updated > 0 {
+		if patch.ModelImportMode != "" {
+			for _, channelID := range channelIDs {
+				s.InvalidateAPIKeysCache(channelID)
+			}
+		}
 		s.InvalidateChannelListCache()
 	}
 
@@ -1893,5 +2112,8 @@ func (s *Server) removeDeletedChannelRuntimeState(cfg *model.Config) {
 	}
 	if s.anthropicCredentials != nil {
 		s.anthropicCredentials.invalidate(id)
+	}
+	if s.zedCredentials != nil {
+		s.zedCredentials.invalidate(id)
 	}
 }

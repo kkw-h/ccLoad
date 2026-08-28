@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ import (
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/testutil"
 	"ccLoad/internal/util"
@@ -155,6 +157,29 @@ func createAnthropicOAuthChannelForAdminTest(t testing.TB, srv *Server, upstream
 		URLs:                  model.ChannelURLs{{URL: upstreamURL, Protocols: []string{util.ProtocolAnthropic}}},
 		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
 		ModelEntries:          []model.ModelEntry{{Model: "claude-sonnet-4-5"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+func createCursorOAuthChannelForAdminTest(t testing.TB, srv *Server, upstreamURL string) *model.Config {
+	t.Helper()
+	payload, err := (&cursorauth.Credential{
+		AccessToken: "tok", APIKey: "cursor-user-key", Email: "user@example.com",
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.store.CreateConfig(context.Background(), &model.Config{
+		Name:                  "cursor-oauth-admin-test",
+		AuthType:              model.AuthTypeCursorOAuth,
+		OAuthCredential:       payload,
+		URLs:                  model.ChannelURLs{{URL: upstreamURL, Protocols: []string{util.ProtocolAnthropic, util.ProtocolOpenAI}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "grok-4.6"}, {Model: "composer-2.5"}},
+		Enabled:               true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -4263,6 +4288,63 @@ func TestHandleChannelTest_HonorsRequestedKeyIndexEvenIfCooled(t *testing.T) {
 	}
 }
 
+func TestHandleChannelTest_OmittedKeyIndexSelectsModelCompatibleKey(t *testing.T) {
+	mockResp := `{
+		"id":"msg_test","type":"message","role":"assistant",
+		"content":[{"type":"text","text":"Hello"}],
+		"model":"claude-haiku-4-5-20251001",
+		"usage":{"input_tokens":10,"output_tokens":5}
+	}`
+	var gotAuth string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(mockResp))
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	ctx := context.Background()
+	created, err := srv.store.CreateConfig(ctx, &model.Config{
+		Name: "test-auto-model-key", URLs: model.ChannelURLs{{URL: upstream.URL}}, Priority: 1, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5"}, {Model: "claude-haiku-4-5-20251001"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-gpt", AllowedModels: []string{"gpt-5"}},
+		{ChannelID: created.ID, KeyIndex: 1, APIKey: "sk-claude", AllowedModels: []string{"claude-haiku-4-5-20251001"}},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+
+	channelID := strconv.FormatInt(created.ID, 10)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model":           "claude-haiku-4-5-20251001",
+		"client_protocol": "anthropic",
+		"content":         "hello",
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := resp.Data["success"].(bool); !success {
+		t.Fatalf("test failed: %+v", resp.Data)
+	}
+	if gotAuth != "Bearer sk-claude" {
+		t.Fatalf("Authorization=%q, want model-compatible key", gotAuth)
+	}
+	if gotIndex, _ := resp.Data["tested_key_index"].(float64); gotIndex != 1 {
+		t.Fatalf("tested_key_index=%v, want 1", resp.Data["tested_key_index"])
+	}
+}
+
 // TestHandleChannelTest_RejectsUnknownKeyIndex 验证：请求一个不存在的 key_index 时直接报错，
 // 不再静默回退到其他可用 Key（既往会调用 SelectAvailableKey）。配合 HonorsRequestedKeyIndexEvenIfCooled
 // 共同保证"显式 key_index 即真"语义。
@@ -5355,10 +5437,16 @@ func TestHandleChannelImageGeneration_XAIOAuthUsesNativeImagesAPI(t *testing.T) 
 	}))
 	defer upstream.Close()
 
-	srv := newInMemoryServerWithSettings(t, map[string]string{
-		config.XAIBaseURLSettingKey: upstream.URL + "/v1",
-	})
-	srv.client = upstream.Client()
+	srv := newInMemoryServer(t)
+	srv.client = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "api.x.ai" {
+			t.Errorf("xAI Images host=%q, want api.x.ai", req.URL.Host)
+		}
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = "http"
+		clone.URL.Host = upstream.host
+		return dispatchTestHTTPRequest(clone)
+	})}
 	credential := mustXAICredentialJSON(t, &xaiauth.Credential{
 		Type: xaiauth.ChannelType, AuthKind: "oauth", AccessToken: "xai-image-token", RefreshToken: "refresh",
 		TokenType: "Bearer", Expired: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
@@ -5436,6 +5524,84 @@ func TestHandleChannelImageGeneration_XAIOAuthUsesNativeImagesAPI(t *testing.T) 
 	}
 }
 
+func TestHandleChannelImageGeneration_XAIOAuthGrok46UsesResponsesImageTool(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode xAI Responses request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"created_at":1770000000,"output":[],"tool_usage":{"image_gen":{"total_tokens":9}}}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"aW1hZ2U=","output_format":"png"}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "api.x.ai" {
+			t.Errorf("xAI Responses host=%q, want api.x.ai", req.URL.Host)
+		}
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = "http"
+		clone.URL.Host = upstream.host
+		return dispatchTestHTTPRequest(clone)
+	})}
+	credential := mustXAICredentialJSON(t, &xaiauth.Credential{
+		Type: xaiauth.ChannelType, AuthKind: "oauth", AccessToken: "xai-grok-access", RefreshToken: "refresh",
+		TokenType: "Bearer", Expired: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		TokenEndpoint: xaiauth.TokenURL, BaseURL: xaiauth.CLIBaseURL,
+	})
+	created, err := srv.store.CreateConfig(context.Background(), &model.Config{
+		Name: "xai-grok46-admin-test", AuthType: model.AuthTypeXAIOAuth, OAuthCredential: credential,
+		URLs:                  model.ChannelURLs{{URL: xaiauth.CLIBaseURL, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "grok-4.6"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	req := newJSONRequest(t, http.MethodPost, fmt.Sprintf("/admin/channels/%d/images/generations", created.ID), map[string]any{
+		"generation_api": imageGenerationAPIImages, "model": "grok-4.6", "prompt": "画一个可爱的小狗", "key_index": 0,
+	})
+	c, w := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", created.ID)}}
+	srv.HandleChannelImageGeneration(c)
+
+	if w.Code != http.StatusOK || gotPath != "/v1/responses" {
+		t.Fatalf("status=%d path=%q body=%s", w.Code, gotPath, w.Body.String())
+	}
+	input, _ := gotBody["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("Responses input=%v", gotBody["input"])
+	}
+	message, _ := input[0].(map[string]any)
+	content, _ := message["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("Responses content=%v", message["content"])
+	}
+	inputText, _ := content[0].(map[string]any)
+	if gotBody["model"] != "grok-4.6" || gotBody["stream"] != true || inputText["text"] != "画一个可爱的小狗" {
+		t.Fatalf("Responses body=%v", gotBody)
+	}
+	tools, _ := gotBody["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "image_generation" {
+		t.Fatalf("Responses tools=%v", gotBody["tools"])
+	}
+	if gotBody["tool_choice"] != "required" {
+		t.Fatalf("xAI Responses image tool_choice=%v, want required", gotBody["tool_choice"])
+	}
+	response := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if success, _ := response.Data["success"].(bool); !success {
+		t.Fatalf("grok-4.6 image generation failed: %v", response.Data)
+	}
+	images, _ := response.Data["images"].([]any)
+	if len(images) != 1 || images[0].(map[string]any)["b64_json"] != "aW1hZ2U=" {
+		t.Fatalf("normalized images=%v", response.Data["images"])
+	}
+}
+
 func TestHandleChannelImageGeneration_XAIOAuthRefreshesRejectedTokenOnce(t *testing.T) {
 	var orderMu sync.Mutex
 	order := make([]string, 0, 3)
@@ -5463,10 +5629,16 @@ func TestHandleChannelImageGeneration_XAIOAuthRefreshesRejectedTokenOnce(t *test
 	}))
 	defer upstream.Close()
 
-	srv := newInMemoryServerWithSettings(t, map[string]string{
-		config.XAIBaseURLSettingKey: upstream.URL + "/v1",
-	})
-	srv.client = upstream.Client()
+	srv := newInMemoryServer(t)
+	srv.client = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "api.x.ai" {
+			t.Errorf("xAI Images host=%q, want api.x.ai", req.URL.Host)
+		}
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = "http"
+		clone.URL.Host = upstream.host
+		return dispatchTestHTTPRequest(clone)
+	})}
 	credential := mustXAICredentialJSON(t, &xaiauth.Credential{
 		Type: xaiauth.ChannelType, AuthKind: "oauth", AccessToken: "rejected-image-token", RefreshToken: "refresh-image-token",
 		TokenType: "Bearer", Expired: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
@@ -5737,6 +5909,66 @@ func TestDownstreamEndpointPath(t *testing.T) {
 	}
 }
 
+// 管理测试与代理链路必须发出同一套上游契约，思考后缀在两边都要落进请求体。
+func TestBuildTestUpstreamRequestPlanAppliesThinkingSuffix(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 11, Name: "codex-test", AuthType: model.AuthTypeAPIKey,
+		URLs:         model.ChannelURLs{{URL: "https://upstream.example.com", Protocols: []string{util.ProtocolCodex}}},
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5.6-luna"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "gpt-5.6-luna", Content: "hello", ClientProtocol: util.ProtocolCodex,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "sk-test", testReq, "gpt-5.6-luna(max)",
+		util.ProtocolCodex, util.ProtocolCodex, "https://upstream.example.com",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	if effort := gjson.GetBytes(plan.requestBody, "reasoning.effort").String(); effort != "max" {
+		t.Fatalf("reasoning.effort=%q, want max. body=%s", effort, plan.requestBody)
+	}
+}
+
+// 跨协议转到 Codex 时，patch 不能用模板默认 medium 盖掉后缀。
+func TestBuildTestUpstreamRequestPlanKeepsThinkingSuffixAcrossCodexTransform(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 12, Name: "codex-transform-test", AuthType: model.AuthTypeAPIKey,
+		URLs:         model.ChannelURLs{{URL: "https://upstream.example.com", Protocols: []string{util.ProtocolCodex}}},
+		ModelEntries: []model.ModelEntry{{Model: "claude-opus-4-6"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-opus-4-6", Content: "hello", ClientProtocol: util.ProtocolAnthropic,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "sk-test", testReq, "claude-opus-4-6(high)",
+		util.ProtocolAnthropic, util.ProtocolCodex, "https://upstream.example.com",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	if effort := gjson.GetBytes(plan.requestBody, "reasoning.effort").String(); effort != "high" {
+		t.Fatalf("reasoning.effort=%q, want high. body=%s", effort, plan.requestBody)
+	}
+}
+
+func TestChannelTestLogIdentityStripsThinkingSuffix(t *testing.T) {
+	t.Parallel()
+
+	logModel, effort := channelTestLogIdentity("gpt-5.6-luna(max)", "low")
+	if logModel != "gpt-5.6-luna" {
+		t.Fatalf("log model=%q, want gpt-5.6-luna", logModel)
+	}
+	if effort != "max" {
+		t.Fatalf("thinking effort=%q, want max from suffix not fallback", effort)
+	}
+}
+
 func TestAdminTestZAICodingPlanEmitsZCodeWireContract(t *testing.T) {
 	srv := newInMemoryServer(t)
 	cfg := newZAITestChannel()
@@ -5746,7 +5978,7 @@ func TestAdminTestZAICodingPlanEmitsZCodeWireContract(t *testing.T) {
 	}
 
 	cfgForBuild, plan, err := srv.buildTestUpstreamRequestPlan(
-		cfg, "key-id.secret", testReq, util.ProtocolAnthropic, util.ProtocolAnthropic, zaiauth.CodingPlanProxyBaseURL,
+		cfg, "key-id.secret", testReq, testReq.Model, util.ProtocolAnthropic, util.ProtocolAnthropic, zaiauth.CodingPlanProxyBaseURL,
 	)
 	if err != nil {
 		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
@@ -5844,5 +6076,169 @@ func TestAdminTestNativeAnthropicDoesNotDoubleAppendHeaderRules(t *testing.T) {
 	}
 	if strings.Count(betas, "context-1m-2025-08-07") != 1 {
 		t.Fatalf("anthropic-beta = %q, append rule must not run twice on the native admin-test path", betas)
+	}
+}
+
+func TestAdminTestCursorOAuthUsesSDKBridgeInsteadOfHTTP(t *testing.T) {
+	t.Parallel()
+	upstreamHits := 0
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"Not Found","message":"Route POST:`+r.URL.Path+` not found","statusCode":404}`)
+	}))
+	srv := newInMemoryServer(t)
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, upstream.URL)
+	runner := &fakeCursorRunner{text: "ok from sdk bridge"}
+	srv.cursorRunner = runner
+
+	result := srv.executeChannelTestWithCooldown(context.Background(), cfg, cooldown.NoKeyIndex, "tok", &testutil.TestChannelRequest{
+		Model: "grok-4.6", ClientProtocol: util.ProtocolAnthropic, Content: "2025 年 1 月 20 日发生了什么大事？",
+	}, true)
+	if success, _ := result["success"].(bool); !success {
+		t.Fatalf("cursor admin test result=%+v", result)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("Cursor OAuth admin test must not HTTP-forward, hits=%d", upstreamHits)
+	}
+	if got, _ := result["upstream_protocol"].(string); got != "cursor-sdk-bridge" {
+		t.Fatalf("upstream_protocol=%q", got)
+	}
+	if got, _ := result["response_text"].(string); got != "ok from sdk bridge" {
+		t.Fatalf("response_text=%q result=%+v", got, result)
+	}
+	if runner.model != "grok-4.6" {
+		t.Fatalf("SDK model=%q, want exact catalog ID", runner.model)
+	}
+	if !strings.Contains(runner.prompt, "2025 年 1 月 20 日发生了什么大事？") {
+		t.Fatalf("prompt=%q", runner.prompt)
+	}
+	if body, _ := result["upstream_request_body"].(string); !strings.Contains(body, `"messages"`) || strings.Contains(body, "chat/completions") {
+		t.Fatalf("client body must stay Anthropic messages, got %s", body)
+	}
+}
+
+func TestHandleChannelTestCursorWritesOneManualLogWithDebug(t *testing.T) {
+	srv := newInMemoryServerWithSettings(t, map[string]string{"debug_log_enabled": "true"})
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, "https://unused.example.com")
+	srv.cursorRunner = &fakeCursorRunner{text: "ok from sdk bridge"}
+	request := newJSONRequest(t, http.MethodPost, fmt.Sprintf("/admin/channels/%d/test", cfg.ID), map[string]any{
+		"model":           "grok-4.6",
+		"client_protocol": "anthropic",
+		"content":         "hello",
+	})
+	c, recorder := newTestContext(t, request)
+	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", cfg.ID)}}
+	srv.HandleChannelTest(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	response := mustParseAPIResponse[map[string]any](t, recorder.Body.Bytes())
+	if success, _ := response.Data["success"].(bool); !success {
+		t.Fatalf("response=%v", response.Data)
+	}
+	// 等待异步代理日志的完整刷新周期，确保没有迟到的重复记录。
+	time.Sleep(config.LogBatchTimeout + 250*time.Millisecond)
+	logs, err := srv.store.ListLogs(context.Background(), time.Time{}, 10, 0, &model.LogFilter{LogSource: model.LogSourceAll})
+	if err != nil {
+		t.Fatalf("ListLogs() error = %v", err)
+	}
+	if len(logs) != 1 || logs[0].LogSource != model.LogSourceManualTest {
+		t.Fatalf("logs=%+v, want one manual-test log", logs)
+	}
+	debug, err := srv.store.GetDebugLogByLogID(context.Background(), logs[0].ID)
+	if err != nil || debug == nil {
+		t.Fatalf("debug=%+v err=%v", debug, err)
+	}
+	if !strings.Contains(debug.ReqURL, "SdkAgentService/CreateAgent+Send") ||
+		!strings.Contains(string(debug.ReqBody), `"id":"grok-4.6"`) ||
+		strings.Contains(string(debug.ReqBody), "cursor-user-key") ||
+		!strings.Contains(string(debug.RespBody), "ok from sdk bridge") ||
+		!strings.Contains(string(debug.TranslatedRespBody), "ok from sdk bridge") {
+		t.Fatalf("debug=%+v", debug)
+	}
+}
+
+func TestAdminTestCursorOAuthReportsMissingBridge(t *testing.T) {
+	t.Parallel()
+	upstreamHits := 0
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	srv := newInMemoryServer(t)
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, upstream.URL)
+	srv.cursorRunner = &fakeCursorRunner{err: cursorauth.ErrAgentMissing}
+
+	result := srv.executeChannelTestWithCooldown(context.Background(), cfg, cooldown.NoKeyIndex, "tok", &testutil.TestChannelRequest{
+		Model: "grok-4.6", ClientProtocol: util.ProtocolAnthropic, Content: "hello",
+	}, true)
+	if success, _ := result["success"].(bool); success {
+		t.Fatalf("missing bridge must fail, result=%+v", result)
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("missing bridge must not HTTP-forward, hits=%d", upstreamHits)
+	}
+	if status, _ := result["status_code"].(int); status != http.StatusServiceUnavailable {
+		t.Fatalf("status_code=%v result=%+v", result["status_code"], result)
+	}
+	if action, _ := result["cooldown_action"].(string); action != "client_error_no_cooldown" {
+		t.Fatalf("cooldown_action=%q result=%+v", action, result)
+	}
+	if errMsg, _ := result["error"].(string); !strings.Contains(errMsg, "cursor-sdk-bridge is not installed") {
+		t.Fatalf("error=%q", errMsg)
+	}
+}
+
+func TestAdminTestCursorRequiresUserAPIKey(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := createCursorOAuthChannelForAdminTest(t, srv, "https://example.invalid")
+	payload, err := (&cursorauth.Credential{AccessToken: "tok", Email: "user@example.com"}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.OAuthCredential = payload
+	result := srv.executeChannelTestWithCooldown(context.Background(), cfg, cooldown.NoKeyIndex, "tok", &testutil.TestChannelRequest{
+		Model: "grok-4.6", ClientProtocol: util.ProtocolAnthropic, Content: "hello",
+	}, true)
+	if status, _ := result["status_code"].(int); status != http.StatusUnauthorized {
+		t.Fatalf("status_code=%v result=%+v", result["status_code"], result)
+	}
+	if errMsg, _ := result["error"].(string); !strings.Contains(errMsg, "User API Key") {
+		t.Fatalf("error=%q data=%+v", errMsg, result)
+	}
+}
+
+func TestPrepareChannelTestAuthEnforcesPersistedKeyModelScope(t *testing.T) {
+	t.Parallel()
+
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1, URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5"}, {Model: "qwen3"}},
+	}
+	keys := []*model.APIKey{
+		{KeyIndex: 0, APIKey: "sk-gpt", AllowedModels: []string{"gpt-5"}},
+		{KeyIndex: 1, APIKey: "sk-qwen", AllowedModels: []string{"qwen3"}},
+	}
+	key0 := 0
+	key1 := 1
+
+	if _, _, err := srv.prepareChannelTestAuth(
+		context.Background(), cfg, keys, "qwen3", &key0, "sk-gpt", oauthCredentialUseCurrent,
+	); err == nil || !strings.Contains(err.Error(), "不允许模型") {
+		t.Fatalf("explicit incompatible key error=%v", err)
+	}
+
+	_, selected, err := srv.prepareChannelTestAuth(
+		context.Background(), cfg, keys, "qwen3", &key1, "", oauthCredentialUseCurrent,
+	)
+	if err != nil {
+		t.Fatalf("prepare compatible key: %v", err)
+	}
+	if selected.keyIndex != 1 || selected.apiKey != "sk-qwen" {
+		t.Fatalf("selected=%+v, want qwen-scoped key", selected)
 	}
 }

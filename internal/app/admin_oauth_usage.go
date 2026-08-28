@@ -17,10 +17,12 @@ import (
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
 	"ccLoad/internal/codexauth"
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/xaiauth"
 	"ccLoad/internal/zaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -44,6 +46,8 @@ const (
 var (
 	errOAuthUsageUnsupported         = errors.New("usage: channel does not use a supported OAuth provider")
 	errZAIUsageManagerUnavailable    = errors.New("usage: Z.ai credential manager is unavailable")
+	errCursorUsageManagerUnavailable = errors.New("usage: Cursor credential manager is unavailable")
+	errZedUsageManagerUnavailable    = errors.New("usage: Zed credential manager is unavailable")
 	errCodexUsageManagerUnavailable  = errors.New("usage: Codex credential manager is unavailable")
 	errAnthropicManagerUnavailable   = errors.New("usage: Anthropic credential manager is unavailable")
 	errAntigravityManagerUnavailable = errors.New("usage: Antigravity credential manager is unavailable")
@@ -175,12 +179,13 @@ type antigravityUsagePayload struct {
 }
 
 type oauthUsageWindow struct {
-	LimitName          string  `json:"limit_name"`
-	Kind               string  `json:"kind"`
-	UsedPercent        float64 `json:"used_percent"`
-	RemainingPercent   float64 `json:"remaining_percent"`
-	LimitWindowSeconds int64   `json:"limit_window_seconds"`
-	ResetAt            int64   `json:"reset_at"`
+	LimitName          string    `json:"limit_name"`
+	Kind               string    `json:"kind"`
+	UsedPercent        float64   `json:"used_percent"`
+	RemainingPercent   float64   `json:"remaining_percent"`
+	LimitWindowSeconds int64     `json:"limit_window_seconds"`
+	ResetAt            int64     `json:"reset_at"`
+	SampledAt          time.Time `json:"-"`
 	// StandardCostMicroUSD 是该窗口自身的累计标准成本，仅在响应中内联，不入持久化快照。
 	StandardCostMicroUSD *int64 `json:"standard_cost_microusd,omitempty"`
 }
@@ -193,8 +198,11 @@ type oauthUsageSummary struct {
 	Windows               []oauthUsageWindow      `json:"windows"`
 	RateLimitResetCredits *codexQuotaResetCredits `json:"rate_limit_reset_credits,omitempty"`
 	Warnings              []string                `json:"warnings,omitempty"`
-	XAIBilling            *xaiBillingSummary      `json:"xai_billing,omitempty"`
-	QuotaCostUsage        *oauthcost.Usage        `json:"quota_cost_usage,omitempty"`
+	// DisplayMessage 是上游账单状态文案（例如 Cursor 的额度用尽提示），
+	// 不是采样失败。前端单独渲染，不得塞进 Warnings。
+	DisplayMessage string             `json:"display_message,omitempty"`
+	XAIBilling     *xaiBillingSummary `json:"xai_billing,omitempty"`
+	QuotaCostUsage *oauthcost.Usage   `json:"quota_cost_usage,omitempty"`
 }
 
 type persistedOAuthUsageSnapshot struct {
@@ -398,11 +406,15 @@ func (e *oauthUsageHTTPStatusError) Error() string {
 	return fmt.Sprintf("usage: %s request returned HTTP %d", e.provider, e.statusCode)
 }
 
+func validOAuthUsedPercent(usedPercent float64) bool {
+	return !math.IsNaN(usedPercent) && !math.IsInf(usedPercent, 0) && usedPercent >= 0 && usedPercent <= 100
+}
+
 func appendCodexUsageWindow(windows []oauthUsageWindow, limitName, kind string, raw *codexUsageRawWindow) []oauthUsageWindow {
-	if raw == nil || raw.UsedPercent == nil {
+	if raw == nil || raw.UsedPercent == nil || !validOAuthUsedPercent(*raw.UsedPercent) {
 		return windows
 	}
-	usedPercent := min(max(*raw.UsedPercent, 0), 100)
+	usedPercent := *raw.UsedPercent
 	return append(windows, oauthUsageWindow{
 		LimitName:          limitName,
 		Kind:               kind,
@@ -465,7 +477,10 @@ func appendAnthropicUsageWindow(
 	if raw == nil || raw.Utilization == nil {
 		return windows
 	}
-	usedPercent := min(max(*raw.Utilization, 0), 100)
+	usedPercent := *raw.Utilization
+	if !validOAuthUsedPercent(usedPercent) {
+		return windows
+	}
 	resetAt := int64(0)
 	if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(raw.ResetsAt)); err == nil {
 		resetAt = parsed.Unix()
@@ -602,11 +617,15 @@ func normalizeAntigravityUsage(payload *antigravityUsagePayload) (*oauthUsageSum
 			if bucket.RemainingFraction == nil {
 				continue
 			}
-			remainingPercent := min(max(*bucket.RemainingFraction*100, 0), 100)
+			remainingPercent := *bucket.RemainingFraction * 100
+			usedPercent := 100 - remainingPercent
+			if !validOAuthUsedPercent(usedPercent) {
+				continue
+			}
 			summary.Windows = append(summary.Windows, oauthUsageWindow{
 				LimitName:          limitName,
 				Kind:               antigravityUsageBucketKind(bucket),
-				UsedPercent:        100 - remainingPercent,
+				UsedPercent:        usedPercent,
 				RemainingPercent:   remainingPercent,
 				LimitWindowSeconds: antigravityUsageWindowSeconds(bucket.Window),
 				ResetAt:            antigravityUsageResetAt(bucket.ResetTime),
@@ -666,6 +685,10 @@ func requestCodexUsage(ctx context.Context, client *http.Client, credential *cod
 	summary, err := normalizeCodexUsage(&payload, credential.PlanType)
 	if err != nil {
 		return nil, err
+	}
+	usageSampledAt := time.Now().UTC()
+	for i := range summary.Windows {
+		summary.Windows[i].SampledAt = usageSampledAt
 	}
 	resetCredits, resetErr := requestCodexResetCredits(ctx, client, credential, time.Now())
 	if resetErr != nil {
@@ -739,6 +762,10 @@ func requestAnthropicUsage(
 	summary, err := normalizeAnthropicUsage(&usagePayload)
 	if err != nil {
 		return nil, anthropicCredentialMetadata{}, err
+	}
+	usageSampledAt := time.Now().UTC()
+	for i := range summary.Windows {
+		summary.Windows[i].SampledAt = usageSampledAt
 	}
 	summary.PlanType = strings.TrimSpace(credential.PlanType)
 
@@ -1010,7 +1037,10 @@ func xaiUsageWindowFromConfig(config *xaiUsageConfig, label string) (oauthUsageW
 		return oauthUsageWindow{}, false
 	}
 	if config.CreditUsagePercent != nil {
-		used := min(max(*config.CreditUsagePercent, 0), 100)
+		used := *config.CreditUsagePercent
+		if !validOAuthUsedPercent(used) {
+			return oauthUsageWindow{}, false
+		}
 		periodType := ""
 		periodStart, periodEnd := "", ""
 		if config.MonthlyLimit == nil && config.Used == nil {
@@ -1045,7 +1075,10 @@ func xaiUsageWindowFromConfig(config *xaiUsageConfig, label string) (oauthUsageW
 		if !ok {
 			return oauthUsageWindow{}, false
 		}
-		used := min(max(*config.OnDemandUsed.Val*100 / *config.OnDemandCap.Val, 0), 100)
+		used, ok := usagePercentOf(*config.OnDemandUsed.Val, *config.OnDemandCap.Val)
+		if !ok {
+			return oauthUsageWindow{}, false
+		}
 		return oauthUsageWindow{
 			LimitName: label, Kind: normalizedXAIUsagePeriodKind(periodType, label),
 			UsedPercent: used, RemainingPercent: 100 - used,
@@ -1057,13 +1090,24 @@ func xaiUsageWindowFromConfig(config *xaiUsageConfig, label string) (oauthUsageW
 		if !ok {
 			return oauthUsageWindow{}, false
 		}
-		used := min(max(*config.Used.Val*100 / *config.MonthlyLimit.Val, 0), 100)
+		used, ok := usagePercentOf(*config.Used.Val, *config.MonthlyLimit.Val)
+		if !ok {
+			return oauthUsageWindow{}, false
+		}
 		return oauthUsageWindow{
 			LimitName: label, Kind: "monthly", UsedPercent: used, RemainingPercent: 100 - used,
 			LimitWindowSeconds: windowSeconds, ResetAt: resetAt,
 		}, true
 	}
 	return oauthUsageWindow{}, false
+}
+
+func usagePercentOf(used, limit float64) (float64, bool) {
+	if math.IsNaN(used) || math.IsInf(used, 0) || math.IsNaN(limit) || math.IsInf(limit, 0) ||
+		used < 0 || limit <= 0 {
+		return 0, false
+	}
+	return min(used*100/limit, 100), true
 }
 
 func xaiBillingSummaryFromConfig(config *xaiUsageConfig) *xaiBillingSummary {
@@ -1301,6 +1345,11 @@ func (s *Server) refreshOAuthUsage(ctx context.Context, id int64) (*oauthUsageSu
 		return nil, err
 	}
 	sampledAt := time.Now().UTC()
+	for i := range summary.Windows {
+		if summary.Windows[i].SampledAt.IsZero() {
+			summary.Windows[i].SampledAt = sampledAt
+		}
+	}
 	summary, err = s.persistOAuthUsage(ctx, cfg, summary, requestedAt, sampledAt)
 	if err != nil {
 		return nil, errOAuthUsagePersistFailed
@@ -1318,7 +1367,9 @@ func oauthUsageHTTPStatus(err error) int {
 		errors.Is(err, errAnthropicManagerUnavailable),
 		errors.Is(err, errAntigravityManagerUnavailable),
 		errors.Is(err, errXAIUsageManagerUnavailable),
-		errors.Is(err, errZAIUsageManagerUnavailable):
+		errors.Is(err, errZAIUsageManagerUnavailable),
+		errors.Is(err, errCursorUsageManagerUnavailable),
+		errors.Is(err, errZedUsageManagerUnavailable):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, errOAuthUsagePersistFailed):
 		return http.StatusInternalServerError
@@ -1404,7 +1455,10 @@ func (s *Server) persistOAuthUsage(
 			return attachOAuthQuotaCostUsage(persisted, state.quotaCostUsage), nil
 		}
 
-		nextQuotaCostUsage := reconcileOAuthQuotaCostUsage(state.quotaCostUsage, summary, sampledAt)
+		var nextQuotaCostUsage *oauthcost.Usage
+		if state.tracksQuotaCost {
+			nextQuotaCostUsage = reconcileOAuthQuotaCostUsage(state.quotaCostUsage, summary, sampledAt)
+		}
 		storedSummary := *summary
 		storedSummary.QuotaCostUsage = nil
 		snapshot, err := json.Marshal(persistedOAuthUsageSnapshot{
@@ -1448,6 +1502,18 @@ func (s *Server) invalidateOAuthCredential(channelID int64, provider string) {
 		s.antigravityCredentials.invalidate(channelID)
 	case xaiauth.ChannelType:
 		s.xaiCredentials.invalidate(channelID)
+	case zaiauth.ChannelType:
+		if s.zaiCredentials != nil {
+			s.zaiCredentials.invalidate(channelID)
+		}
+	case cursorauth.ChannelType:
+		if s.cursorCredentials != nil {
+			s.cursorCredentials.invalidate(channelID)
+		}
+	case zedauth.ChannelType:
+		if s.zedCredentials != nil {
+			s.zedCredentials.invalidate(channelID)
+		}
 	}
 }
 
@@ -1572,6 +1638,48 @@ func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oau
 			return nil, oauthUsageCredentialRefreshError(err, "usage: Z.ai credential refresh failed")
 		}
 		return requestZAIUsage(ctx, s.zaiUsageService(cfg), credential.APIKey)
+	case cfg.UsesCursorOAuth():
+		if s.cursorCredentials == nil {
+			return nil, errCursorUsageManagerUnavailable
+		}
+		credential, err := s.cursorCredentials.credential(ctx, cfg, false)
+		if err != nil {
+			return nil, oauthUsageCredentialRefreshError(err, "usage: Cursor credential refresh failed")
+		}
+		service := s.cursorUsageService(cfg)
+		for attempt := 0; attempt < 2; attempt++ {
+			summary, usageErr := requestCursorUsage(ctx, service, credential.AccessToken)
+			if !errors.Is(usageErr, cursorauth.ErrSessionRejected) {
+				return summary, usageErr
+			}
+			if attempt == 1 {
+				return nil, usageErr
+			}
+			credential, err = s.cursorCredentials.credentialAfterUnauthorized(ctx, cfg, credential.AccessToken)
+			if err != nil {
+				return nil, oauthUsageCredentialRefreshError(err, "usage: Cursor credential refresh failed")
+			}
+		}
+		return nil, errors.New("usage: Cursor session token was rejected")
+	case cfg.UsesZedOAuth():
+		if s.zedCredentials == nil {
+			return nil, errZedUsageManagerUnavailable
+		}
+		credential, err := s.zedCredentials.credential(ctx, cfg, false)
+		if err != nil {
+			return nil, oauthUsageCredentialRefreshError(err, "usage: Zed credential refresh failed")
+		}
+		service := zedauth.NewService(s.getClientForChannel(cfg))
+		if s.zedService != nil {
+			service.CurrentUserURL = s.zedService.CurrentUserURL
+			service.LLMTokensURL = s.zedService.LLMTokensURL
+			service.ModelsURL = s.zedService.ModelsURL
+		}
+		usage, err := service.FetchUsage(ctx, credential)
+		if err != nil {
+			return nil, fmt.Errorf("usage: Zed quota request failed: %w", err)
+		}
+		return normalizeZedUsage(usage), nil
 	default:
 		return nil, errOAuthUsageUnsupported
 	}
@@ -1624,4 +1732,85 @@ func normalizeZAIUsage(limits []zaiauth.QuotaLimit) (*oauthUsageSummary, error) 
 		return nil, errors.New("usage: Z.ai response has no quota windows")
 	}
 	return summary, nil
+}
+
+func (s *Server) cursorUsageService(cfg *model.Config) *cursorauth.Service {
+	service := cursorauth.NewService(s.getClientForChannel(cfg))
+	if s.cursorService != nil {
+		service.APIBaseURL = s.cursorService.APIBaseURL
+	}
+	return service
+}
+
+func requestCursorUsage(ctx context.Context, service *cursorauth.Service, accessToken string) (*oauthUsageSummary, error) {
+	usage, err := service.FetchPeriodUsage(ctx, accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("usage: Cursor quota request failed: %w", err)
+	}
+	return normalizeCursorUsage(usage)
+}
+
+func normalizeCursorUsage(usage *cursorauth.PeriodUsage) (*oauthUsageSummary, error) {
+	if usage == nil || len(usage.Windows) == 0 {
+		return nil, errors.New("usage: Cursor response has no quota windows")
+	}
+	summary := &oauthUsageSummary{
+		Provider:       cursorauth.ChannelType,
+		PlanType:       usage.PlanType,
+		DisplayMessage: strings.TrimSpace(usage.DisplayMessage),
+		Windows:        make([]oauthUsageWindow, 0, len(usage.Windows)),
+	}
+	for _, window := range usage.Windows {
+		summary.Windows = append(summary.Windows, oauthUsageWindow{
+			LimitName:          window.Name,
+			Kind:               window.Kind,
+			UsedPercent:        window.UsedPercent,
+			RemainingPercent:   window.RemainingPercent,
+			LimitWindowSeconds: window.LimitWindowSeconds,
+			ResetAt:            window.ResetAt,
+		})
+	}
+	return summary, nil
+}
+
+func normalizeZedUsage(usage *zedauth.Usage) *oauthUsageSummary {
+	summary := &oauthUsageSummary{
+		Provider: zedauth.ChannelType, PlanType: "unknown",
+		Windows: make([]oauthUsageWindow, 0, 1),
+	}
+	if usage == nil {
+		return summary
+	}
+	if planType := strings.TrimSpace(usage.PlanType); planType != "" {
+		summary.PlanType = planType
+	}
+	if usage.AccountTooYoung {
+		summary.EntitlementStatus = "restricted"
+	} else if usage.Limit != nil && *usage.Limit > 0 {
+		used := int64(0)
+		if usage.Used != nil && *usage.Used > 0 {
+			used = *usage.Used
+		}
+		usedPercent := min(float64(used)*100/float64(*usage.Limit), 100)
+		resetAt := int64(0)
+		if reset, err := time.Parse(time.RFC3339, usage.SubscriptionEnd); err == nil {
+			resetAt = reset.Unix()
+		}
+		summary.Windows = append(summary.Windows, oauthUsageWindow{
+			LimitName: "model_requests", Kind: "requests", UsedPercent: usedPercent,
+			RemainingPercent: 100 - usedPercent, ResetAt: resetAt,
+		})
+		if used >= *usage.Limit {
+			summary.EntitlementStatus = "exhausted"
+		}
+	} else {
+		summary.EntitlementStatus = "unmetered"
+	}
+	if usage.Overdue {
+		summary.Warnings = append(summary.Warnings, "Zed account has overdue invoices")
+	}
+	if usage.UsageBasedBilling {
+		summary.Warnings = append(summary.Warnings, "Zed usage-based billing is enabled")
+	}
+	return summary
 }

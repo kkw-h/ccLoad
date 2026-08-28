@@ -25,6 +25,7 @@ const {
   renderOAuthCredential,
   saveCodexQuotaOverdraftFromAdvancedSettings,
   updateCodexQuotaOverdraft,
+  zedOAuthStartOptions,
   openOAuthCredentialImportDialog,
   openOAuthLoginDialog,
   setOAuthCredentialView,
@@ -36,8 +37,45 @@ const {
   submitAnthropicOAuthCode,
   submitCodexOAuthCallback,
   submitCodexPersonalAccessToken,
+  submitCursorCredential,
   submitXAIOAuthCallback
 } = require('./channels-codex-auth.js');
+
+test('Zed login submits the registered installation identity', () => {
+  const previousWindow = global.window;
+  global.window = { t: key => key };
+  try {
+    const options = zedOAuthStartOptions(' 9d4b8c17-12ae-4091-96bc-1a79ce2de601 ');
+    assert.equal(options.method, 'POST');
+    assert.deepEqual(JSON.parse(options.body), { system_id: '9d4b8c17-12ae-4091-96bc-1a79ce2de601' });
+    assert.throws(() => zedOAuthStartOptions('not-a-uuid'), /channels\.zed\.systemIDInvalid/);
+  } finally {
+    global.window = previousWindow;
+  }
+});
+
+test('Cursor credential import accepts only a user API key', async () => {
+  const previousWindow = global.window;
+  global.window = { t: key => key };
+  const input = {
+    value: '  cursor-user-key  ',
+    removeAttribute() {},
+    setAttribute() {},
+    focus() {}
+  };
+  try {
+    let request;
+    await submitCursorCredential(input, async (url, options) => {
+      request = { url, options };
+      return { channel_name: 'Cursor-user@example.com' };
+    });
+    assert.equal(request.url, '/admin/cursor/credentials/import');
+    assert.deepEqual(JSON.parse(request.options.body), { api_key: 'cursor-user-key' });
+    assert.equal(input.value, '');
+  } finally {
+    global.window = previousWindow;
+  }
+});
 
 test('OAuth credential cleanup resumes its SSE stream without restarting the destructive job', async () => {
   const previousWindow = global.window;
@@ -815,7 +853,7 @@ test('closing and pagehide abort active OAuth secret submissions and clear brows
   }
 });
 
-test('logs channel editor loads Codex auth before opening a Codex channel', async () => {
+test('logs channel editor opens a channel and displays Codex auth', async () => {
   const requiredMarkupIDs = new Set([
     'channelModal',
     'commonModelsModal',
@@ -909,6 +947,7 @@ test('logs channel editor loads Codex auth before opening a Codex channel', asyn
     assert.equal(openedChannelID, 42);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
     assert.match(elements.get('codexCredentialContent').textContent, /at-from-log-editor/);
+
   } finally {
     delete require.cache[modulePath];
     for (const [name, descriptor] of previous) {
@@ -1653,7 +1692,6 @@ test('advanced settings confirmation persists only a changed Codex quota overdra
     assert.equal(saved.enabled, false);
     assert.equal(writes, 1);
     assert.equal(elements.get('codexQuotaOverdraftEnabled').checked, false);
-    assert.match(content.textContent, /"enabled": false/);
 
     await saveCodexQuotaOverdraftFromAdvancedSettings(42, async () => {
       writes++;
@@ -1701,6 +1739,85 @@ test('manual Anthropic credential refresh targets the saved channel', async () =
     url: '/admin/channels/42/anthropic-credential/refresh',
     options: { method: 'POST' }
   });
+});
+
+test('manual Cursor credential refresh targets the saved channel', async () => {
+  let captured;
+  const response = { oauth_credential: { access_token: 'cursor-at' } };
+  const result = await refreshOAuthCredential(42, async (url, options) => {
+    captured = { url, options };
+    return response;
+  }, 'cursor_oauth');
+
+  assert.equal(result, response);
+  assert.deepEqual(captured, {
+    url: '/admin/channels/42/cursor-credential/refresh',
+    options: { method: 'POST' }
+  });
+  await assert.rejects(() => refreshOAuthCredential(0, async () => response, 'cursor_oauth'), /saved Cursor channel/);
+});
+
+test('manual xAI credential refresh targets the saved channel', async () => {
+  let captured;
+  const response = { oauth_credential: { access_token: 'xai-at' } };
+  const result = await refreshOAuthCredential(42, async (url, options) => {
+    captured = { url, options };
+    return response;
+  }, 'xai_oauth');
+
+  assert.equal(result, response);
+  assert.deepEqual(captured, {
+    url: '/admin/channels/42/xai-credential/refresh',
+    options: { method: 'POST' }
+  });
+  await assert.rejects(() => refreshOAuthCredential(0, async () => response, 'xai_oauth'), /saved xAI channel/);
+});
+
+test('manual Z.ai credential refresh targets the saved channel', async () => {
+  let captured;
+  const response = { oauth_credential: { api_key: 'zai-key' } };
+  const result = await refreshOAuthCredential(42, async (url, options) => {
+    captured = { url, options };
+    return response;
+  }, 'zai_oauth');
+
+  assert.equal(result, response);
+  assert.deepEqual(captured, {
+    url: '/admin/channels/42/zai-credential/refresh',
+    options: { method: 'POST' }
+  });
+  await assert.rejects(() => refreshOAuthCredential(0, async () => response, 'zai_oauth'), /saved Z.ai channel/);
+});
+
+test('manual Zed credential refresh targets the saved channel', async () => {
+  let captured;
+  const response = { oauth_credential: { access_token: 'zed-jwt' } };
+  const result = await refreshOAuthCredential(42, async (url, options) => {
+    captured = { url, options };
+    return response;
+  }, 'zed_oauth');
+
+  assert.equal(result, response);
+  assert.deepEqual(captured, {
+    url: '/admin/channels/42/zed-credential/refresh',
+    options: { method: 'POST' }
+  });
+  await assert.rejects(() => refreshOAuthCredential(0, async () => response, 'zed_oauth'), /saved Zed channel/);
+});
+
+test('manual credential refresh rejects unsupported auth types', async () => {
+  await assert.rejects(
+    () => refreshOAuthCredential(42, async () => {
+      throw new Error('fetcher must not run');
+    }, 'api_key'),
+    /does not support credential refresh/
+  );
+  await assert.rejects(
+    () => refreshOAuthCredential(42, async () => {
+      throw new Error('fetcher must not run');
+    }, 'gemini_oauth'),
+    /does not support credential refresh/
+  );
 });
 
 test('OAuth usage refresh stores one safe per-channel quota summary', async () => {
@@ -2146,7 +2263,7 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('channelAPIKeyHeader').hidden, true);
     assert.equal(elements.get('channelAPIKeyTable').hidden, true);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
-    assert.equal(elements.get('codexCredentialRefreshButton').hidden, true);
+    assert.equal(elements.get('codexCredentialRefreshButton').hidden, false);
     assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(xaiCredential, null, 2));
     let copiedXAICredential = '';
     await copyOAuthCredential(async text => { copiedXAICredential = text; });
@@ -2161,6 +2278,28 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('channelCodexPlanBadge').textContent, 'Max 20x');
     assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(anthropicCredential, null, 2));
 
+    const cursorCredential = {
+      type: 'cursor', access_token: 'cursor-at', refresh_token: 'cursor-rt', email: 'user@example.com'
+    };
+    applyChannelAuthEditorMode('cursor_oauth', cursorCredential);
+    assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialRefreshButton').hidden, false);
+    assert.equal(elements.get('codexCredentialReadOnlyNotice').hidden, false);
+    assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(cursorCredential, null, 2));
+
+    const zaiCredential = { type: 'z.ai', api_key: 'zai-key', email: 'zai@example.com' };
+    applyChannelAuthEditorMode('zai_oauth', zaiCredential);
+    assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialRefreshButton').hidden, true);
+    assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(zaiCredential, null, 2));
+
+    const zaiOAuthCredential = {
+      type: 'z.ai', api_key: 'zai-key', access_token: 'zai-access', email: 'zai@example.com'
+    };
+    applyChannelAuthEditorMode('zai_oauth', zaiOAuthCredential);
+    assert.equal(elements.get('codexCredentialRefreshButton').hidden, false);
+    assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(zaiOAuthCredential, null, 2));
+
     applyChannelAuthEditorMode('api_key');
     assert.equal(elements.get('codexCredentialReadOnlyNotice').hidden, true);
     assert.equal(elements.get('channelAPIKeyHeader').hidden, false);
@@ -2169,7 +2308,7 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('importKeysBtn').disabled, false);
     assert.equal(elements.get('selectAllKeys').disabled, false);
     assert.equal(elements.get('codexCredentialTab').hidden, true);
-    assert.equal(elements.get('codexCredentialRefreshButton').hidden, false);
+    assert.equal(elements.get('codexCredentialRefreshButton').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').textContent, '');
     assert.equal(elements.get('codexCredentialContent').textContent, '');

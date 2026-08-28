@@ -202,6 +202,12 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureAPIKeysNote(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate api_keys note: %w", err)
 			}
+			if err := ensureAPIKeysAllowedModels(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys allowed_models: %w", err)
+			}
+			if err := ensureAPIKeysModelScopeEmpty(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys model_scope_empty: %w", err)
+			}
 		}
 
 		// 增量迁移：确保auth_tokens表有缓存token字段（2025-12新增）
@@ -456,6 +462,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"global_cooldown_detection_rules", "{}", "json", "未配置渠道专属规则时继承的全局冷却探测规则", "{}"},
 		{"model_reasoning_effort_overrides", "{}", "json", "按原模型名称覆盖可用推理强度", "{}"},
 		{"model_metadata_overrides", "{}", "json", "按原模型名称覆盖模型列表元数据", "{}"},
+		{"model_multimodal_fallback", "{}", "json", "多模态请求(含图片/文件等非文本内容)自动改用回退模型，JSON对象格式 {\"文本模型\":\"回退模型\"}", "{}"},
 		{"antigravity_sensitive_words", config.DefaultAntigravitySensitiveWordsJSON, "json", "Antigravity systemInstruction 中使用零宽字符替换的敏感词 JSON 字符串数组", config.DefaultAntigravitySensitiveWordsJSON},
 		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
 		{"upstream_connection_reuse_limit_seconds", "0", "duration", "上游连接最长复用时间(秒,0=不限制;达到时限后不接收新请求,在途请求完成后关闭)", "0"},

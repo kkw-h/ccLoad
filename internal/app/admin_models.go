@@ -7,14 +7,17 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
 	"ccLoad/internal/zaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -30,16 +33,27 @@ type FetchModelsRequest struct {
 	URLs                   model.ChannelURLs `json:"urls" binding:"required,min=1"`
 	Protocol               string            `json:"protocol,omitempty"`
 	APIKeys                []string          `json:"api_keys" binding:"required,min=1"`
+	PerKey                 bool              `json:"per_key,omitempty"`
 	LowercaseModels        bool              `json:"lowercase_models,omitempty"`
 	StripModelSourcePrefix bool              `json:"strip_model_source_prefix,omitempty"`
 }
 
 // FetchModelsResponse 获取模型列表响应
 type FetchModelsResponse struct {
-	Models   []model.ModelEntry `json:"models"`          // 模型列表（包含redirect_model便于编辑）
-	Protocol string             `json:"protocol"`        // 成功请求使用的实际上游协议
-	Source   string             `json:"source"`          // 数据来源: "api"(从API获取) 或 "predefined"(预定义)
-	Debug    *FetchModelsDebug  `json:"debug,omitempty"` // 调试信息（仅开发环境）
+	Models    []model.ModelEntry   `json:"models"`          // 模型列表（包含redirect_model便于编辑）
+	Protocol  string               `json:"protocol"`        // 成功请求使用的实际上游协议
+	Source    string               `json:"source"`          // 数据来源: "api"(从API获取) 或 "predefined"(预定义)
+	Debug     *FetchModelsDebug    `json:"debug,omitempty"` // 调试信息（仅开发环境）
+	KeyModels []FetchKeyModelsItem `json:"key_models,omitempty"`
+}
+
+// FetchKeyModelsItem identifies keys by stable row index and never exposes the credential.
+type FetchKeyModelsItem struct {
+	KeyIndex int                `json:"key_index"`
+	Models   []model.ModelEntry `json:"models"`
+	Protocol string             `json:"protocol,omitempty"`
+	Source   string             `json:"source,omitempty"`
+	Error    string             `json:"error,omitempty"`
 }
 
 // FetchModelsDebug 调试信息结构
@@ -93,7 +107,15 @@ func (s *Server) HandleFetchModels(c *gin.Context) {
 		return
 	}
 
-	response, err := s.fetchModelsForChannel(c.Request.Context(), channel, c.Query("protocol"))
+	perKey := false
+	if rawPerKey := strings.TrimSpace(c.Query("per_key")); rawPerKey != "" {
+		perKey, err = strconv.ParseBool(rawPerKey)
+		if err != nil {
+			RespondErrorMsg(c, http.StatusBadRequest, "per_key 参数无效")
+			return
+		}
+	}
+	response, err := s.fetchModelsForChannel(c.Request.Context(), channel, c.Query("protocol"), perKey)
 	if err != nil {
 		// [INFO] 修复：统一返回200，通过success字段区分成功/失败（上游错误是预期内的）
 		RespondErrorMsg(c, http.StatusOK, err.Error())
@@ -113,8 +135,18 @@ func (s *Server) HandleFetchModelsPreview(c *gin.Context) {
 	}
 
 	req.Protocol = strings.TrimSpace(req.Protocol)
-	req.APIKeys = normalizeModelFetchKeys(req.APIKeys)
-	if len(req.APIKeys) == 0 {
+	var perKeyAPIKeys []*model.APIKey
+	if req.PerKey {
+		perKeyAPIKeys = make([]*model.APIKey, 0, len(req.APIKeys))
+		for i, apiKey := range req.APIKeys {
+			if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+				perKeyAPIKeys = append(perKeyAPIKeys, &model.APIKey{KeyIndex: i, APIKey: apiKey})
+			}
+		}
+	} else {
+		req.APIKeys = normalizeModelFetchKeys(req.APIKeys)
+	}
+	if (!req.PerKey && len(req.APIKeys) == 0) || (req.PerKey && len(perKeyAPIKeys) == 0) {
 		RespondErrorMsg(c, http.StatusBadRequest, "urls、api_keys为必填字段")
 		return
 	}
@@ -126,17 +158,26 @@ func (s *Server) HandleFetchModelsPreview(c *gin.Context) {
 		return
 	}
 
-	response, err := s.fetchModelsWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, req.APIKeys)
+	var response *FetchModelsResponse
+	if req.PerKey {
+		response, err = s.fetchModelsPerKeyWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, perKeyAPIKeys)
+	} else {
+		response, err = s.fetchModelsWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, req.APIKeys)
+	}
 	if err != nil {
 		// [INFO] 修复：统一返回200，通过success字段区分成功/失败（上游错误是预期内的）
 		RespondErrorMsg(c, http.StatusOK, err.Error())
 		return
 	}
 	if req.LowercaseModels || req.StripModelSourcePrefix {
-		response.Models = normalizeModelEntriesForSave(response.Models, modelNormalizationOptions{
+		options := modelNormalizationOptions{
 			lowercaseModels:        req.LowercaseModels,
 			stripModelSourcePrefix: req.StripModelSourcePrefix,
-		})
+		}
+		response.Models = normalizeModelEntriesForSave(response.Models, options)
+		for i := range response.KeyModels {
+			response.KeyModels[i].Models = normalizeModelEntriesForSave(response.KeyModels[i].Models, options)
+		}
 	}
 	RespondJSON(c, http.StatusOK, response)
 }
@@ -177,6 +218,7 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 	unchanged := 0
 	failed := 0
 	changed := false
+	changedChannelIDs := make([]int64, 0, len(channelIDs))
 
 	for _, channelID := range channelIDs {
 		item := BatchRefreshModelsItem{ChannelID: channelID}
@@ -191,7 +233,7 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 		}
 		item.ChannelName = cfg.Name
 
-		resp, err := s.fetchModelsForChannel(ctx, cfg, overrideProtocol)
+		resp, err := s.fetchModelsForChannel(ctx, cfg, overrideProtocol, false)
 		if err != nil {
 			item.Status = "failed"
 			item.Error = err.Error()
@@ -249,10 +291,14 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 		item.Status = "updated"
 		updated++
 		changed = true
+		changedChannelIDs = append(changedChannelIDs, channelID)
 		results = append(results, item)
 	}
 
 	if changed {
+		for _, channelID := range changedChannelIDs {
+			s.InvalidateAPIKeysCache(channelID)
+		}
 		s.InvalidateChannelListCache()
 	}
 
@@ -266,8 +312,8 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 	})
 }
 
-func availableModelFetchKeys(keys []*model.APIKey, now time.Time) []string {
-	apiKeys := make([]string, 0, len(keys))
+func availableModelFetchAPIKeys(keys []*model.APIKey, now time.Time) []*model.APIKey {
+	available := make([]*model.APIKey, 0, len(keys))
 	var cooldownFallback *model.APIKey
 	for _, key := range keys {
 		if key == nil || key.Disabled || strings.TrimSpace(key.APIKey) == "" {
@@ -281,16 +327,24 @@ func availableModelFetchKeys(keys []*model.APIKey, now time.Time) []string {
 			}
 			continue
 		}
-		apiKeys = append(apiKeys, key.APIKey)
+		available = append(available, key)
 	}
-	apiKeys = normalizeModelFetchKeys(apiKeys)
-	if len(apiKeys) > 0 {
-		return apiKeys
+	if len(available) > 0 {
+		return available
 	}
 	if cooldownFallback != nil {
-		return []string{strings.TrimSpace(cooldownFallback.APIKey)}
+		return []*model.APIKey{cooldownFallback}
 	}
-	return apiKeys
+	return available
+}
+
+func availableModelFetchKeys(keys []*model.APIKey, now time.Time) []string {
+	available := availableModelFetchAPIKeys(keys, now)
+	apiKeys := make([]string, 0, len(available))
+	for _, key := range available {
+		apiKeys = append(apiKeys, key.APIKey)
+	}
+	return normalizeModelFetchKeys(apiKeys)
 }
 
 func normalizeModelFetchKeys(apiKeys []string) []string {
@@ -310,36 +364,125 @@ func normalizeModelFetchKeys(apiKeys []string) []string {
 	return normalized
 }
 
-func (s *Server) fetchModelsForChannel(ctx context.Context, cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
+func (s *Server) fetchModelsForChannel(
+	ctx context.Context,
+	cfg *model.Config,
+	overrideProtocol string,
+	perKey bool,
+) (*FetchModelsResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("渠道不存在")
 	}
 	cfg = s.withOAuthBaseURLOverride(cfg)
 	if cfg.UsesXAIOAuth() {
-		return fetchXAIOAuthModels(cfg, overrideProtocol)
+		return sortOAuthFetchModels(fetchXAIOAuthModels(cfg, overrideProtocol))
 	}
 	if cfg.UsesAnthropicOAuth() {
-		return fetchAnthropicOAuthModels(cfg, overrideProtocol)
+		return sortOAuthFetchModels(fetchAnthropicOAuthModels(cfg, overrideProtocol))
 	}
 	if cfg.UsesZAIOAuth() {
-		return s.fetchZAIOAuthModels(ctx, cfg, overrideProtocol)
+		return sortOAuthFetchModels(s.fetchZAIOAuthModels(ctx, cfg, overrideProtocol))
+	}
+	if cfg.UsesCursorOAuth() {
+		return sortOAuthFetchModels(s.fetchCursorOAuthModels(ctx, cfg, overrideProtocol))
+	}
+	if cfg.UsesZedOAuth() {
+		return sortOAuthFetchModels(s.fetchZedOAuthModels(ctx, cfg, overrideProtocol))
 	}
 	if cfg.UsesAntigravityOAuth() {
-		return s.fetchAntigravityModelsWithURLFallback(ctx, cfg, overrideProtocol)
+		return sortOAuthFetchModels(s.fetchAntigravityModelsWithURLFallback(ctx, cfg, overrideProtocol))
 	}
 	if cfg.UsesCodexOAuth() {
-		return s.fetchCodexOAuthModels(ctx, cfg, overrideProtocol)
+		return sortOAuthFetchModels(s.fetchCodexOAuthModels(ctx, cfg, overrideProtocol))
 	}
 
 	keys, err := s.store.GetAPIKeys(ctx, cfg.ID)
 	if err != nil {
 		return nil, fmt.Errorf("该渠道没有可用的API Key")
 	}
+	if perKey {
+		availableKeys := availableModelFetchAPIKeys(keys, time.Now())
+		if len(availableKeys) == 0 {
+			return nil, fmt.Errorf("该渠道没有可用的API Key")
+		}
+		return s.fetchModelsPerKeyWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, availableKeys)
+	}
 	apiKeys := availableModelFetchKeys(keys, time.Now())
 	if len(apiKeys) == 0 {
 		return nil, fmt.Errorf("该渠道没有可用的API Key")
 	}
 	return s.fetchModelsWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, apiKeys)
+}
+
+// OAuth 模型目录由系统生成，不能把上游或静态表的偶然顺序当成展示顺序。
+// 普通渠道仍保留用户输入顺序，不在存储层或通用模型规范化里排序。
+func sortOAuthModelEntries(entries []model.ModelEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		left := strings.ToLower(strings.TrimSpace(entries[i].Model))
+		right := strings.ToLower(strings.TrimSpace(entries[j].Model))
+		if left == right {
+			return entries[i].Model < entries[j].Model
+		}
+		return left < right
+	})
+}
+
+func oauthModelEntries(modelNames []string) []model.ModelEntry {
+	entries := make([]model.ModelEntry, len(modelNames))
+	for i, modelName := range modelNames {
+		entries[i] = model.ModelEntry{Model: modelName}
+	}
+	sortOAuthModelEntries(entries)
+	return entries
+}
+
+func sortOAuthFetchModels(response *FetchModelsResponse, err error) (*FetchModelsResponse, error) {
+	if err != nil || response == nil {
+		return response, err
+	}
+	sortOAuthModelEntries(response.Models)
+	return response, nil
+}
+
+func (s *Server) fetchZedOAuthModels(ctx context.Context, cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
+	overrideProtocol = strings.ToLower(strings.TrimSpace(overrideProtocol))
+	if overrideProtocol != "" {
+		if !protocol.IsValid(protocol.Protocol(overrideProtocol)) {
+			return nil, fmt.Errorf("不支持的上游协议: %s", overrideProtocol)
+		}
+		if util.NormalizeProtocol(overrideProtocol) != util.ProtocolCodex {
+			return nil, errors.New("模型发现: Zed 仅支持 codex 协议")
+		}
+	}
+	if s.zedCredentials == nil {
+		return nil, errors.New("模型发现: Zed 凭证管理器不可用")
+	}
+	credential, err := s.zedCredentials.credential(ctx, cfg, false)
+	if err != nil {
+		return nil, fmt.Errorf("模型发现: 加载 Zed 凭证失败: %w", err)
+	}
+	service := zedauth.NewService(s.getClientForChannel(cfg))
+	if s.zedService != nil {
+		service.ModelsURL = s.zedService.ModelsURL
+		service.LLMTokensURL = s.zedService.LLMTokensURL
+		service.CurrentUserURL = s.zedService.CurrentUserURL
+	}
+	names, err := service.FetchModels(ctx, credential)
+	if err != nil {
+		return nil, fmt.Errorf("模型发现: 请求 Zed 模型目录失败: %w", err)
+	}
+	models := make([]model.ModelEntry, len(names))
+	for i, name := range names {
+		models[i] = model.ModelEntry{Model: name}
+	}
+	channelURL := ""
+	if len(cfg.URLs) > 0 {
+		channelURL = cfg.URLs[0].RuntimeURL()
+	}
+	return &FetchModelsResponse{
+		Models: models, Protocol: util.ProtocolCodex, Source: "api",
+		Debug: &FetchModelsDebug{NormalizedProtocol: util.ProtocolCodex, Fetcher: "zed_model_catalog", ChannelURL: channelURL},
+	}, nil
 }
 
 // fetchZAIOAuthModels lists the Coding Plan lineup live from the account
@@ -409,6 +552,53 @@ func (s *Server) zaiCodingPlanModels(ctx context.Context, apiKey string) ([]stri
 		return nil, accountErr
 	}
 	return nil, err
+}
+
+func (s *Server) fetchCursorOAuthModels(
+	ctx context.Context,
+	cfg *model.Config,
+	overrideProtocol string,
+) (*FetchModelsResponse, error) {
+	overrideProtocol = strings.ToLower(strings.TrimSpace(overrideProtocol))
+	if overrideProtocol != "" {
+		if !protocol.IsValid(protocol.Protocol(overrideProtocol)) {
+			return nil, fmt.Errorf("不支持的上游协议: %s", overrideProtocol)
+		}
+		normalized := util.NormalizeProtocol(overrideProtocol)
+		if normalized != util.ProtocolAnthropic && normalized != util.ProtocolOpenAI {
+			return nil, fmt.Errorf("模型发现: Cursor OAuth 仅支持 anthropic 或 openai 协议")
+		}
+	}
+
+	names, source := cursorauth.DefaultModels, "predefined"
+	credential, err := cursorauth.ParseCredential([]byte(cfg.OAuthCredential))
+	if err != nil {
+		return nil, fmt.Errorf("模型发现: 解析 Cursor 凭证失败: %w", err)
+	}
+	if live, listErr := s.listCursorSDKModels(ctx, credential); listErr != nil {
+		log.Printf("[WARN] Cursor SDK 模型目录不可用，回退 default (channel=%d): %v", cfg.ID, listErr)
+	} else if len(live) > 0 {
+		names, source = live, "api"
+	}
+	models := make([]model.ModelEntry, len(names))
+	for i, name := range names {
+		models[i] = model.ModelEntry{Model: name}
+	}
+	channelURL := ""
+	if len(cfg.URLs) > 0 {
+		channelURL = cfg.URLs[0].RuntimeURL()
+	}
+	discoveredProtocol := util.ProtocolAnthropic
+	if util.NormalizeProtocol(overrideProtocol) == util.ProtocolOpenAI {
+		discoveredProtocol = util.ProtocolOpenAI
+	}
+	return &FetchModelsResponse{
+		Models: models, Protocol: discoveredProtocol, Source: source,
+		Debug: &FetchModelsDebug{
+			NormalizedProtocol: discoveredProtocol,
+			Fetcher:            "cursor_sdk_catalog", ChannelURL: channelURL,
+		},
+	}, nil
 }
 
 func fetchAnthropicOAuthModels(cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
@@ -698,6 +888,89 @@ func (s *Server) fetchModelsWithURLFallback(
 	return nil, fmt.Errorf("获取模型列表失败: 未找到可用URL")
 }
 
+func (s *Server) fetchModelsPerKeyWithURLFallback(
+	ctx context.Context,
+	channelID int64,
+	configuredURLs model.ChannelURLs,
+	overrideProtocol string,
+	apiKeys []*model.APIKey,
+) (*FetchModelsResponse, error) {
+	if len(apiKeys) == 0 {
+		return nil, fmt.Errorf("API Key为空")
+	}
+
+	response := &FetchModelsResponse{
+		Models:    make([]model.ModelEntry, 0),
+		KeyModels: make([]FetchKeyModelsItem, 0, len(apiKeys)),
+	}
+	seenModels := make(map[string]struct{})
+	successfulKeys := 0
+	var firstKeyErr error
+	for _, apiKey := range apiKeys {
+		if apiKey == nil || strings.TrimSpace(apiKey.APIKey) == "" {
+			continue
+		}
+		item := FetchKeyModelsItem{KeyIndex: apiKey.KeyIndex, Models: make([]model.ModelEntry, 0)}
+		fetched, err := s.fetchModelsWithURLFallback(
+			ctx, channelID, configuredURLs, overrideProtocol, []string{apiKey.APIKey},
+		)
+		if err != nil {
+			item.Error = publicFetchModelsError(err)
+			response.KeyModels = append(response.KeyModels, item)
+			if firstKeyErr == nil {
+				firstKeyErr = errors.New(item.Error)
+			}
+			continue
+		}
+		if len(fetched.Models) == 0 {
+			item.Error = "上游未返回任何模型"
+			response.KeyModels = append(response.KeyModels, item)
+			if firstKeyErr == nil {
+				firstKeyErr = errors.New(item.Error)
+			}
+			continue
+		}
+		successfulKeys++
+		item.Models = append(item.Models, fetched.Models...)
+		item.Protocol = fetched.Protocol
+		item.Source = fetched.Source
+		response.KeyModels = append(response.KeyModels, item)
+		if response.Protocol == "" {
+			response.Protocol = fetched.Protocol
+			response.Source = fetched.Source
+			response.Debug = fetched.Debug
+		}
+		for _, entry := range fetched.Models {
+			key := strings.ToLower(model.RoutingModelName(entry.Model))
+			if _, exists := seenModels[key]; exists {
+				continue
+			}
+			seenModels[key] = struct{}{}
+			response.Models = append(response.Models, entry)
+		}
+	}
+	if successfulKeys == 0 {
+		if firstKeyErr != nil {
+			return nil, fmt.Errorf("所有 API Key 模型探测均失败: %w", firstKeyErr)
+		}
+		return nil, errors.New("所有 API Key 模型探测均失败")
+	}
+	return response, nil
+}
+
+func publicFetchModelsError(err error) string {
+	if err == nil {
+		return "模型探测失败"
+	}
+	if statusCode, _, ok := parseFetchModelsStatus(err.Error()); ok {
+		return fmt.Sprintf("模型探测失败: 上游返回 HTTP %d", statusCode)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+		return "模型探测失败: 请求超时"
+	}
+	return "模型探测失败"
+}
+
 func shouldTryNextKeyOnFetchModelsError(err error) bool {
 	if err == nil {
 		return false
@@ -976,6 +1249,31 @@ func replaceModelEntries(cfg *model.Config, fetched []model.ModelEntry, options 
 	oldSet := make(map[string]struct{}, len(oldEntries))
 	disabledAliases := make(map[string]struct{}, len(oldEntries))
 	newSet := make(map[string]struct{}, len(fetched))
+	modelIdentities := func(name string) []string {
+		if name == "" {
+			return nil
+		}
+		normalized, _ := normalizeModelAlias(name, options)
+		return []string{
+			strings.ToLower(name),
+			strings.ToLower(normalized),
+			strings.ToLower(model.RoutingModelName(name)),
+			strings.ToLower(model.RoutingModelName(normalized)),
+		}
+	}
+	rememberDisabled := func(name string) {
+		for _, identity := range modelIdentities(name) {
+			disabledAliases[identity] = struct{}{}
+		}
+	}
+	isDisabled := func(name string) bool {
+		for _, identity := range modelIdentities(name) {
+			if _, exists := disabledAliases[identity]; exists {
+				return true
+			}
+		}
+		return false
+	}
 
 	for _, entry := range oldEntries {
 		key := strings.ToLower(entry.Model)
@@ -983,20 +1281,13 @@ func replaceModelEntries(cfg *model.Config, fetched []model.ModelEntry, options 
 		if !entry.Disabled {
 			continue
 		}
-		disabledAliases[key] = struct{}{}
-		normalizedModel, _ := normalizeModelAlias(entry.Model, options)
-		disabledAliases[strings.ToLower(normalizedModel)] = struct{}{}
-		if entry.RedirectModel != "" {
-			disabledAliases[strings.ToLower(entry.RedirectModel)] = struct{}{}
-		}
+		rememberDisabled(entry.Model)
+		rememberDisabled(entry.RedirectModel)
 	}
 	for i := range fetched {
 		key := strings.ToLower(fetched[i].Model)
 		newSet[key] = struct{}{}
-		_, disabled := disabledAliases[key]
-		if !disabled && fetched[i].RedirectModel != "" {
-			_, disabled = disabledAliases[strings.ToLower(fetched[i].RedirectModel)]
-		}
+		disabled := isDisabled(fetched[i].Model) || isDisabled(fetched[i].RedirectModel)
 		fetched[i].Disabled = fetched[i].Disabled || disabled
 	}
 	for key := range oldSet {

@@ -1073,6 +1073,40 @@ func TestEnsureChannelModelsRedirectField_SQLite(t *testing.T) {
 	}
 }
 
+func TestEnsureAPIKeysAllowedModels_SQLite(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE api_keys (
+			id INTEGER PRIMARY KEY,
+			api_key TEXT NOT NULL
+		);
+		INSERT INTO api_keys (id, api_key) VALUES (1, 'legacy-key')
+	`); err != nil {
+		t.Fatalf("create legacy api_keys: %v", err)
+	}
+
+	if err := ensureAPIKeysAllowedModels(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("ensureAPIKeysAllowedModels: %v", err)
+	}
+	if err := ensureAPIKeysModelScopeEmpty(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("ensureAPIKeysModelScopeEmpty: %v", err)
+	}
+
+	var allowedModels string
+	var modelScopeEmpty int
+	if err := db.QueryRowContext(ctx, `SELECT allowed_models, model_scope_empty FROM api_keys WHERE id = 1`).Scan(&allowedModels, &modelScopeEmpty); err != nil {
+		t.Fatalf("query migrated allowed_models: %v", err)
+	}
+	if allowedModels != "" {
+		t.Fatalf("legacy allowed_models=%q, want unrestricted", allowedModels)
+	}
+	if modelScopeEmpty != 0 {
+		t.Fatalf("legacy model_scope_empty=%d, want unrestricted", modelScopeEmpty)
+	}
+}
+
 func TestMigrateSQLite_AddsChannelModelsDisabled(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -1782,7 +1816,7 @@ func TestEnsureLogsNewColumns_SQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sqliteExistingColumns: %v", err)
 	}
-	for _, col := range []string{"minute_bucket", "auth_token_id", "client_ip", "actual_model", "log_source"} {
+	for _, col := range []string{"minute_bucket", "auth_token_id", "client_ip", "actual_model", "response_model", "log_source"} {
 		if !cols[col] {
 			t.Errorf("column %s not found in logs", col)
 		}

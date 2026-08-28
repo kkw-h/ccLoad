@@ -89,8 +89,9 @@ func (s *SQLStore) GetConfig(ctx context.Context, id int64) (*model.Config, erro
 func (s *SQLStore) GetEnabledChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error) {
 	var query string
 	var args []any
+	routingModel := model.RoutingModelName(modelName)
 
-	if modelName == "*" {
+	if routingModel == "*" {
 		// 通配符：返回所有启用的渠道
 		// 注意：不再从 channels 表读取 models 和 model_redirects
 		query = `
@@ -106,7 +107,8 @@ func (s *SQLStore) GetEnabledChannelsByModel(ctx context.Context, modelName stri
             ORDER BY c.priority DESC, c.id ASC
         `
 	} else {
-		// 精确匹配：使用 channel_models 索引表
+		// 先用基名前缀缩小候选，加载完整条目后再按 RoutingModelName 精确过滤。
+		// 数据库不应复制思考后缀语法，否则迟早会和内存路由规则分叉。
 		query = `
 	            SELECT c.id, c.name, c.url, c.priority, c.rpm_limit, c.max_concurrency,
 		                   c.auth_type, COALESCE(c.oauth_credential, ''), c.websockets, c.protocol_transform_mode, c.enabled, c.scheduled_check_enabled, c.scheduled_check_model,
@@ -117,12 +119,12 @@ func (s *SQLStore) GetEnabledChannelsByModel(ctx context.Context, modelName stri
 	            INNER JOIN channel_models cm ON c.id = cm.channel_id
 	            LEFT JOIN api_keys k ON c.id = k.channel_id
 	            WHERE c.enabled = 1
-              AND cm.model = ?
+	              AND (cm.model = ? OR cm.model LIKE ?)
 	              AND cm.disabled = 0
 	            GROUP BY c.id
             ORDER BY c.priority DESC, c.id ASC
         `
-		args = []any{modelName}
+		args = []any{routingModel, routingModel + "%"}
 	}
 
 	rows, err := s.QueryContext(ctx, query, args...)
@@ -140,6 +142,15 @@ func (s *SQLStore) GetEnabledChannelsByModel(ctx context.Context, modelName stri
 	// 批量加载所有渠道的模型数据
 	if err := s.loadConfigsAuxConcurrent(ctx, configs); err != nil {
 		return nil, err
+	}
+	if routingModel != "*" {
+		matched := configs[:0]
+		for _, cfg := range configs {
+			if cfg.SupportsModel(routingModel) {
+				matched = append(matched, cfg)
+			}
+		}
+		configs = matched
 	}
 
 	return configs, nil
@@ -341,6 +352,9 @@ func (s *SQLStore) UpdateConfig(ctx context.Context, id int64, upd *model.Config
 		if err := s.saveModelEntriesTx(ctx, tx, id, upd.ModelEntries); err != nil {
 			return fmt.Errorf("save model entries: %w", err)
 		}
+		if err := s.pruneAPIKeyAllowedModelsTx(ctx, tx, id, upd.ModelEntries, updatedAtUnix); err != nil {
+			return fmt.Errorf("prune API key model scopes: %w", err)
+		}
 
 		return nil
 	})
@@ -397,6 +411,50 @@ func (s *SQLStore) CompareAndSwapOAuthCredential(
 	})
 	if err != nil {
 		return false, fmt.Errorf("compare and swap OAuth credential: %w", err)
+	}
+	return matched, nil
+}
+
+// CompareAndSwapChannelManagement replaces the private management envelope of
+// an API-key channel while the complete previously persisted payload matches.
+func (s *SQLStore) CompareAndSwapChannelManagement(
+	ctx context.Context,
+	channelID int64,
+	expectedEnvelope, nextEnvelope string,
+) (bool, error) {
+	if nextEnvelope != "" {
+		envelope, err := model.ParseChannelManagementEnvelope(nextEnvelope)
+		if err != nil {
+			return false, fmt.Errorf("invalid next channel management envelope: %w", err)
+		}
+		nextEnvelope, err = envelope.Marshal()
+		if err != nil {
+			return false, fmt.Errorf("marshal next channel management envelope: %w", err)
+		}
+	}
+
+	matched := false
+	err := s.WithTransaction(ctx, func(tx *sql.Tx) error {
+		currentAuthType, currentEnvelope, loadErr := s.loadOAuthCredentialForUpdate(ctx, tx, channelID)
+		if errors.Is(loadErr, sql.ErrNoRows) {
+			return nil
+		}
+		if loadErr != nil {
+			return loadErr
+		}
+		if currentAuthType != model.AuthTypeAPIKey || currentEnvelope != expectedEnvelope {
+			return nil
+		}
+		if _, updateErr := s.execTx(ctx, tx, `
+			UPDATE channels SET oauth_credential = ?, updated_at = ? WHERE id = ?
+		`, nextEnvelope, timeToUnix(time.Now()), channelID); updateErr != nil {
+			return updateErr
+		}
+		matched = true
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("compare and swap channel management envelope: %w", err)
 	}
 	return matched, nil
 }
@@ -708,18 +766,22 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 				continue
 			}
 
+			updatedAtUnix := timeToUnix(time.Now())
 			if _, err := s.execTx(ctx, tx, `
 				UPDATE channels
 				SET priority = ?, cost_multiplier = ?, daily_cost_limit = ?, rpm_limit = ?, max_concurrency = ?,
 					protocol_transform_mode = ?, scheduled_check_model = ?, updated_at = ?
 				WHERE id = ?
 			`, nextPriority, nextCostMultiplier, nextDailyCostLimit, nextRPMLimit, nextMaxConcurrency,
-				nextProtocolMode, nextScheduledCheckModel, timeToUnix(time.Now()), channelID); err != nil {
+				nextProtocolMode, nextScheduledCheckModel, updatedAtUnix, channelID); err != nil {
 				return fmt.Errorf("patch channel %d: %w", channelID, err)
 			}
 			if modelsChanged {
 				if err := s.saveModelEntriesTx(ctx, tx, channelID, nextModels); err != nil {
 					return fmt.Errorf("patch channel %d models: %w", channelID, err)
+				}
+				if err := s.pruneAPIKeyAllowedModelsTx(ctx, tx, channelID, nextModels, updatedAtUnix); err != nil {
+					return fmt.Errorf("patch channel %d API key model scopes: %w", channelID, err)
 				}
 			}
 			result.Updated++
@@ -867,6 +929,103 @@ func reconciledScheduledCheckModel(current string, entries []model.ModelEntry) s
 		}
 	}
 	return ""
+}
+
+func (s *SQLStore) pruneAPIKeyAllowedModelsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	channelID int64,
+	entries []model.ModelEntry,
+	updatedAtUnix int64,
+) error {
+	configured := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		name := strings.ToLower(strings.TrimSpace(model.RoutingModelName(entry.Model)))
+		if name == "*" {
+			return nil
+		}
+		if name != "" {
+			configured[name] = struct{}{}
+		}
+	}
+
+	type scopeUpdate struct {
+		keyIndex        int
+		value           string
+		modelScopeEmpty bool
+		disabled        bool
+	}
+	query := `
+		SELECT key_index, allowed_models, model_scope_empty, disabled
+		FROM api_keys
+		WHERE channel_id = ?
+		ORDER BY key_index ASC
+	`
+	if s.supportsRowLock() {
+		query += " FOR UPDATE"
+	}
+	rows, err := s.queryTx(ctx, tx, query, channelID)
+	if err != nil {
+		return fmt.Errorf("query API key model scopes: %w", err)
+	}
+
+	updates := make([]scopeUpdate, 0)
+	for rows.Next() {
+		var keyIndex int
+		var raw string
+		var modelScopeEmpty, disabled int
+		if err := rows.Scan(&keyIndex, &raw, &modelScopeEmpty, &disabled); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan API key model scope: %w", err)
+		}
+		if raw == "" {
+			continue
+		}
+
+		var allowedModels []string
+		if err := json.Unmarshal([]byte(raw), &allowedModels); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode API key index %d allowed_models: %w", keyIndex, err)
+		}
+		kept := make([]string, 0, len(allowedModels))
+		for _, allowedModel := range allowedModels {
+			if _, ok := configured[strings.ToLower(strings.TrimSpace(allowedModel))]; ok {
+				kept = append(kept, allowedModel)
+			}
+		}
+		if len(kept) == len(allowedModels) {
+			continue
+		}
+		value, err := marshalAllowedModels(kept)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("encode API key index %d allowed_models: %w", keyIndex, err)
+		}
+		updates = append(updates, scopeUpdate{
+			keyIndex:        keyIndex,
+			value:           value,
+			modelScopeEmpty: len(kept) == 0,
+			disabled:        disabled != 0 || len(kept) == 0,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate API key model scopes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close API key model scopes: %w", err)
+	}
+
+	for _, update := range updates {
+		if _, err := s.execTx(ctx, tx, `
+			UPDATE api_keys
+			SET allowed_models = ?, model_scope_empty = ?, disabled = ?, updated_at = ?
+			WHERE channel_id = ? AND key_index = ?
+		`, update.value, update.modelScopeEmpty, update.disabled, updatedAtUnix, channelID, update.keyIndex); err != nil {
+			return fmt.Errorf("update API key index %d model scope: %w", update.keyIndex, err)
+		}
+	}
+	return nil
 }
 
 // DeleteConfig 删除渠道配置

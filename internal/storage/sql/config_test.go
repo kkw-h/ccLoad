@@ -1104,6 +1104,39 @@ func TestConfig_GetEnabledChannelsByModel(t *testing.T) {
 	}
 }
 
+func TestConfig_GetEnabledChannelsByModelUsesRoutingModelName(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t, "routing_model_query.db")
+	ctx := context.Background()
+
+	for _, entry := range []struct {
+		name  string
+		model string
+	}{
+		{name: "thinking-suffix", model: "gpt-5.6-luna(max)"},
+		{name: "unknown-suffix", model: "gpt-5.6-luna(custom)"},
+		{name: "same-prefix", model: "gpt-5.6-luna-other"},
+	} {
+		if _, err := store.CreateConfig(ctx, &model.Config{
+			Name:         entry.name,
+			URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+			Enabled:      true,
+			ModelEntries: []model.ModelEntry{{Model: entry.model}},
+		}); err != nil {
+			t.Fatalf("create %s: %v", entry.name, err)
+		}
+	}
+
+	configs, err := store.GetEnabledChannelsByModel(ctx, "gpt-5.6-luna")
+	if err != nil {
+		t.Fatalf("GetEnabledChannelsByModel(base): %v", err)
+	}
+	if len(configs) != 1 || configs[0].Name != "thinking-suffix" {
+		t.Fatalf("channels for routing base = %#v, want only thinking-suffix", configs)
+	}
+}
+
 func TestConfig_GetEnabledChannelsIncludesCooledEnabledChannels(t *testing.T) {
 	t.Parallel()
 
@@ -1252,6 +1285,12 @@ func TestConfig_BatchPatchConfigs(t *testing.T) {
 	second := create("batch-second", model.ProtocolTransformModeLocal, "model-x", []model.ModelEntry{
 		{Model: "model-x"},
 	})
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: first.ID, KeyIndex: 0, APIKey: "sk-first", AllowedModels: []string{"alias-a"}},
+		{ChannelID: second.ID, KeyIndex: 0, APIKey: "sk-second", AllowedModels: []string{"model-x"}},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
 
 	multiplier := 0.5
 	priority := -12
@@ -1340,6 +1379,13 @@ func TestConfig_BatchPatchConfigs(t *testing.T) {
 		if got.ScheduledCheckModel != "" {
 			t.Fatalf("channel %d scheduled_check_model=%q, want empty", channelID, got.ScheduledCheckModel)
 		}
+		keys, err := store.GetAPIKeys(ctx, channelID)
+		if err != nil {
+			t.Fatalf("GetAPIKeys(%d) after replace: %v", channelID, err)
+		}
+		if len(keys) != 1 || len(keys[0].AllowedModels) != 0 || !keys[0].ModelScopeEmpty || !keys[0].Disabled {
+			t.Fatalf("channel %d key model scopes=%v, want disabled after removing every scoped model", channelID, keys)
+		}
 	}
 
 	unchanged, err := store.BatchPatchConfigs(ctx, []int64{first.ID, second.ID}, model.BatchConfigPatch{
@@ -1351,6 +1397,60 @@ func TestConfig_BatchPatchConfigs(t *testing.T) {
 	}
 	if unchanged.Updated != 0 || unchanged.Unchanged != 2 {
 		t.Fatalf("unexpected unchanged result: %+v", unchanged)
+	}
+}
+
+func TestConfig_UpdatePrunesAPIKeyModelScopes(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t, "prune-key-model-scopes.db")
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name: "prune-key-model-scopes", URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "model-a"}, {Model: "model-b"}, {Model: "model-c(max)"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "sk-restricted", AllowedModels: []string{"MODEL-A", "model-b"}},
+		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-unrestricted"},
+		{ChannelID: cfg.ID, KeyIndex: 2, APIKey: "sk-only-removed", AllowedModels: []string{"model-b"}},
+		{ChannelID: cfg.ID, KeyIndex: 3, APIKey: "sk-routing-name", AllowedModels: []string{"model-c"}},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+
+	cfg.ModelEntries = []model.ModelEntry{{Model: "model-a"}, {Model: "model-c(max)"}}
+	cfg, err = store.UpdateConfig(ctx, cfg.ID, cfg)
+	if err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+	keys, err := store.GetAPIKeys(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys: %v", err)
+	}
+	if len(keys) != 4 || !slices.Equal(keys[0].AllowedModels, []string{"MODEL-A"}) || len(keys[1].AllowedModels) != 0 ||
+		len(keys[2].AllowedModels) != 0 || !keys[2].ModelScopeEmpty || !keys[2].Disabled ||
+		!slices.Equal(keys[3].AllowedModels, []string{"model-c"}) || keys[3].ModelScopeEmpty {
+		t.Fatalf("key model scopes after removal=%v", keys)
+	}
+
+	if err := store.UpdateAPIKeyModelScopes(ctx, cfg.ID, map[int]model.APIKeyModelScope{
+		0: {AllowedModels: []string{"dynamic-model"}},
+	}); err != nil {
+		t.Fatalf("UpdateAPIKeyModelScopes: %v", err)
+	}
+	cfg.ModelEntries = []model.ModelEntry{{Model: "*"}}
+	if _, err := store.UpdateConfig(ctx, cfg.ID, cfg); err != nil {
+		t.Fatalf("UpdateConfig wildcard: %v", err)
+	}
+	key, err := store.GetAPIKey(ctx, cfg.ID, 0)
+	if err != nil {
+		t.Fatalf("GetAPIKey wildcard: %v", err)
+	}
+	if !slices.Equal(key.AllowedModels, []string{"dynamic-model"}) {
+		t.Fatalf("wildcard key model scope=%v, want preserved dynamic model", key.AllowedModels)
 	}
 }
 
@@ -1491,5 +1591,87 @@ func TestConfig_ModelRedirect(t *testing.T) {
 	}
 	if !foundRedirect {
 		t.Error("expected to find gpt-4 -> gpt-4-turbo redirect")
+	}
+}
+
+func TestConfig_ChannelManagementCompareAndSwap(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t, "channel-management-cas.db")
+	ctx := context.Background()
+
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "managed-api-key", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := `{"kind":"channel_management","version":1,"profile":"sub2api","settings":{"base_url":"https://panel.example.com","access_token":"first-private-token"},"state":{}}`
+	second := `{"kind":"channel_management","version":1,"profile":"sub2api_pro","settings":{"base_url":"https://pro.example.com","access_token":"second-private-token","daily_checkin_enabled":true,"daily_checkin_time":"08:30"},"state":{}}`
+
+	updated, err := store.CompareAndSwapChannelManagement(ctx, created.ID, "", first)
+	if err != nil || !updated {
+		t.Fatalf("empty -> first CAS = (%v, %v), want (true, nil)", updated, err)
+	}
+	got, err := store.GetConfig(ctx, created.ID)
+	if err != nil || got.OAuthCredential != first {
+		t.Fatalf("first persisted envelope = (%q, %v)", got.OAuthCredential, err)
+	}
+
+	updated, err = store.CompareAndSwapChannelManagement(ctx, created.ID, first+" ", second)
+	if err != nil || updated {
+		t.Fatalf("non-exact expected CAS = (%v, %v), want (false, nil)", updated, err)
+	}
+	updated, err = store.CompareAndSwapChannelManagement(ctx, created.ID, first, second)
+	if err != nil || !updated {
+		t.Fatalf("replace CAS = (%v, %v), want (true, nil)", updated, err)
+	}
+	updated, err = store.CompareAndSwapChannelManagement(ctx, created.ID, first, "")
+	if err != nil || updated {
+		t.Fatalf("stale CAS = (%v, %v), want (false, nil)", updated, err)
+	}
+	updated, err = store.CompareAndSwapChannelManagement(ctx, created.ID, second, "")
+	if err != nil || !updated {
+		t.Fatalf("clear CAS = (%v, %v), want (true, nil)", updated, err)
+	}
+	got, err = store.GetConfig(ctx, created.ID)
+	if err != nil || got.OAuthCredential != "" {
+		t.Fatalf("cleared envelope = (%q, %v)", got.OAuthCredential, err)
+	}
+
+	db := store.(*sqlstore.SQLStore)
+	if _, err := db.ExecContext(ctx, `UPDATE channels SET auth_type = '' WHERE id = ?`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	updated, err = store.CompareAndSwapChannelManagement(ctx, created.ID, "", first)
+	if err != nil || updated {
+		t.Fatalf("legacy empty auth_type CAS = (%v, %v), want (false, nil)", updated, err)
+	}
+
+	if _, err := store.CompareAndSwapChannelManagement(ctx, created.ID, "", `{"kind":"channel_management"}`); err == nil {
+		t.Fatal("CAS accepted invalid next envelope")
+	}
+}
+
+func TestConfig_ChannelManagementCompareAndSwapRejectsOAuthChannel(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t, "channel-management-oauth.db")
+	ctx := context.Background()
+	credential := `{"type":"codex","access_token":"oauth-private-token","refresh_token":"oauth-refresh-token"}`
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "oauth-channel", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credential,
+		URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := `{"kind":"channel_management","version":1,"profile":"sub2api","settings":{"base_url":"https://panel.example.com","access_token":"management-private-token"},"state":{}}`
+	updated, err := store.CompareAndSwapChannelManagement(ctx, created.ID, credential, next)
+	if err != nil || updated {
+		t.Fatalf("OAuth channel CAS = (%v, %v), want (false, nil)", updated, err)
+	}
+	got, err := store.GetConfig(ctx, created.ID)
+	if err != nil || got.OAuthCredential != credential || !got.UsesCodexOAuth() {
+		t.Fatalf("OAuth channel changed = (%#v, %v)", got, err)
 	}
 }

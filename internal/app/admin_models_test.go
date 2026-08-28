@@ -109,6 +109,76 @@ func TestAdminModels_FetchModelsPreview(t *testing.T) {
 		}
 	})
 
+	t.Run("per-key discovery returns union and scoped results without secrets", func(t *testing.T) {
+		perKeyUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.Header.Get("Authorization") {
+			case "Bearer sk-a":
+				_, _ = w.Write([]byte(`{"data":[{"id":"model-a"},{"id":"common"}]}`))
+			case "Bearer sk-b":
+				_, _ = w.Write([]byte(`{"data":[{"id":"model-b"},{"id":"common"}]}`))
+			default:
+				http.Error(w, "invalid api key sk-bad", http.StatusUnauthorized)
+			}
+		}))
+		t.Cleanup(perKeyUpstream.Close)
+
+		payload := map[string]any{
+			"protocol": "openai",
+			"urls":     []map[string]any{{"url": perKeyUpstream.URL, "protocols": []string{"openai"}}},
+			"api_keys": []string{"sk-a", "sk-bad", "sk-b"},
+			"per_key":  true,
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
+		server.HandleFetchModelsPreview(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 body=%s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "sk-a") || strings.Contains(w.Body.String(), "sk-b") {
+			t.Fatalf("response leaked API key: %s", w.Body.String())
+		}
+		resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+		if !resp.Success || len(resp.Data.Models) != 3 || len(resp.Data.KeyModels) != 3 {
+			t.Fatalf("unexpected per-key response: %s", w.Body.String())
+		}
+		if resp.Data.KeyModels[0].KeyIndex != 0 || len(resp.Data.KeyModels[0].Models) != 2 {
+			t.Fatalf("key 0 result=%+v", resp.Data.KeyModels[0])
+		}
+		if resp.Data.KeyModels[1].KeyIndex != 1 || resp.Data.KeyModels[1].Error == "" {
+			t.Fatalf("key 1 failure=%+v", resp.Data.KeyModels[1])
+		}
+		if resp.Data.KeyModels[2].KeyIndex != 2 || len(resp.Data.KeyModels[2].Models) != 2 {
+			t.Fatalf("key 2 result=%+v", resp.Data.KeyModels[2])
+		}
+	})
+
+	t.Run("per-key discovery fails when every key fails", func(t *testing.T) {
+		failedUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "invalid api key sk-secret", http.StatusUnauthorized)
+		}))
+		t.Cleanup(failedUpstream.Close)
+
+		payload := map[string]any{
+			"protocol": "openai",
+			"urls":     []map[string]any{{"url": failedUpstream.URL, "protocols": []string{"openai"}}},
+			"api_keys": []string{"sk-bad-a", "sk-bad-b"},
+			"per_key":  true,
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
+		server.HandleFetchModelsPreview(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+		if resp.Success || !strings.Contains(resp.Error, "所有 API Key 模型探测均失败") {
+			t.Fatalf("unexpected response: %s", w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "sk-secret") {
+			t.Fatalf("response leaked upstream error body: %s", w.Body.String())
+		}
+	})
+
 	t.Run("normalization options preserve upstream model names", func(t *testing.T) {
 		normalizationUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/v1/models" {
@@ -521,17 +591,17 @@ func TestAdminModels_HandleFetchModels_AntigravityOAuth(t *testing.T) {
 	want := []model.ModelEntry{
 		{Model: "claude-opus-4-6-thinking", RedirectModel: "claude-opus-4-6-thinking"},
 		{Model: "claude-sonnet-4-6", RedirectModel: "claude-sonnet-4-6"},
-		{Model: "gemini-3.7-flash-high", RedirectModel: "gemini-3.7-flash-high"},
-		{Model: "gemini-3.6-flash-high", RedirectModel: "gemini-3.6-flash-high"},
 		{Model: "gemini-3-flash", RedirectModel: "gemini-3-flash"},
 		{Model: "gemini-3-flash-agent", RedirectModel: "gemini-3-flash-agent"},
 		{Model: "gemini-3.1-flash-image", RedirectModel: "gemini-3.1-flash-image"},
-		{Model: "gemini-pro-agent", RedirectModel: "gemini-pro-agent"},
-		{Model: "gemini-3.1-pro-low", RedirectModel: "gemini-3.1-pro-low"},
-		{Model: "gpt-oss-120b-medium", RedirectModel: "gpt-oss-120b-medium"},
 		{Model: "gemini-3.1-flash-lite", RedirectModel: "gemini-3.1-flash-lite"},
-		{Model: "gemini-3.5-flash-low", RedirectModel: "gemini-3.5-flash-low"},
+		{Model: "gemini-3.1-pro-low", RedirectModel: "gemini-3.1-pro-low"},
 		{Model: "gemini-3.5-flash-extra-low", RedirectModel: "gemini-3.5-flash-extra-low"},
+		{Model: "gemini-3.5-flash-low", RedirectModel: "gemini-3.5-flash-low"},
+		{Model: "gemini-3.6-flash-high", RedirectModel: "gemini-3.6-flash-high"},
+		{Model: "gemini-3.7-flash-high", RedirectModel: "gemini-3.7-flash-high"},
+		{Model: "gemini-pro-agent", RedirectModel: "gemini-pro-agent"},
+		{Model: "gpt-oss-120b-medium", RedirectModel: "gpt-oss-120b-medium"},
 	}
 	if !resp.Success || !reflect.DeepEqual(resp.Data.Models, want) || resp.Data.Protocol != "gemini" {
 		t.Fatalf("unexpected response: %s", w.Body.String())
@@ -670,11 +740,11 @@ func TestAdminModels_HandleFetchModels_CodexOAuth(t *testing.T) {
 		t.Fatalf("response leaked OAuth token: %s", w.Body.String())
 	}
 	want := []model.ModelEntry{
-		{Model: "gpt-5.6-terra", RedirectModel: "gpt-5.6-terra"},
-		{Model: "gpt-5.6-luna", RedirectModel: "gpt-5.6-luna"},
-		{Model: "gpt-5.5", RedirectModel: "gpt-5.5"},
-		{Model: "gpt-5.4-mini", RedirectModel: "gpt-5.4-mini"},
 		{Model: "codex-auto-review", RedirectModel: "codex-auto-review"},
+		{Model: "gpt-5.4-mini", RedirectModel: "gpt-5.4-mini"},
+		{Model: "gpt-5.5", RedirectModel: "gpt-5.5"},
+		{Model: "gpt-5.6-luna", RedirectModel: "gpt-5.6-luna"},
+		{Model: "gpt-5.6-terra", RedirectModel: "gpt-5.6-terra"},
 		{Model: "gpt-image-1.5", RedirectModel: "gpt-image-1.5"},
 		{Model: "gpt-image-2", RedirectModel: "gpt-image-2"},
 	}
@@ -732,19 +802,19 @@ func TestAdminModels_HandleFetchModels_XAIOAuthUsesFixedCatalog(t *testing.T) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 	wantNames := []string{
-		"grok-build-0.1",
-		"grok-4.6",
-		"grok-4.5",
-		"grok-4.3",
-		"grok-4.20-0309-reasoning",
-		"grok-4.20-0309-non-reasoning",
-		"grok-4.20-multi-agent-0309",
 		"grok-3-mini",
 		"grok-3-mini-fast",
+		"grok-4.20-0309-non-reasoning",
+		"grok-4.20-0309-reasoning",
+		"grok-4.20-multi-agent-0309",
+		"grok-4.3",
+		"grok-4.5",
+		"grok-4.6",
+		"grok-build-0.1",
 		"grok-composer-2.5-fast",
 		"grok-imagine-image",
-		"grok-imagine-image-quality",
 		"grok-imagine-image-2.0",
+		"grok-imagine-image-quality",
 	}
 	response := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
 	if !response.Success || response.Data.Protocol != "codex" || response.Data.Source != "predefined" {
@@ -1287,6 +1357,50 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		}
 		if len(got.ModelEntries) != 1 || got.ModelEntries[0].Model != "new-1" || !got.ModelEntries[0].Disabled {
 			t.Fatalf("unexpected models after replace: %#v", got.ModelEntries)
+		}
+	})
+
+	t.Run("replace mode preserves disabled state by routing model name", func(t *testing.T) {
+		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.6-luna"}]}`))
+		}))
+		t.Cleanup(upstream.Close)
+
+		server, store, cleanup := setupAdminTestServer(t)
+		defer cleanup()
+
+		ctx := context.Background()
+		cfg, err := store.CreateConfig(ctx, &model.Config{
+			Name:         "routing-identity-channel",
+			URLs:         model.ChannelURLs{{URL: upstream.URL}},
+			ModelEntries: []model.ModelEntry{{Model: "gpt-5.6-luna(max)", Disabled: true}},
+			Enabled:      true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig failed: %v", err)
+		}
+		if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+			ChannelID: cfg.ID, KeyIndex: 0, APIKey: "k", KeyStrategy: model.KeyStrategySequential,
+		}}); err != nil {
+			t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+		}
+
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/refresh-batch", map[string]any{
+			"channel_ids": []int64{cfg.ID},
+			"mode":        "replace",
+		}))
+		server.HandleBatchRefreshModels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		got, err := store.GetConfig(ctx, cfg.ID)
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		if len(got.ModelEntries) != 1 || got.ModelEntries[0].Model != "gpt-5.6-luna" || !got.ModelEntries[0].Disabled {
+			t.Fatalf("disabled routing identity was lost after replace: %#v", got.ModelEntries)
 		}
 	})
 

@@ -3,6 +3,7 @@ module ccLoad
 go 1.26.0
 
 require (
+	connectrpc.com/connect v1.20.0
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/andybalholm/brotli v1.2.2
 	github.com/bytedance/sonic v1.15.2
@@ -60,12 +61,12 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.2 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
-	go.mongodb.org/mongo-driver/v2 v2.8.0 // indirect
+	go.mongodb.org/mongo-driver/v2 v2.8.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/arch v0.30.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	modernc.org/libc v1.75.3 // indirect
+	modernc.org/libc v1.75.5 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.12.0 // indirect
+	modernc.org/memory v1.12.1 // indirect
 )

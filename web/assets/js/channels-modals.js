@@ -312,6 +312,15 @@ function invokeChannelEditorAction(actionName, ...args) {
   return undefined;
 }
 
+/** 管理账户只随 API Key 渠道提交；OAuth 渠道必须完全省略该键，凭据也绝不出现在顶层。 */
+function applyChannelManagementPayload(payload) {
+  const account = payload.auth_type === 'api_key'
+    ? invokeChannelEditorAction('collectManagementAccountForSubmit')
+    : null;
+  if (account) payload.management_account = account;
+  return payload;
+}
+
 function initChannelEditorActions() {
   if (typeof window.initDelegatedActions === 'function') {
     window.initDelegatedActions({
@@ -455,6 +464,7 @@ async function showAddModal() {
 
   invokeChannelEditorAction('resetCustomRulesState', null);
   invokeChannelEditorAction('resetCooldownDetectionState', null);
+  invokeChannelEditorAction('resetManagementAccountDraft', null, getValidInlineURLConfigs(), 'api_key');
 
   resetChannelFormDirty();
   document.getElementById('channelModal').classList.add('show');
@@ -499,7 +509,7 @@ async function editChannel(id) {
   const protocolModeRenderPromise = ensureProtocolTransformModeCombobox(channel.protocol_transform_mode);
 
   editingChannelId = id;
-  editingChannelAuthType = ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth'].includes(channel.auth_type)
+  editingChannelAuthType = ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(channel.auth_type)
     ? channel.auth_type
     : 'api_key';
   clearChannelDuplicateHint();
@@ -542,6 +552,12 @@ async function editChannel(id) {
       editorData.oauth_credential_info || null
     );
   }
+  invokeChannelEditorAction(
+    'resetManagementAccountDraft',
+    editorData.management_account || null,
+    channel.urls || [],
+    editingChannelAuthType
+  );
 
   const keyStrategy = channel.key_strategy || 'sequential';
   const strategyRadio = document.querySelector(`input[name="keyStrategy"][value="${keyStrategy}"]`);
@@ -775,7 +791,7 @@ async function saveChannel(event) {
     return;
   }
 
-  const isOAuth = ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth'].includes(editingChannelAuthType);
+  const isOAuth = ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType);
   const validKeyRows = isOAuth ? [] : getValidInlineKeyRows();
   const validKeys = validKeyRows.map(row => row.api_key);
   if (!isOAuth && validKeyRows.length === 0) {
@@ -815,7 +831,12 @@ async function saveChannel(event) {
     auth_type: isOAuth ? editingChannelAuthType : 'api_key',
     urls: validURLConfigs,
     api_key: validKeys.join(','),
-    api_keys: validKeyRows.map(row => ({ api_key: row.api_key, note: row.note || '' })),
+    api_keys: validKeyRows.map(row => ({
+      api_key: row.api_key,
+      note: row.note || '',
+      allowed_models: Array.isArray(row.allowed_models) ? [...row.allowed_models] : [],
+      model_scope_empty: row.model_scope_empty === true
+    })),
     protocol_transform_mode: getProtocolTransformMode(),
     priority: parseInt(document.getElementById('channelPriority').value) || 0,
     rpm_limit: parseInt(document.getElementById('channelRPMLimit').value) || 0,
@@ -838,6 +859,7 @@ async function saveChannel(event) {
     retry_other_keys_on_failure: !!document.getElementById('channelRetryOtherKeysOnFailure')?.checked
   };
   if (!isOAuth) formData.key_strategy = keyStrategy;
+  applyChannelManagementPayload(formData);
 
   if (!formData.name || formData.urls.length === 0 || (!isOAuth && !formData.api_key) || formData.models.length === 0) {
     if (window.showError) window.showError(window.t('channels.fillAllRequired'));
@@ -2259,19 +2281,29 @@ function exportChannelModels() {
   if (window.showSuccess) window.showSuccess(window.t('channels.modelsExported', { count: models.length }));
 }
 
-function deleteRedirectRow(index) {
-  redirectTableData.splice(index, 1);
-  // 更新选中状态：删除该索引，并调整后续索引
+function deleteRedirectModelsAtIndices(indices) {
+  const deletedIndices = [...new Set(indices)]
+    .filter(index => Number.isInteger(index) && index >= 0 && index < redirectTableData.length)
+    .sort((a, b) => b - a);
+  if (deletedIndices.length === 0) return false;
+
+  const deleted = new Set(deletedIndices);
+  deletedIndices.forEach(index => redirectTableData.splice(index, 1));
+
   const newSelectedIndices = new Set();
-  selectedModelIndices.forEach(i => {
-    if (i < index) {
-      newSelectedIndices.add(i);
-    } else if (i > index) {
-      newSelectedIndices.add(i - 1);
-    }
+  selectedModelIndices.forEach(index => {
+    if (deleted.has(index)) return;
+    const shift = deletedIndices.filter(deletedIndex => deletedIndex < index).length;
+    newSelectedIndices.add(index - shift);
   });
   selectedModelIndices.clear();
-  newSelectedIndices.forEach(i => selectedModelIndices.add(i));
+  newSelectedIndices.forEach(index => selectedModelIndices.add(index));
+  syncInlineKeyModelScopesWithConfiguredModels();
+  return true;
+}
+
+function deleteRedirectRow(index) {
+  if (!deleteRedirectModelsAtIndices([index])) return;
   renderRedirectTable();
   markChannelFormDirty();
 }
@@ -2867,14 +2899,7 @@ function batchDeleteSelectedModels() {
   const tableContainer = document.querySelector('#redirectTableBody').closest('.inline-table-container');
   const scrollTop = tableContainer ? tableContainer.scrollTop : 0;
 
-  // 从大到小排序，确保删除时索引不会错位
-  const indicesToDelete = Array.from(selectedModelIndices).sort((a, b) => b - a);
-
-  indicesToDelete.forEach(index => {
-    redirectTableData.splice(index, 1);
-  });
-
-  selectedModelIndices.clear();
+  deleteRedirectModelsAtIndices(Array.from(selectedModelIndices));
   updateModelBatchDeleteButton();
 
   renderRedirectTable();
@@ -2941,6 +2966,84 @@ function areModelRowsEqual(left, right) {
       (row.redirect_model || '') === (other.redirect_model || '') &&
       !!row.disabled === !!other.disabled;
   });
+}
+
+function normalizeDetectedModelNames(entries) {
+  const seen = new Set();
+  const names = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    for (const value of [entry?.model, entry?.redirect_model]) {
+      const name = String(value || '').trim();
+      const key = name.toLowerCase();
+      if (!name || seen.has(key)) continue;
+      seen.add(key);
+      names.push(name);
+    }
+  }
+  return names;
+}
+
+function detectedChannelModels(modelRows, entries) {
+  const detectedNames = normalizeDetectedModelNames(entries);
+  const detected = new Set(detectedNames.map(name => name.toLowerCase()));
+  const matched = [];
+  const seen = new Set();
+  for (const row of Array.isArray(modelRows) ? modelRows : []) {
+    const logicalModel = String(row?.model || '').trim();
+    if (!logicalModel || logicalModel === '*') continue;
+    const upstreamModel = String(row?.redirect_model || logicalModel).trim();
+    if (!detected.has(logicalModel.toLowerCase()) && !detected.has(upstreamModel.toLowerCase())) continue;
+    const key = logicalModel.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    matched.push(logicalModel);
+  }
+  const wildcard = (Array.isArray(modelRows) ? modelRows : [])
+    .some(row => String(row?.model || '').trim() === '*');
+  return matched.length > 0 || !wildcard ? matched : detectedNames;
+}
+
+function proposeFetchedKeyModelScopes(keyRows, modelRows, keyModels, requestEntries) {
+  const originalRows = (Array.isArray(keyRows) ? keyRows : []).map(row => ({
+    ...row,
+    allowed_models: Array.isArray(row?.allowed_models) ? [...row.allowed_models] : []
+  }));
+  const rows = originalRows.map(row => ({ ...row, allowed_models: [...row.allowed_models] }));
+  const results = new Map(
+    (Array.isArray(keyModels) ? keyModels : [])
+      .filter(Boolean)
+      .map(result => [Number(result.key_index), result])
+  );
+  let changedCount = 0;
+  let matchedCount = 0;
+  let unmatchedCount = 0;
+  for (const [requestIndex, requestEntry] of (Array.isArray(requestEntries) ? requestEntries : []).entries()) {
+    const result = results.get(requestIndex);
+    if (!result || result.error || !Array.isArray(result.models) || result.models.length === 0) continue;
+    const rowIndex = Number(requestEntry?.keyIndex);
+    const row = rows[rowIndex];
+    if (!row || String(row.api_key || '').trim() !== String(requestEntry?.apiKey || '').trim()) continue;
+    const allowedModels = detectedChannelModels(modelRows, result.models);
+    if (allowedModels.length === 0) {
+      unmatchedCount++;
+      continue;
+    }
+    matchedCount++;
+    const current = (row.allowed_models || []).map(name => String(name).toLowerCase());
+    const next = allowedModels.map(name => name.toLowerCase());
+    if (current.length !== next.length || current.some((name, index) => name !== next[index])) {
+      row.allowed_models = allowedModels;
+      changedCount++;
+    }
+  }
+  const complete = matchedCount === (Array.isArray(requestEntries) ? requestEntries.length : 0);
+  return {
+    rows: complete ? rows : originalRows,
+    changedCount: complete ? changedCount : 0,
+    matchedCount,
+    unmatchedCount,
+    complete
+  };
 }
 
 function quickAddFieldKind(name) {
@@ -3275,7 +3378,9 @@ function initQuickAddChannelModalEvents() {
 async function fetchModelsFromAPI() {
   let endpoint;
   let fetchOptions;
-  if (['antigravity_oauth', 'codex_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth'].includes(editingChannelAuthType)) {
+  let modelFetchEntries = [];
+  let skippedKeyCount = 0;
+  if (['antigravity_oauth', 'codex_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType)) {
     if (!editingChannelId) {
       if (window.showError) window.showError(window.t('channels.saveBeforeModelTest'));
       else alert(window.t('channels.saveBeforeModelTest'));
@@ -3285,7 +3390,13 @@ async function fetchModelsFromAPI() {
   } else {
     const urls = getValidInlineURLConfigs();
     const channelUrl = urls[0]?.url || '';
-    const availableKeys = selectModelFetchKeys(getInlineKeyRows(), currentChannelKeyCooldowns);
+    const keyRows = getInlineKeyRows();
+    modelFetchEntries = selectModelFetchKeyEntries(keyRows, currentChannelKeyCooldowns);
+    const availableKeys = modelFetchEntries.map(entry => entry.apiKey);
+    skippedKeyCount = Math.max(
+      0,
+      countConfiguredInlineKeys(keyRows) - modelFetchEntries.length
+    );
 
     if (!channelUrl) {
       if (window.showError) {
@@ -3311,7 +3422,8 @@ async function fetchModelsFromAPI() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         urls,
-        api_keys: availableKeys
+        api_keys: availableKeys,
+        per_key: true
       })
     };
   }
@@ -3320,9 +3432,13 @@ async function fetchModelsFromAPI() {
     const response = await fetchAPIWithAuth(endpoint, fetchOptions);
     if (!response.success) throw new Error(response.error || window.t('channels.fetchModelsFailed', { error: '' }));
     const data = response.data || {};
+    const keyModels = Array.isArray(data.key_models) ? data.key_models : [];
+    const failedKeyCount = keyModels.filter(result => result?.error).length;
+    let unmatchedKeyCount = 0;
 
     if (!data.models || data.models.length === 0) {
-      throw new Error(window.t('channels.noModelsFromApi'));
+      const firstKeyError = keyModels.find(result => result?.error)?.error;
+      throw new Error(firstKeyError || window.t('channels.noModelsFromApi'));
     }
 
     const previousRows = redirectTableData.map(row => ({
@@ -3342,11 +3458,51 @@ async function fetchModelsFromAPI() {
     renderRedirectTable();
     if (!areModelRowsEqual(previousRows, redirectTableData)) markChannelFormDirty();
 
+    if (modelFetchEntries.length > 0 && keyModels.length > 0) {
+      const scopeProposal = proposeFetchedKeyModelScopes(
+        getInlineKeyRows(),
+        redirectTableData,
+        keyModels,
+        modelFetchEntries
+      );
+      const completeScopeDetection = skippedKeyCount === 0 &&
+        failedKeyCount === 0 &&
+        keyModels.length === modelFetchEntries.length &&
+        scopeProposal.complete;
+      const shouldApply = completeScopeDetection && scopeProposal.changedCount > 0 &&
+        typeof window.confirm === 'function' &&
+        window.confirm(window.t('channels.applyFetchedKeyModelsConfirm', { count: scopeProposal.changedCount }));
+      if (shouldApply && scopeProposal.changedCount > 0) {
+        inlineKeyTableData = scopeProposal.rows;
+        renderInlineKeyTable();
+        markChannelFormDirty();
+        if (window.showSuccess) {
+          window.showSuccess(window.t('channels.appliedFetchedKeyModels', { count: scopeProposal.changedCount }));
+        }
+      }
+      unmatchedKeyCount = scopeProposal.unmatchedCount;
+    }
+
     const source = data.source === 'api' ? window.t('channels.fetchModelsSource.api') : window.t('channels.fetchModelsSource.predefined');
     if (window.showSuccess) {
       window.showSuccess(window.t('channels.fetchModelsSuccess', { source, total: redirectTableData.length, added: replacement.added }));
     } else {
       alert(window.t('channels.fetchModelsSuccess', { source, total: redirectTableData.length, added: replacement.added }));
+    }
+
+    const warnings = [];
+    if (failedKeyCount > 0) {
+      warnings.push(window.t('channels.fetchModelsPartialFailed', { failed: failedKeyCount }));
+    }
+    if (skippedKeyCount > 0) {
+      warnings.push(window.t('channels.fetchModelsSkippedKeys', { count: skippedKeyCount }));
+    }
+    if (unmatchedKeyCount > 0) {
+      warnings.push(window.t('channels.fetchModelsUnmatchedKeys', { count: unmatchedKeyCount }));
+    }
+    if (warnings.length > 0) {
+      if (window.showWarning) window.showWarning(warnings.join(' '));
+      else alert(warnings.join(' '));
     }
 
   } catch (error) {
@@ -3614,6 +3770,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     addCommonModels,
     addCommonModelsToRows,
+    applyChannelManagementPayload,
     applyQuickAddChannelSetup,
     batchClearSelectedChannelCooldowns,
     batchSetSelectedChannelsPriority,
@@ -3625,6 +3782,7 @@ if (typeof module !== 'undefined' && module.exports) {
     collectModelsForSubmit,
     confirmModelImport,
     detectChannelWebsocketSupport,
+    deleteRedirectModelsAtIndices,
     discoverQuickAddChannelSetup,
     editChannel,
     exportChannelModels,
@@ -3634,6 +3792,7 @@ if (typeof module !== 'undefined' && module.exports) {
     mergeModelRowsWithFetchedModels,
     openBatchModelImportModal,
     parseQuickAddChannelInfo,
+    proposeFetchedKeyModelScopes,
     saveChannel,
     testRedirectModel,
     toggleModelDisabledState

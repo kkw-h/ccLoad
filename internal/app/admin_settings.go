@@ -130,6 +130,39 @@ func respondSettingCombinationError(c *gin.Context, err error) bool {
 	return true
 }
 
+func settingsRequireRestart(updates map[string]string) bool {
+	for key := range updates {
+		if key != modelMultimodalFallbackSettingKey && !isLiveModelCapabilitySetting(key) {
+			return true
+		}
+	}
+	return false
+}
+
+// commitSettingUpdates 将持久化与运行态发布绑定成同一个有序操作。
+// 只要包含多模态映射，就串行化整个提交，避免并发请求让数据库终值与运行态快照错序。
+func (s *Server) commitSettingUpdates(updates map[string]string, persist func() error) (bool, error) {
+	value, updatesMultimodalFallback := updates[modelMultimodalFallbackSettingKey]
+	var multimodalFallbackModels map[string]string
+	if updatesMultimodalFallback {
+		parsed, err := parseMultimodalFallbackModels(value)
+		if err != nil {
+			return false, fmt.Errorf("parse validated multimodal fallback setting: %w", err)
+		}
+		multimodalFallbackModels = parsed
+		s.multimodalFallbackUpdateMu.Lock()
+		defer s.multimodalFallbackUpdateMu.Unlock()
+	}
+
+	if err := persist(); err != nil {
+		return false, err
+	}
+	if updatesMultimodalFallback {
+		s.setMultimodalFallbackModels(multimodalFallbackModels)
+	}
+	return settingsRequireRestart(updates), nil
+}
+
 // AdminListSettings 获取所有配置项
 // GET /admin/settings
 func (s *Server) AdminListSettings(c *gin.Context) {
@@ -213,11 +246,12 @@ func (s *Server) AdminUpdateSetting(c *gin.Context) {
 	}
 
 	// 冷却上下限必须作为一个有效快照原子写入，其他设置保持单项更新。
-	if len(updates) == 1 {
-		err = s.configService.UpdateSetting(c.Request.Context(), key, req.Value)
-	} else {
-		err = s.configService.BatchUpdateSettings(c.Request.Context(), updates)
-	}
+	restartRequired, err := s.commitSettingUpdates(updates, func() error {
+		if len(updates) == 1 {
+			return s.configService.UpdateSetting(c.Request.Context(), key, req.Value)
+		}
+		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
+	})
 	if err != nil {
 		log.Printf("[ERROR] AdminUpdateSetting key=%s 失败: %v", key, err)
 		RespondError(c, http.StatusInternalServerError, err)
@@ -229,9 +263,8 @@ func (s *Server) AdminUpdateSetting(c *gin.Context) {
 		return
 	}
 
-	requiresRestart := settingsRequireRestart(updates)
 	message := "配置已保存并立即生效"
-	if requiresRestart {
+	if restartRequired {
 		message = "配置已保存，程序将在2秒后重启"
 	}
 	RespondJSON(c, http.StatusOK, gin.H{
@@ -240,7 +273,7 @@ func (s *Server) AdminUpdateSetting(c *gin.Context) {
 		"value":   req.Value,
 	})
 
-	if requiresRestart {
+	if restartRequired {
 		go s.triggerRestart()
 	}
 }
@@ -273,11 +306,12 @@ func (s *Server) AdminResetSetting(c *gin.Context) {
 	if respondSettingCombinationError(c, err) {
 		return
 	}
-	if len(updates) == 1 {
-		err = s.configService.UpdateSetting(c.Request.Context(), key, setting.DefaultValue)
-	} else {
-		err = s.configService.BatchUpdateSettings(c.Request.Context(), updates)
-	}
+	restartRequired, err := s.commitSettingUpdates(updates, func() error {
+		if len(updates) == 1 {
+			return s.configService.UpdateSetting(c.Request.Context(), key, setting.DefaultValue)
+		}
+		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
+	})
 	if err != nil {
 		log.Printf("[ERROR] AdminResetSetting key=%s 失败: %v", key, err)
 		RespondError(c, http.StatusInternalServerError, err)
@@ -289,9 +323,8 @@ func (s *Server) AdminResetSetting(c *gin.Context) {
 		return
 	}
 
-	requiresRestart := settingsRequireRestart(updates)
 	message := "配置已重置为默认值并立即生效"
-	if requiresRestart {
+	if restartRequired {
 		message = "配置已重置为默认值，程序将在2秒后重启"
 	}
 	RespondJSON(c, http.StatusOK, gin.H{
@@ -300,7 +333,7 @@ func (s *Server) AdminResetSetting(c *gin.Context) {
 		"value":   setting.DefaultValue,
 	})
 
-	if requiresRestart {
+	if restartRequired {
 		go s.triggerRestart()
 	}
 }
@@ -343,7 +376,10 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 	}
 
 	// 批量更新(事务保护)
-	if err := s.configService.BatchUpdateSettings(c.Request.Context(), updates); err != nil {
+	restartRequired, err := s.commitSettingUpdates(updates, func() error {
+		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
+	})
+	if err != nil {
 		log.Printf("[ERROR] AdminBatchUpdateSettings 失败: %v", err)
 		RespondError(c, http.StatusInternalServerError, err)
 		return
@@ -354,18 +390,17 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 		return
 	}
 
-	requiresRestart := settingsRequireRestart(updates)
 	message := fmt.Sprintf("已保存 %d 项配置并立即生效", len(req))
-	if requiresRestart {
+	if restartRequired {
 		message = fmt.Sprintf("已保存 %d 项配置，程序将在2秒后重启", len(req))
 	}
-	log.Printf("[INFO] 已批量更新 %d 项配置（需要重启: %t）", len(req), requiresRestart)
+	log.Printf("[INFO] 已批量更新 %d 项配置（需要重启: %t）", len(req), restartRequired)
 
 	RespondJSON(c, http.StatusOK, gin.H{
 		"message": message,
 	})
 
-	if requiresRestart {
+	if restartRequired {
 		go s.triggerRestart()
 	}
 }
@@ -392,15 +427,6 @@ func (s *Server) applyLiveSettings(updates map[string]string) error {
 	return nil
 }
 
-func settingsRequireRestart(updates map[string]string) bool {
-	for key := range updates {
-		if !isLiveModelCapabilitySetting(key) {
-			return true
-		}
-	}
-	return false
-}
-
 func isLiveModelCapabilitySetting(key string) bool {
 	return key == modelReasoningEffortOverridesSetting || key == modelMetadataOverridesSetting
 }
@@ -409,6 +435,10 @@ func isLiveModelCapabilitySetting(key string) bool {
 func validateSettingValue(key, valueType, value string) error {
 	if key == globalCooldownDetectionRulesSettingKey {
 		_, err := parseGlobalCooldownDetectionRules(value)
+		return err
+	}
+	if key == modelMultimodalFallbackSettingKey {
+		_, err := parseMultimodalFallbackModels(value)
 		return err
 	}
 
