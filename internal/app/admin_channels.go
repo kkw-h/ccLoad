@@ -1237,7 +1237,10 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			RespondError(c, http.StatusInternalServerError, parseErr)
 			return
 		}
-		req.Models = filterCodexOAuthModelEntries(req.Models, credential.PlanType)
+		if validateErr := validateCodexOAuthModelEntries(req.Models, credential.PlanType); validateErr != nil {
+			RespondErrorMsg(c, http.StatusBadRequest, validateErr.Error())
+			return
+		}
 	}
 	var oldKeys []*model.APIKey
 	if !existing.UsesOAuth() {

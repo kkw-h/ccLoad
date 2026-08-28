@@ -3053,6 +3053,39 @@ func TestImportedOAuthCredentialUpsertsSameEmail(t *testing.T) {
 	}
 }
 
+func TestCodexReauthorizationPreservesAllowedModelAliases(t *testing.T) {
+	store := newCodexAuthTestStore(t)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	initial := &codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: "at-initial", RefreshToken: "rt-initial",
+		Expired: expiresAt, ChatGPTUserID: "user-model-alias", AccountID: "account-model-alias",
+		Email: "model-alias@example.com", PlanType: "free",
+	}
+	channel, created, err := createOrUpdateCodexChannel(context.Background(), store, initial)
+	if err != nil || !created {
+		t.Fatalf("initial authorization = (%#v, %v, %v)", channel, created, err)
+	}
+	channel.ModelEntries = append(channel.ModelEntries, model.ModelEntry{Model: "codex-fast", RedirectModel: "gpt-5.5"})
+	if _, err := store.UpdateConfig(context.Background(), channel.ID, channel); err != nil {
+		t.Fatalf("persist model alias: %v", err)
+	}
+
+	reauthorized := cloneCodexCredential(initial)
+	reauthorized.AccessToken = "at-reauthorized"
+	reauthorized.RefreshToken = "rt-reauthorized"
+	reauthorized.PlanType = "plus"
+	updated, created, err := createOrUpdateCodexChannel(context.Background(), store, reauthorized)
+	if err != nil || created {
+		t.Fatalf("reauthorization = (%#v, %v, %v)", updated, created, err)
+	}
+	if !updated.SupportsModel("codex-fast") {
+		t.Fatalf("reauthorization dropped model alias: %v", updated.GetModels())
+	}
+	if redirect, ok := updated.GetRedirectModel("codex-fast"); !ok || redirect != "gpt-5.5" {
+		t.Fatalf("GetRedirectModel(codex-fast) = (%q, %v), want (gpt-5.5, true)", redirect, ok)
+	}
+}
+
 func TestCodexReauthorizationMigratesLegacyEmailIdentity(t *testing.T) {
 	t.Parallel()
 	store := newCodexAuthTestStore(t)
@@ -3703,7 +3736,7 @@ func TestCodexChannelKeyMutationEndpointsAreReadOnly(t *testing.T) {
 	}
 
 	submittedModels := append([]model.ModelEntry(nil), channel.ModelEntries...)
-	submittedModels = append(submittedModels, model.ModelEntry{Model: "gpt-5.4"})
+	submittedModels = append(submittedModels, model.ModelEntry{Model: "codex-fast", RedirectModel: "gpt-5.5"})
 	allowedUpdate, err := json.Marshal(map[string]any{
 		"name":                    "codex-renamed",
 		"auth_type":               model.AuthTypeCodexOAuth,
@@ -3732,12 +3765,49 @@ func TestCodexChannelKeyMutationEndpointsAreReadOnly(t *testing.T) {
 	if persisted.Name != "codex-renamed" || persisted.OAuthCredential != channel.OAuthCredential {
 		t.Fatalf("allowed update changed credential or missed name: %#v", persisted)
 	}
-	if persisted.SupportsModel("gpt-5.4") {
-		t.Fatalf("free Codex channel kept unsupported model: %v", persisted.GetModels())
+	if !persisted.SupportsModel("codex-fast") {
+		t.Fatalf("free Codex channel dropped model alias: %v", persisted.GetModels())
+	}
+	if redirect, ok := persisted.GetRedirectModel("codex-fast"); !ok || redirect != "gpt-5.5" {
+		t.Fatalf("GetRedirectModel(codex-fast) = (%q, %v), want (gpt-5.5, true)", redirect, ok)
 	}
 	keys, err := store.GetAPIKeys(context.Background(), channel.ID)
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("Codex API keys after allowed update = (%#v, %v)", keys, err)
+	}
+
+	invalidModels := append([]model.ModelEntry(nil), persisted.ModelEntries...)
+	invalidModels = append(invalidModels, model.ModelEntry{Model: "bad-alias", RedirectModel: "gpt-5.4"})
+	invalidUpdate, err := json.Marshal(map[string]any{
+		"name":                    persisted.Name,
+		"auth_type":               model.AuthTypeCodexOAuth,
+		"urls":                    persisted.URLs,
+		"api_key":                 "",
+		"api_keys":                []ChannelAPIKeyRequest{},
+		"models":                  invalidModels,
+		"enabled":                 persisted.Enabled,
+		"websockets":              persisted.Websockets,
+		"protocol_transform_mode": persisted.ProtocolTransformMode,
+	})
+	if err != nil {
+		t.Fatalf("marshal invalid update: %v", err)
+	}
+	invalidRequest := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/channels/%d", channel.ID), bytes.NewReader(invalidUpdate))
+	invalidRequest.Header.Set("Content-Type", "application/json")
+	invalidResponse := httptest.NewRecorder()
+	engine.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid redirect update status=%d body=%s", invalidResponse.Code, invalidResponse.Body.String())
+	}
+	if !strings.Contains(invalidResponse.Body.String(), "gpt-5.4") {
+		t.Fatalf("invalid redirect update omitted target model: %s", invalidResponse.Body.String())
+	}
+	afterInvalid, err := store.GetConfig(context.Background(), channel.ID)
+	if err != nil {
+		t.Fatalf("GetConfig() after invalid update error = %v", err)
+	}
+	if afterInvalid.SupportsModel("bad-alias") || !afterInvalid.SupportsModel("codex-fast") {
+		t.Fatalf("invalid update changed persisted models: %v", afterInvalid.GetModels())
 	}
 }
 

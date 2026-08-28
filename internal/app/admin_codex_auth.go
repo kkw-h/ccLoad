@@ -873,10 +873,31 @@ func codexOAuthModelEntries(planType string) []model.ModelEntry {
 	return entries
 }
 
+func codexOAuthModelTarget(entry model.ModelEntry) string {
+	if target := strings.TrimSpace(entry.RedirectModel); target != "" {
+		return target
+	}
+	return strings.TrimSpace(entry.Model)
+}
+
+func validateCodexOAuthModelEntries(entries []model.ModelEntry, planType string) error {
+	for _, entry := range entries {
+		target := codexOAuthModelTarget(entry)
+		if codexOAuthModelAllowed(target, planType) {
+			continue
+		}
+		if strings.TrimSpace(entry.RedirectModel) != "" {
+			return fmt.Errorf("model %q redirects to unsupported Codex model %q for current plan", strings.TrimSpace(entry.Model), target)
+		}
+		return fmt.Errorf("unsupported Codex model %q for current plan", target)
+	}
+	return nil
+}
+
 func filterCodexOAuthModelEntries(entries []model.ModelEntry, planType string) []model.ModelEntry {
 	filtered := make([]model.ModelEntry, 0, len(entries))
 	for _, entry := range entries {
-		if codexOAuthModelAllowed(entry.Model, planType) {
+		if codexOAuthModelAllowed(codexOAuthModelTarget(entry), planType) {
 			filtered = append(filtered, entry)
 		}
 	}
@@ -884,16 +905,17 @@ func filterCodexOAuthModelEntries(entries []model.ModelEntry, planType string) [
 }
 
 func mergeCodexOAuthModelEntries(entries []model.ModelEntry, planType string) []model.ModelEntry {
-	existing := make(map[string]model.ModelEntry, len(entries))
-	for _, entry := range entries {
-		existing[entry.Model] = entry
+	models := filterCodexOAuthModelEntries(entries, planType)
+	existing := make(map[string]struct{}, len(models))
+	for _, entry := range models {
+		existing[entry.Model] = struct{}{}
 	}
-	models := codexOAuthModelEntries(planType)
-	for i := range models {
-		if entry, ok := existing[models[i].Model]; ok {
-			models[i] = entry
+	for _, entry := range codexOAuthModelEntries(planType) {
+		if _, ok := existing[entry.Model]; !ok {
+			models = append(models, entry)
 		}
 	}
+	sortOAuthModelEntries(models)
 	return models
 }
 
