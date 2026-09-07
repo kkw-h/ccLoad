@@ -32,6 +32,8 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ==================== 渠道测试功能 ====================
@@ -102,7 +104,7 @@ func (s *Server) HandleChannelWebsocketProbe(c *gin.Context) {
 	applyHeaderRules(upstreamHeaders, cfg.HeaderRules())
 	probeRequest := &http.Request{Header: upstreamHeaders}
 	injectCodexHeaders(probeRequest, cfg, probe.APIKey, true)
-	copyCodexWebsocketInputHeaders(upstreamHeaders, headers)
+	prepareCodexWebsocketInputHeaders(upstreamHeaders, headers, cfg.HeaderRules())
 	websocketURL, err := codexWebsocketURL(fullURL)
 	if err != nil {
 		RespondError(c, http.StatusBadRequest, err)
@@ -394,25 +396,30 @@ func patchUpstreamTestFields(translatedBody, upstreamBody []byte, upstreamProtoc
 		return translatedBody
 	}
 
-	var translated, upstream map[string]any
-	if err := sonic.Unmarshal(translatedBody, &translated); err != nil {
+	if !isMutableJSONObject(translatedBody) || !isMutableJSONObject(upstreamBody) {
 		return translatedBody
 	}
-	if err := sonic.Unmarshal(upstreamBody, &upstream); err != nil {
-		return translatedBody
-	}
-
+	result := translatedBody
 	for _, key := range keys {
-		if val, ok := upstream[key]; ok {
-			translated[key] = val
-		} else {
-			delete(translated, key)
+		// 读写指向同一个字面键，但两套路径语法不同：sjson 靠 `:` 前缀强制对象键，
+		// gjson 不认 `:`，只认 `\` 转义。共用一份转义结果才能保证二者定位一致。
+		escaped := sjsonPathEscape(key)
+		path := sjsonObjectPathJoin("", key)
+		if value := gjson.GetBytes(upstreamBody, escaped); value.Exists() {
+			var err error
+			result, err = sjson.SetRawBytes(result, path, []byte(value.Raw))
+			if err != nil {
+				return translatedBody
+			}
+			continue
 		}
-	}
-
-	result, err := sonic.ConfigStd.Marshal(translated)
-	if err != nil {
-		return translatedBody
+		if gjson.GetBytes(result, escaped).Exists() {
+			var err error
+			result, err = sjson.DeleteBytes(result, path)
+			if err != nil {
+				return translatedBody
+			}
+		}
 	}
 	return result
 }
@@ -506,7 +513,13 @@ func (s *Server) buildChannelTestRequestPlan(
 	}
 
 	// 协议转换负责消息和工具的格式变换；上游测试器负责系统提示、请求选项和协议默认值。
-	translatedBody = patchUpstreamTestFields(translatedBody, upstreamBody, upstreamProtocol)
+	// Zed 的上游协议名义上是 Codex，实际发出的是 provider_request，Codex 测试模板对任何
+	// Zed provider 都不成立，所以对全部 Zed 渠道跳过——不只 Anthropic。具体到 Anthropic：
+	// 模板的 instructions/reasoning.medium 会变成 Anthropic system + thinking.budget_tokens，
+	// 再和保守的 max_tokens 默认值撞成上游 400。Zed 测试只保留客户端转换结果。
+	if !cfgForBuild.UsesZedOAuth() {
+		translatedBody = patchUpstreamTestFields(translatedBody, upstreamBody, upstreamProtocol)
+	}
 
 	plan.fullURL = upstreamURL
 	plan.headers = cloneHeaders(upstreamHeaders)
@@ -1480,7 +1493,7 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	useNativeCodexWebsocket := cfg.Websockets && !requestPlan.xaiOAuth && !cfg.UsesZedOAuth() && testReq.Stream &&
 		clientProtocol == string(protocol.Codex) && requestPlan.upstreamProtocol == string(protocol.Codex)
 	if useNativeCodexWebsocket {
-		copyCodexWebsocketInputHeaders(req.Header, requestPlan.upstreamHeaders)
+		prepareCodexWebsocketInputHeaders(req.Header, requestPlan.upstreamHeaders, cfg.HeaderRules())
 		preparedBody, prepareErr := buildCodexWebsocketRequestBody(requestPlan.requestBody)
 		if prepareErr != nil {
 			if capacityRelease != nil {
@@ -1597,6 +1610,7 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	// 判断是否为SSE响应，以及是否请求了流式
 	contentType := resp.Header.Get("Content-Type")
 	isEventStream := responseIsSSE(resp, requestPlan.upstreamStreaming)
+	wrapCodexSSEResponseBody(resp, protocol.Protocol(requestPlan.upstreamProtocol), isEventStream)
 
 	// 通用结果初始化
 	result = map[string]any{
@@ -1871,9 +1885,14 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		requestPlan.fullURL = buildAnthropicOAuthURL(selectedURL, requestPath, "")
 	}
 	requestedStreaming := isStreamingRequest(requestPath, requestPlan.requestBody)
+	// 与代理链路一致：Anthropic CCH 签名按上游 origin 分流，最终化前必须先有 URL。
+	parsedTestURL, err := neturl.Parse(requestPlan.fullURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse test upstream URL: %w", err)
+	}
 	requestPlan.requestBody, err = s.prepareTranslatedUpstreamBody(
 		cfgForBuild, upstreamProtocolValue, requestPath, requestPlan.requestBody, requestPlan.clientBody,
-		requestPlan.apiKey, requestPlan.headers, false,
+		requestPlan.apiKey, requestPlan.headers, false, parsedTestURL,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("finalize test request body: %w", err)
@@ -1905,11 +1924,10 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		ensureCodexSessionHeader(requestPlan.headers, sessionID)
 	}
 	if cfgForBuild.UsesZedOAuth() {
-		var originalAnthropicRequest []byte
-		if protocol.Protocol(requestPlan.clientProtocol) == protocol.Anthropic {
-			originalAnthropicRequest = requestPlan.clientBody
-		}
-		requestPlan.requestBody, requestPlan.zedWire, err = finalizeZedResponsesBody(s.protocolRegistry, requestPlan.requestBody, originalAnthropicRequest)
+		requestPlan.requestBody, requestPlan.zedWire, err = finalizeZedResponsesBodyWithOptions(
+			s.protocolRegistry, requestPlan.requestBody, requestPlan.clientBody,
+			zedBodyRulesPreserveThinking(cfgForBuild.BodyRules()),
+		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("finalize Zed test request body: %w", err)
 		}

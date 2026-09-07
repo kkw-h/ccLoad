@@ -55,8 +55,12 @@ var responsesWebsocketUpgrader = websocket.Upgrader{
 
 func isResponsesWebsocketUpgradeRequest(r *http.Request) bool {
 	return r != nil && r.Method == http.MethodGet &&
-		slices.Contains(responsesWebsocketUpgradePaths, r.URL.Path) &&
+		isResponsesWebsocketPath(r.URL.Path) &&
 		websocket.IsWebSocketUpgrade(r)
+}
+
+func isResponsesWebsocketPath(path string) bool {
+	return slices.Contains(responsesWebsocketUpgradePaths, path)
 }
 
 // responsesWebsocketTimeouts resolves the idle read deadline and ping
@@ -675,7 +679,7 @@ func writeResponsesWebsocketSyntheticPrewarm(
 }
 
 func isResponsesWebsocketFailurePayload(payload []byte) bool {
-	if !gjson.ValidBytes(payload) {
+	if !json.Valid(payload) {
 		return false
 	}
 	switch strings.TrimSpace(gjson.GetBytes(payload, "type").String()) {
@@ -799,7 +803,7 @@ func (w *responsesWebsocketBridgeWriter) Write(data []byte) (int, error) {
 		if len(payload) == 0 || bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
 			continue
 		}
-		if !gjson.ValidBytes(payload) {
+		if !json.Valid(payload) {
 			return 0, errors.New("invalid JSON in upstream SSE event")
 		}
 		eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())

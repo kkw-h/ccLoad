@@ -123,6 +123,74 @@ func TestProxy_SingleURLRecordsRuntimeStats(t *testing.T) {
 	}
 }
 
+func TestProxy_APIKeyCostMultiplierSnapshotsPerKeyInLogs(t *testing.T) {
+	t.Parallel()
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chat-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	ctx := context.Background()
+
+	urls := channelURLsForTest(upstream.URL)
+	for urlIndex := range urls {
+		urls[urlIndex].Protocols = []string{util.ProtocolOpenAI}
+	}
+	cfg := &model.Config{
+		Name:                  "key-multiplier-log-snapshot",
+		AuthType:              model.AuthTypeAPIKey,
+		URLs:                  urls,
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		Priority:              100,
+		Enabled:               true,
+		ModelEntries:          []model.ModelEntry{{Model: "gpt-multiplier-test"}},
+	}
+	created, err := srv.store.CreateConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	// round_robin 让两次串行请求各命中一把 Key，各自把倍率快照进日志。
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-low", KeyStrategy: model.KeyStrategyRoundRobin, CostMultiplier: 0.5},
+		{ChannelID: created.ID, KeyIndex: 1, APIKey: "sk-high", KeyStrategy: model.KeyStrategyRoundRobin, CostMultiplier: 2.0},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+
+	injectAPIToken(srv.authService, "test-api-key", 0, 1)
+	engine := gin.New()
+	srv.SetupRoutes(engine)
+
+	for range 2 {
+		response := doProxyRequest(t, engine, "/v1/chat/completions", map[string]any{
+			"model":    "gpt-multiplier-test",
+			"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+		}, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	// 日志是批量异步落库，等待一个完整刷新周期。
+	time.Sleep(config.LogBatchTimeout + 250*time.Millisecond)
+
+	logs, err := srv.store.ListLogs(ctx, time.Now().Add(-time.Minute), 10, 0, &model.LogFilter{Model: "gpt-multiplier-test"})
+	if err != nil {
+		t.Fatalf("ListLogs: %v", err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("log count=%d, want 2", len(logs))
+	}
+	got := make(map[float64]bool, len(logs))
+	for _, logEntry := range logs {
+		got[logEntry.CostMultiplier] = true
+	}
+	if !got[0.5] || !got[2.0] {
+		t.Fatalf("snapshotted multipliers=%v, want both 0.5 and 2.0", got)
+	}
+}
+
 func TestProxy_NonResponsesGenerateFieldIsPreserved(t *testing.T) {
 	requestBody := make(chan []byte, 1)
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -310,12 +378,20 @@ func antigravityProxyClaudeThoughtSignature(modelName string) string {
 	return base64.StdEncoding.EncodeToString(payload)
 }
 
+// 身份 fixture 必须是真实形态：device_id 是 64 位小写 hex，account_uuid 是 UUID。
+// isNativeAnthropicClaudeCodeRequest 按上游 isValidUserID 校验这两处，占位串会让
+// 本该直通的原生请求在测试里被误判成第三方调用方。
+const (
+	anthropicProxyTestDeviceID    = "b7c1d0e9f28a34556677889900aabbccddeeff00112233445566778899aabbcc"
+	anthropicProxyTestAccountUUID = "5c9e1a2b-3d4f-4a5b-8c6d-7e8f90a1b2c3"
+)
+
 func anthropicProxyTestCredential(t testing.TB, accessToken string) string {
 	t.Helper()
 	credential := &anthropicauth.Credential{
 		Type: anthropicauth.ChannelType, AccessToken: accessToken, RefreshToken: "rt-anthropic",
 		Expired:     time.Now().UTC().Add(10 * 24 * time.Hour).Format(time.RFC3339),
-		AccountUUID: "account-anthropic", DeviceID: "device-anthropic",
+		AccountUUID: anthropicProxyTestAccountUUID, DeviceID: anthropicProxyTestDeviceID,
 	}
 	payload, err := credential.JSON()
 	if err != nil {
@@ -345,7 +421,7 @@ func expiredProxyOAuthCredential(t testing.TB, authType, accessToken string) str
 	case model.AuthTypeAnthropicOAuth:
 		payload, err = (&anthropicauth.Credential{
 			Type: anthropicauth.ChannelType, AccessToken: accessToken, RefreshToken: "rt-anthropic",
-			Expired: expired, AccountUUID: "account-anthropic", DeviceID: "device-anthropic",
+			Expired: expired, AccountUUID: anthropicProxyTestAccountUUID, DeviceID: anthropicProxyTestDeviceID,
 		}).JSON()
 	case model.AuthTypeAntigravityOAuth:
 		payload, err = (&antigravityauth.Credential{
@@ -423,7 +499,7 @@ func TestProxy_NativeAnthropicAPIKeyRebuildsAndNormalizesWire(t *testing.T) {
 	if got := headerValueFold(upstreamHeaders, "x-api-key"); got != "sk-ant-official" {
 		t.Fatalf("official Anthropic x-api-key=%q", got)
 	}
-	if got := upstreamHeaders.Get("User-Agent"); got != "claude-cli/2.1.220 (external, cli)" {
+	if got := upstreamHeaders.Get("User-Agent"); got != "claude-cli/2.1.258 (external, cli)" {
 		t.Fatalf("User-Agent=%q", got)
 	}
 	betas := headerValueFold(upstreamHeaders, "Anthropic-Beta")
@@ -453,8 +529,11 @@ func TestProxy_NativeAnthropicAPIKeyRebuildsAndNormalizesWire(t *testing.T) {
 	if got := gjson.GetBytes(upstreamBody, "messages.0.content").String(); !strings.Contains(got, "keep this native prompt") {
 		t.Fatalf("caller system prompt was dropped: %s", upstreamBody)
 	}
-	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); strings.Contains(got, "cch=00000;") || !strings.Contains(got, " cch=") {
-		t.Fatalf("CCH was not rebuilt: %q", got)
+	// 第一方 origin：真实 Claude Code 在这里发 cch，所以 API Key 渠道也必须签（见
+	// anthropicCCHSigningEnabled）。签名值不能是占位哨兵 00000。
+	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); !strings.HasPrefix(got, "x-anthropic-billing-header:") ||
+		!strings.Contains(got, " cch=") || strings.Contains(got, "cch=00000;") {
+		t.Fatalf("API-key billing on first-party origin must be signed: %q", got)
 	}
 	if gjson.GetBytes(upstreamBody, "temperature").Exists() || gjson.GetBytes(upstreamBody, "top_p").Exists() ||
 		gjson.GetBytes(upstreamBody, "top_k").Exists() {
@@ -696,7 +775,8 @@ func TestProxy_AnthropicCompatibleGatewayOwnsLegacySystemTurns(t *testing.T) {
 }
 
 // TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy 守住原生 Claude Code
-// 请求的直通契约：调用方已经自带完整 CLI 指纹时，网关只重签 CCH，不重写 body。
+// 请求的直通契约：调用方已经自带完整 CLI 指纹时，API Key 网关不处理 CCH，
+// 也不重写 body。
 // 与 TestProxy_AnthropicOAuthPreservesNativePromptAcross400Retry 对称——直通判定
 // 看的是请求形态，不是凭证形态，API Key 渠道同样适用。
 func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
@@ -730,7 +810,7 @@ func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 	response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
 		"model": "claude-sonnet-4-6",
 		"system": []any{
-			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=00000;"},
+			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=4d721;"},
 			map[string]any{
 				"type": "text", "text": "explicit cache only",
 				"cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"},
@@ -765,8 +845,8 @@ func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 		gjson.GetBytes(upstreamBody, "messages.2.content.0.cache_control").Exists() {
 		t.Fatalf("automatic cache breakpoints were added beside explicit policy: %s", upstreamBody)
 	}
-	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); strings.Contains(got, "cch=00000;") || !strings.Contains(got, " cch=") {
-		t.Fatalf("CCH was not rebuilt: %q", got)
+	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); got != "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=4d721;" {
+		t.Fatalf("caller-owned API-key CCH changed: %q", got)
 	}
 }
 
@@ -1305,6 +1385,59 @@ func TestProxy_AntigravityProviderAdapterRequest(t *testing.T) {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestProxy_AntigravityClaudeSystemReminderPreservesToolPairing(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wire, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var callIDs, resultIDs []string
+		foundReminder := false
+		for _, content := range gjson.GetBytes(wire, "request.contents").Array() {
+			for _, part := range content.Get("parts").Array() {
+				if call := part.Get("functionCall"); call.Exists() {
+					callIDs = append(callIDs, call.Get("id").String())
+				}
+				if result := part.Get("functionResponse"); result.Exists() {
+					resultIDs = append(resultIDs, result.Get("id").String())
+					if content.Get("role").String() != "user" {
+						t.Errorf("tool result has non-user role: %s", wire)
+					}
+				}
+				foundReminder = foundReminder || strings.Contains(part.Get("text").String(), "keep the reminder")
+			}
+		}
+		if strings.Join(callIDs, ",") != "call_a,call_b" || strings.Join(resultIDs, ",") != "call_a,call_b" || !foundReminder {
+			t.Errorf("lost tool pairing or system reminder: %s", wire)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "antigravity-system-tool-pairing", upstreamProtocol: "gemini", models: "gemini-3-flash", priority: 100,
+		authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-system-pairing"),
+	}}, map[int]string{0: upstream.URL})
+	response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
+		"model": "gemini-3-flash", "max_tokens": 64,
+		"messages": []any{
+			map[string]any{"role": "user", "content": "read both"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "call_a", "name": "read_a", "input": map[string]any{}},
+				map[string]any{"type": "tool_use", "id": "call_b", "name": "read_b", "input": map[string]any{}},
+			}},
+			map[string]any{"role": "system", "content": "keep the reminder"},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "call_b", "content": "B"},
+				map[string]any{"type": "tool_result", "tool_use_id": "call_a", "content": "A"},
+			}},
+		},
+	}, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -3639,6 +3772,59 @@ func TestProxy_XAIOAuthDoesNotReplayAfterCommittedSemanticOutput(t *testing.T) {
 	}
 }
 
+func TestProxy_CodexPreservesOfficialClientIdentity(t *testing.T) {
+	const clientUserAgent = "codex-tui/0.153.4 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (codex-tui; 0.153.4)"
+	for _, authType := range []string{model.AuthTypeAPIKey, model.AuthTypeCodexOAuth} {
+		t.Run(authType, func(t *testing.T) {
+			for _, version := range []string{"", "0.153.4"} {
+				t.Run("version="+version, func(t *testing.T) {
+					captured := make(chan http.Header, 1)
+					upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						captured <- r.Header.Clone()
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "event: response.completed\ndata: "+`{"type":"response.completed","response":{"id":"resp-identity","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`+"\n\n")
+					}))
+					defer upstream.Close()
+					channel := testChannel{
+						name: "codex-identity", upstreamProtocol: "codex", models: "gpt-test",
+						authType: authType, apiKey: "sk-upstream",
+					}
+					if authType == model.AuthTypeCodexOAuth {
+						channel.oauthCredential = codexProxyTestCredential(t, "at-upstream", "rt-upstream", "account-upstream")
+					}
+					env := setupProxyTestEnv(t, []testChannel{channel}, map[int]string{0: upstream.URL})
+					headers := map[string]string{
+						"User-Agent": clientUserAgent, "Originator": "codex-tui",
+						"X-Codex-Window-Id": "client-thread:0",
+					}
+					if version != "" {
+						headers["Version"] = version
+					}
+					response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+						"model": "gpt-test", "instructions": "test", "input": []any{}, "stream": true,
+					}, headers)
+					if response.Code != http.StatusOK {
+						t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+					}
+					var got http.Header
+					select {
+					case got = <-captured:
+					default:
+						t.Fatal("upstream request was not captured")
+					}
+					if got.Get("User-Agent") != clientUserAgent || got.Get("Version") != version {
+						t.Errorf("upstream identity = UA %q Version %q, want UA %q Version %q",
+							got.Get("User-Agent"), got.Get("Version"), clientUserAgent, version)
+					}
+					if windowID := got.Get("X-Codex-Window-Id"); windowID != "client-thread:0" {
+						t.Errorf("upstream X-Codex-Window-Id = %q, want client-thread:0", windowID)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestProxy_CodexOAuthNonStreamingOpenAIClientReassemblesAndTranslates(t *testing.T) {
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wireBody, err := io.ReadAll(r.Body)
@@ -5317,6 +5503,111 @@ func TestProxy_CodexPriorityRequestBillsFastModeWithoutResponseTier(t *testing.T
 	wantCost := util.CalculateCostDetailed("gpt-5.6", 1000, 1000, 0, 0, 0) * 2.5
 	if !floatEquals(entry.Cost, wantCost) {
 		t.Fatalf("Cost=%v, want fast-mode cost %v", entry.Cost, wantCost)
+	}
+}
+
+func TestProxy_CodexPriorityRequestBillsFastModeDespiteUpstreamDefaultTier(t *testing.T) {
+	t.Parallel()
+
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp-standard","status":"completed","model":"gpt-5.6","service_tier":"default","output":[],"usage":{"input_tokens":1000,"output_tokens":1000,"total_tokens":2000}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "codex-standard", models: "gpt-5.6", upstreamProtocol: util.ProtocolCodex},
+	}, map[int]string{0: upstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model":        "gpt-5.6",
+		"stream":       true,
+		"service_tier": "priority",
+		"input":        "hi",
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	entry := waitForProxyLog(t, env, "gpt-5.6")
+	if entry.ServiceTier != "priority" {
+		t.Fatalf("ServiceTier=%q, want priority", entry.ServiceTier)
+	}
+	wantCost := util.CalculateCostDetailed("gpt-5.6", 1000, 1000, 0, 0, 0) * 2.5
+	if !floatEquals(entry.Cost, wantCost) {
+		t.Fatalf("Cost=%v, want fast-mode cost %v", entry.Cost, wantCost)
+	}
+}
+
+func TestProxy_CodexAutoResponseChargesFastMode(t *testing.T) {
+	t.Parallel()
+
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp-auto","status":"completed","model":"gpt-5.6-sol","service_tier":"auto","output":[],"usage":{"input_tokens":1000,"output_tokens":1000,"total_tokens":2000}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "codex-auto", models: "gpt-5.6-sol", upstreamProtocol: util.ProtocolCodex},
+	}, map[int]string{0: upstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model":        "gpt-5.6-sol",
+		"stream":       true,
+		"service_tier": "priority",
+		"input":        "hi",
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	entry := waitForProxyLog(t, env, "gpt-5.6-sol")
+	if entry.ServiceTier != "auto" {
+		t.Fatalf("ServiceTier=%q, want auto", entry.ServiceTier)
+	}
+	wantCost := util.CalculateCostDetailed("gpt-5.6-sol", 1000, 1000, 0, 0, 0) * 2.5
+	if !floatEquals(entry.Cost, wantCost) {
+		t.Fatalf("Cost=%v, want auto fast-mode cost %v", entry.Cost, wantCost)
+	}
+}
+
+func TestProxy_CodexUltrafastResponseChargesTenfold(t *testing.T) {
+	t.Parallel()
+
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp-ultrafast","status":"completed","model":"gpt-5.6","service_tier":"ultrafast","output":[],"usage":{"input_tokens":1000,"output_tokens":1000,"total_tokens":2000}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "codex-ultrafast", models: "gpt-5.6", upstreamProtocol: util.ProtocolCodex},
+	}, map[int]string{0: upstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model":        "gpt-5.6",
+		"stream":       true,
+		"service_tier": "priority",
+		"input":        "hi",
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	entry := waitForProxyLog(t, env, "gpt-5.6")
+	if entry.ServiceTier != "ultrafast" {
+		t.Fatalf("ServiceTier=%q, want ultrafast", entry.ServiceTier)
+	}
+	wantCost := util.CalculateCostDetailed("gpt-5.6", 1000, 1000, 0, 0, 0) * 10
+	if !floatEquals(entry.Cost, wantCost) {
+		t.Fatalf("Cost=%v, want ultrafast cost %v", entry.Cost, wantCost)
 	}
 }
 
@@ -7255,6 +7546,89 @@ func TestProxy_AutomaticProtocolFallback_SkipsUnrepresentableTransforms(t *testi
 	}
 }
 
+func TestProxy_LocalMode_SkipsUnrepresentableTransformsAndRetriesNextProtocol(t *testing.T) {
+	var paths []string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"unexpected protocol"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "local-compaction-protocol-skip", upstreamProtocol: "anthropic",
+		protocolTransformMode: model.ProtocolTransformModeLocal, models: "gpt-5.6-sol",
+	}}, map[int]string{0: upstream.URL})
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil || len(configs) != 1 {
+		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
+	}
+	configs[0].URLs[0].Protocols = []string{"anthropic", "codex"}
+	if _, err := env.store.UpdateConfig(context.Background(), configs[0].ID, configs[0]); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+	env.server.InvalidateChannelListCache()
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-5.6-sol",
+		"input": []map[string]any{{
+			"type":              "compaction",
+			"encrypted_content": "opaque",
+		}},
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !slices.Equal(paths, []string{"/v1/responses"}) {
+		t.Fatalf("paths=%v, want native Codex after local Anthropic transform rejection", paths)
+	}
+}
+
+func TestProxy_LocalMode_SkipsUnrepresentableTransformsAndRetriesNextChannel(t *testing.T) {
+	var anthropicHits, codexHits int
+	anthropicUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		anthropicHits++
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"anthropic should not be called"}}`)
+	}))
+	defer anthropicUpstream.Close()
+	codexUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		codexHits++
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"unexpected path"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer codexUpstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "anthropic-local", upstreamProtocol: "anthropic", protocolTransformMode: model.ProtocolTransformModeLocal, models: "gpt-5.6-sol"},
+		{name: "codex-local", upstreamProtocol: "codex", protocolTransformMode: model.ProtocolTransformModeLocal, models: "gpt-5.6-sol"},
+	}, map[int]string{0: anthropicUpstream.URL, 1: codexUpstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-5.6-sol",
+		"input": []map[string]any{{
+			"type":              "compaction",
+			"encrypted_content": "opaque",
+		}},
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if anthropicHits != 0 || codexHits != 1 {
+		t.Fatalf("anthropicHits=%d codexHits=%d, want 0/1", anthropicHits, codexHits)
+	}
+}
+
 func TestProxy_AutomaticProtocolFallback_ExactURLTranslatesDirectly(t *testing.T) {
 	var paths []string
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -8276,6 +8650,69 @@ func TestProxy_CodexInvalidEncryptedContentRetriesWithoutEncryptedInputItems(t *
 	}
 	if !bytes.Contains(bodies[1], []byte(`"type":"message"`)) {
 		t.Fatalf("retry request should keep non-encrypted input items, got %s", bodies[1])
+	}
+}
+
+func TestProxy_CodexSSEInvalidEncryptedContentRetriesWithoutEncryptedInputItems(t *testing.T) {
+	t.Parallel()
+
+	const invalidEncryptedContentEvent = `{"type":"error","error":{"message":"The encrypted content could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"},"status":400}`
+
+	var attempts atomic.Int32
+	var bodies [][]byte
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "codex-sse-ch", upstreamProtocol: "codex", models: "gpt-5.5", apiKey: "sk-codex"},
+	}, map[int]string{0: "https://codex-upstream.example.com"})
+
+	env.server.client = &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, body)
+			if attempts.Add(1) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body: io.NopCloser(bytes.NewReader([]byte(
+						"event: error\n" + "data: " + invalidEncryptedContentEvent + "\n\n",
+					))),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(bytes.NewReader([]byte(
+					"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+						"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n",
+				))),
+			}, nil
+		}),
+	}
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model":  "gpt-5.5",
+		"stream": true,
+		"input": []map[string]any{
+			{"type": "reasoning", "summary": []any{}, "encrypted_content": "drop-reasoning"},
+			{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "hi"}}},
+		},
+	}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected retry success, got %d: %s", w.Code, w.Body.String())
+	}
+	if attempts.Load() != 2 || len(bodies) != 2 {
+		t.Fatalf("attempts=%d bodies=%d, want 2/2", attempts.Load(), len(bodies))
+	}
+	if !bytes.Contains(bodies[0], []byte(`"type":"reasoning"`)) {
+		t.Fatalf("first request should include reasoning item, got %s", bodies[0])
+	}
+	if bytes.Contains(bodies[1], []byte(`"type":"reasoning"`)) ||
+		bytes.Contains(bodies[1], []byte(`"encrypted_content"`)) {
+		t.Fatalf("SSE 400 retry should remove encrypted thinking state, got %s", bodies[1])
+	}
+	if !bytes.Contains(bodies[1], []byte(`"type":"message"`)) ||
+		!strings.Contains(w.Body.String(), `"delta":"ok"`) {
+		t.Fatalf("retry should preserve user message and return second response, body=%s response=%s", bodies[1], w.Body.String())
 	}
 }
 

@@ -707,7 +707,7 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 
 	result := model.BatchConfigPatchResult{}
 	err = s.WithTransaction(ctx, func(tx *sql.Tx) error {
-		states, err := s.loadBatchConfigPatchStates(ctx, tx, channelIDs, patch.ModelImportMode != "")
+		states, err := s.loadBatchConfigPatchStates(ctx, tx, channelIDs, patch.ModelImportMode != "", patch.CostMultiplier != nil)
 		if err != nil {
 			return err
 		}
@@ -723,9 +723,21 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 			if patch.Priority != nil {
 				nextPriority = *patch.Priority
 			}
+			// 倍率属于凭证：api_key 渠道批量设置落到该渠道全部 Key，OAuth 渠道维持渠道级列。
 			nextCostMultiplier := state.costMultiplier
+			keyMultiplierChanged := false
 			if patch.CostMultiplier != nil {
-				nextCostMultiplier = *patch.CostMultiplier
+				if model.NormalizeAuthType(state.authType) == model.AuthTypeAPIKey {
+					targetMultiplier := normalizeCostMultiplier(*patch.CostMultiplier)
+					for _, currentMultiplier := range state.keyCostMultipliers {
+						if currentMultiplier != targetMultiplier {
+							keyMultiplierChanged = true
+							break
+						}
+					}
+				} else {
+					nextCostMultiplier = *patch.CostMultiplier
+				}
 			}
 			nextDailyCostLimit := state.dailyCostLimit
 			if patch.DailyCostLimit != nil {
@@ -753,28 +765,37 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 				nextScheduledCheckModel = reconciledScheduledCheckModel(nextScheduledCheckModel, nextModels)
 			}
 
-			changed := state.priority != nextPriority ||
+			channelChanged := state.priority != nextPriority ||
 				state.costMultiplier != nextCostMultiplier ||
 				state.dailyCostLimit != nextDailyCostLimit ||
 				state.rpmLimit != nextRPMLimit ||
 				state.maxConcurrency != nextMaxConcurrency ||
 				state.protocolTransformMode != nextProtocolMode ||
-				state.scheduledCheckModel != nextScheduledCheckModel ||
-				modelsChanged
+				state.scheduledCheckModel != nextScheduledCheckModel
+			changed := channelChanged || keyMultiplierChanged || modelsChanged
 			if !changed {
 				result.Unchanged++
 				continue
 			}
 
 			updatedAtUnix := timeToUnix(time.Now())
-			if _, err := s.execTx(ctx, tx, `
-				UPDATE channels
-				SET priority = ?, cost_multiplier = ?, daily_cost_limit = ?, rpm_limit = ?, max_concurrency = ?,
-					protocol_transform_mode = ?, scheduled_check_model = ?, updated_at = ?
-				WHERE id = ?
-			`, nextPriority, nextCostMultiplier, nextDailyCostLimit, nextRPMLimit, nextMaxConcurrency,
-				nextProtocolMode, nextScheduledCheckModel, updatedAtUnix, channelID); err != nil {
-				return fmt.Errorf("patch channel %d: %w", channelID, err)
+			if channelChanged || modelsChanged {
+				if _, err := s.execTx(ctx, tx, `
+					UPDATE channels
+					SET priority = ?, cost_multiplier = ?, daily_cost_limit = ?, rpm_limit = ?, max_concurrency = ?,
+						protocol_transform_mode = ?, scheduled_check_model = ?, updated_at = ?
+					WHERE id = ?
+				`, nextPriority, nextCostMultiplier, nextDailyCostLimit, nextRPMLimit, nextMaxConcurrency,
+					nextProtocolMode, nextScheduledCheckModel, updatedAtUnix, channelID); err != nil {
+					return fmt.Errorf("patch channel %d: %w", channelID, err)
+				}
+			}
+			if keyMultiplierChanged {
+				if _, err := s.execTx(ctx, tx, `
+					UPDATE api_keys SET cost_multiplier = ?, updated_at = ? WHERE channel_id = ?
+				`, normalizeCostMultiplier(*patch.CostMultiplier), updatedAtUnix, channelID); err != nil {
+					return fmt.Errorf("patch channel %d api key cost multipliers: %w", channelID, err)
+				}
 			}
 			if modelsChanged {
 				if err := s.saveModelEntriesTx(ctx, tx, channelID, nextModels); err != nil {
@@ -802,7 +823,9 @@ type batchConfigPatchState struct {
 	maxConcurrency        int
 	protocolTransformMode string
 	scheduledCheckModel   string
+	authType              string
 	modelEntries          []model.ModelEntry
+	keyCostMultipliers    []float64
 }
 
 func normalizeBatchPatchChannelIDs(channelIDs []int64) []int64 {
@@ -821,7 +844,7 @@ func normalizeBatchPatchChannelIDs(channelIDs []int64) []int64 {
 	return result
 }
 
-func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, channelIDs []int64, withModels bool) (map[int64]*batchConfigPatchState, error) {
+func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, channelIDs []int64, withModels, withKeyMultipliers bool) (map[int64]*batchConfigPatchState, error) {
 	placeholders := make([]string, len(channelIDs))
 	args := make([]any, len(channelIDs))
 	for i, channelID := range channelIDs {
@@ -831,7 +854,7 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 
 	//nolint:gosec // placeholders are generated internally and contain only "?".
 	query := `SELECT id, priority, cost_multiplier, daily_cost_limit, rpm_limit, max_concurrency,
-		protocol_transform_mode, scheduled_check_model
+		protocol_transform_mode, scheduled_check_model, auth_type
 		FROM channels WHERE id IN (` + strings.Join(placeholders, ",") + `) ORDER BY id`
 	if s.supportsRowLock() {
 		query += ` FOR UPDATE`
@@ -846,7 +869,7 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 		state := &batchConfigPatchState{}
 		if err := rows.Scan(
 			&channelID, &state.priority, &state.costMultiplier, &state.dailyCostLimit, &state.rpmLimit, &state.maxConcurrency,
-			&state.protocolTransformMode, &state.scheduledCheckModel,
+			&state.protocolTransformMode, &state.scheduledCheckModel, &state.authType,
 		); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan channel for batch patch: %w", err)
@@ -860,29 +883,63 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close channels for batch patch: %w", err)
 	}
-	if !withModels || len(states) == 0 {
+	if len(states) == 0 {
 		return states, nil
 	}
 
-	modelRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, model, redirect_model, disabled
-		FROM channel_models WHERE channel_id IN (`+strings.Join(placeholders, ",")+`)
-		ORDER BY channel_id, created_at ASC, model ASC`), normalizeSQLArgs(args)...)
-	if err != nil {
-		return nil, fmt.Errorf("query models for batch patch: %w", err)
+	if withModels {
+		modelRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, model, redirect_model, disabled
+			FROM channel_models WHERE channel_id IN (`+strings.Join(placeholders, ",")+`)
+			ORDER BY channel_id, created_at ASC, model ASC`), normalizeSQLArgs(args)...)
+		if err != nil {
+			return nil, fmt.Errorf("query models for batch patch: %w", err)
+		}
+		for modelRows.Next() {
+			var channelID int64
+			var entry model.ModelEntry
+			if err := modelRows.Scan(&channelID, &entry.Model, &entry.RedirectModel, &entry.Disabled); err != nil {
+				_ = modelRows.Close()
+				return nil, fmt.Errorf("scan model for batch patch: %w", err)
+			}
+			if state := states[channelID]; state != nil {
+				state.modelEntries = append(state.modelEntries, entry)
+			}
+		}
+		if err := modelRows.Err(); err != nil {
+			_ = modelRows.Close()
+			return nil, fmt.Errorf("iterate models for batch patch: %w", err)
+		}
+		if err := modelRows.Close(); err != nil {
+			return nil, fmt.Errorf("close models for batch patch: %w", err)
+		}
 	}
-	defer func() { _ = modelRows.Close() }()
-	for modelRows.Next() {
+	if !withKeyMultipliers {
+		return states, nil
+	}
+
+	keyRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, cost_multiplier
+		FROM api_keys WHERE channel_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY channel_id, key_index ASC`), normalizeSQLArgs(args)...)
+	if err != nil {
+		return nil, fmt.Errorf("query API key multipliers for batch patch: %w", err)
+	}
+	for keyRows.Next() {
 		var channelID int64
-		var entry model.ModelEntry
-		if err := modelRows.Scan(&channelID, &entry.Model, &entry.RedirectModel, &entry.Disabled); err != nil {
-			return nil, fmt.Errorf("scan model for batch patch: %w", err)
+		var multiplier float64
+		if err := keyRows.Scan(&channelID, &multiplier); err != nil {
+			_ = keyRows.Close()
+			return nil, fmt.Errorf("scan API key multiplier for batch patch: %w", err)
 		}
 		if state := states[channelID]; state != nil {
-			state.modelEntries = append(state.modelEntries, entry)
+			state.keyCostMultipliers = append(state.keyCostMultipliers, multiplier)
 		}
 	}
-	if err := modelRows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate models for batch patch: %w", err)
+	if err := keyRows.Err(); err != nil {
+		_ = keyRows.Close()
+		return nil, fmt.Errorf("iterate API key multipliers for batch patch: %w", err)
+	}
+	if err := keyRows.Close(); err != nil {
+		return nil, fmt.Errorf("close API key multipliers for batch patch: %w", err)
 	}
 	return states, nil
 }

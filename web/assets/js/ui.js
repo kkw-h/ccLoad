@@ -209,9 +209,13 @@ window.WebAuth = window.WebAuth || {
   }
 
   function getStoredTheme() {
+    if (window.ccLoadTheme && typeof window.ccLoadTheme.getStoredTheme === 'function') {
+      return window.ccLoadTheme.getStoredTheme();
+    }
     try {
       const saved = localStorage.getItem(THEME_STORAGE_KEY);
-      return THEME_MODES.includes(saved) ? saved : 'system';
+      const mode = typeof saved === 'string' ? saved.split(':', 1)[0] : null;
+      return THEME_MODES.includes(mode) ? mode : 'system';
     } catch (_) {
       return 'system';
     }
@@ -264,8 +268,8 @@ window.WebAuth = window.WebAuth || {
     });
   }
 
-  function applyStoredTheme() {
-    currentThemeMode = getStoredTheme();
+  function applyThemeMode(mode) {
+    currentThemeMode = THEME_MODES.includes(mode) ? mode : 'system';
     const resolvedTheme = resolveTheme(currentThemeMode);
     document.documentElement.dataset.theme = currentThemeMode;
     document.documentElement.dataset.resolvedTheme = resolvedTheme;
@@ -277,13 +281,20 @@ window.WebAuth = window.WebAuth || {
     }));
   }
 
+  function applyStoredTheme() {
+    applyThemeMode(getStoredTheme());
+  }
+
   function setThemeMode(mode) {
     if (!THEME_MODES.includes(mode)) return;
-    try {
-      localStorage.setItem(THEME_STORAGE_KEY, mode);
-    } catch (_) { /* 存储失败时只应用当前页面 */ }
-    currentThemeMode = mode;
-    applyStoredTheme();
+    if (window.ccLoadTheme && typeof window.ccLoadTheme.setStoredTheme === 'function') {
+      window.ccLoadTheme.setStoredTheme(mode);
+    } else {
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, `${mode}:${Date.now()}`);
+      } catch (_) { /* 存储失败时只应用当前页面 */ }
+    }
+    applyThemeMode(mode);
   }
 
   function initTheme() {
@@ -1333,13 +1344,18 @@ window.WebAuth = window.WebAuth || {
   /**
    * 格式化成本（美元）
    * @param {number} cost - 成本值
+   * @param {number} [decimalPlaces=3] - 小数位数
    * @returns {string} 格式化后的字符串
    */
-  function formatCost(cost) {
+  function formatCost(cost, decimalPlaces) {
     const value = Number(cost);
     if (!Number.isFinite(value)) return '';
-    if (value === 0) return '$0';
-    return '$' + value.toFixed(3);
+    const hasExplicitDecimalPlaces = Number.isInteger(decimalPlaces);
+    const places = hasExplicitDecimalPlaces
+      ? Math.max(0, Math.min(6, decimalPlaces))
+      : 3;
+    if (value === 0) return hasExplicitDecimalPlaces && places > 0 ? '$0.' + '0'.repeat(places) : '$0';
+    return '$' + value.toFixed(places);
   }
 
   /**
@@ -1364,7 +1380,13 @@ window.WebAuth = window.WebAuth || {
   function formatCostMultiplier(multiplier) {
     const value = Number(multiplier);
     if (!Number.isFinite(value) || value < 0 || Math.abs(value - 1) < 1e-9) return '';
-    // 0 倍率（免费渠道）显示为 "0x"
+    return formatCostMultiplierValue(value);
+  }
+
+  // 区间端点必须显式显示 1x；单值倍率为 1 时才由上层整体隐藏。
+  function formatCostMultiplierValue(multiplier) {
+    const value = Number(multiplier);
+    if (!Number.isFinite(value) || value < 0) return '';
     return `${Number(value.toFixed(2)).toString()}x`;
   }
 
@@ -1405,7 +1427,7 @@ window.WebAuth = window.WebAuth || {
    * 构建两行成本显示HTML
    * @param {number} standard - 标准成本
    * @param {number|null|undefined} effective - 倍率后成本
-   * @param {{tone?: 'warning'|'success'}} options - 样式配置
+   * @param {{tone?: 'warning'|'success', decimalPlaces?: number}} options - 样式配置
    * @returns {string}
    */
   function buildCostStackHtml(standard, effective, options = {}) {
@@ -1422,24 +1444,35 @@ window.WebAuth = window.WebAuth || {
       classes.push('cost-stack--inline');
     }
 
+    const format = cost => formatCost(cost, options.decimalPlaces);
+
     if (!info.hasMultiplier) {
-      return `<span class="${classes.join(' ')}"><span class="cost-stack-effective">${formatCost(info.effectiveCost)}</span></span>`;
+      return `<span class="${classes.join(' ')}"><span class="cost-stack-effective">${format(info.effectiveCost)}</span></span>`;
     }
 
     if (inline) {
-      return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${formatCost(info.standardCost)}</span><span class="cost-stack-effective">${formatCost(info.effectiveCost)}</span></span>`;
+      return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${format(info.standardCost)}</span><span class="cost-stack-effective">${format(info.effectiveCost)}</span></span>`;
     }
 
-    return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${formatCost(info.standardCost)}</span><span class="cost-stack-effective">${formatCost(info.effectiveCost)}</span></span>`;
+    return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${format(info.standardCost)}</span><span class="cost-stack-effective">${format(info.effectiveCost)}</span></span>`;
   }
 
   /**
    * 构建单元格右上角倍率角标
-   * @param {number} multiplier - 倍率
+   * @param {number} multiplierMin - 倍率区间下限
+   * @param {number} multiplierMax - 倍率区间上限（缺省或等于下限时按单值显示）
    * @returns {string}
    */
-  function buildCornerMultiplierBadge(multiplier) {
-    const text = formatCostMultiplier(multiplier);
+  function buildCornerMultiplierBadge(multiplierMin, multiplierMax) {
+    const lo = Number(multiplierMin);
+    if (!Number.isFinite(lo)) return '';
+    const hi = Number(multiplierMax);
+    let text;
+    if (Number.isFinite(hi) && Math.abs(hi - lo) >= 1e-9) {
+      text = `${formatCostMultiplierValue(lo)}–${formatCostMultiplierValue(hi)}`;
+    } else {
+      text = formatCostMultiplier(lo);
+    }
     if (!text) return '';
     return `<sup class="cell-multiplier-badge">${text}</sup>`;
   }
@@ -1906,7 +1939,15 @@ window.WebAuth = window.WebAuth || {
         if (selected) row.classList.add('selected');
         if (idx === activeIndex) row.classList.add('active');
 
+        // Keep the option in the DOM until the click event is dispatched.
+        // Firefox retargets a click to the dialog when a mousedown handler
+        // removes the clicked node immediately; dialog backdrop handlers then
+        // mistake a normal selection for an outside click and close the modal.
         row.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+        row.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
           commitOption(item);

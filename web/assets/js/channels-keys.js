@@ -15,6 +15,15 @@ function isChannelKeyEditorReadOnly() {
     ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType);
 }
 
+function canFetchInlineKeyRate() {
+  if (isChannelKeyEditorReadOnly() || typeof window === 'undefined' ||
+    typeof window.getManagementAccountRateConfig !== 'function') {
+    return false;
+  }
+  const config = window.getManagementAccountRateConfig();
+  return Boolean(config && ['new_api', 'sub2api', 'sub2api_pro'].includes(config.profile));
+}
+
 function normalizeKeyAllowedModels(models) {
   const seen = new Set();
   const normalized = [];
@@ -38,12 +47,19 @@ function routingKeyModelName(value) {
   return match[1].trim() || modelName;
 }
 
+function normalizeKeyCostMultiplier(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 1;
+  return parsed;
+}
+
 function normalizeInlineKeyRow(row) {
   if (row && typeof row === 'object') {
     const normalized = {
       api_key: String(row.api_key || '').trim(),
       note: String(row.note || '').trim(),
-      allowed_models: normalizeKeyAllowedModels(row.allowed_models)
+      allowed_models: normalizeKeyAllowedModels(row.allowed_models),
+      cost_multiplier: normalizeKeyCostMultiplier(row.cost_multiplier)
     };
     if (row.model_scope_empty === true) normalized.model_scope_empty = true;
     return normalized;
@@ -51,7 +67,8 @@ function normalizeInlineKeyRow(row) {
   return {
     api_key: String(row || '').trim(),
     note: '',
-    allowed_models: []
+    allowed_models: [],
+    cost_multiplier: 1
   };
 }
 
@@ -118,29 +135,47 @@ function selectAvailableInlineKeys(rows, states) {
   return [...new Set(selectModelFetchKeyEntries(rows, states, false).map(entry => entry.apiKey))];
 }
 
-function selectModelFetchKeyEntries(rows, states, allowCooldownFallback = true) {
+function selectModelFetchKeyEntries(rows, states, allowCooldownFallback = true, allowScopeEmpty = false) {
   const statesByIndex = new Map(
     (Array.isArray(states) ? states : [])
       .filter(Boolean)
       .map(state => [Number(state.key_index), state])
   );
   const available = [];
+  const scopeEmpty = [];
   let fallback = null;
   for (const [index, row] of (Array.isArray(rows) ? rows : []).entries()) {
-    const apiKey = normalizeInlineKeyRow(row).api_key;
+    const normalizedRow = normalizeInlineKeyRow(row);
+    const apiKey = normalizedRow.api_key;
     const state = statesByIndex.get(index);
     const cooldownRemaining = Number(state?.cooldown_remaining_ms || 0);
-    if (!apiKey || state?.disabled) continue;
-    if (cooldownRemaining <= 0) {
-      available.push({ keyIndex: index, apiKey });
+    const scopeAutoDisabled = Boolean(normalizedRow.model_scope_empty);
+    if (!apiKey) continue;
+    // 手动禁用的 Key 不参与探测；作用域被裁剪空而自动禁用的 Key 凭据仍有效，
+    // 仅当调用方显式允许（allowScopeEmpty）时降级参与只读模型探测。
+    if (state?.disabled && (!allowScopeEmpty || !scopeAutoDisabled)) continue;
+    if (cooldownRemaining > 0) {
+      if (!scopeAutoDisabled && allowCooldownFallback &&
+          (!fallback || cooldownRemaining < fallback.cooldownRemaining)) {
+        fallback = { keyIndex: index, apiKey, cooldownRemaining };
+      }
       continue;
     }
-    if (!fallback || cooldownRemaining < fallback.cooldownRemaining) {
-      fallback = { keyIndex: index, apiKey, cooldownRemaining };
+    if (scopeAutoDisabled) {
+      if (!allowScopeEmpty) continue;
+      scopeEmpty.push({ keyIndex: index, apiKey });
+      continue;
     }
+    available.push({ keyIndex: index, apiKey });
   }
-  if (available.length > 0 || !allowCooldownFallback || !fallback) return available;
-  return [{ keyIndex: fallback.keyIndex, apiKey: fallback.apiKey }];
+  if (available.length > 0) {
+    return available.concat(scopeEmpty);
+  }
+  const entries = [];
+  if (allowCooldownFallback && fallback) {
+    entries.push({ keyIndex: fallback.keyIndex, apiKey: fallback.apiKey });
+  }
+  return entries.concat(scopeEmpty);
 }
 
 function countConfiguredInlineKeys(rows) {
@@ -185,7 +220,8 @@ function setInlineKeyTableDataFromAPI(apiKeys) {
         api_key: item.api_key || '',
         note: item.note || '',
         allowed_models: item.allowed_models || [],
-        model_scope_empty: item.model_scope_empty === true
+        model_scope_empty: item.model_scope_empty === true,
+        cost_multiplier: item.cost_multiplier
       });
     }
     return makeInlineKeyRow(item || '', '');
@@ -760,12 +796,19 @@ function createKeyRow(index) {
     mobileLabelNote: window.t('channels.modal.keyNote'),
     mobileLabelStatus: window.t('common.status'),
     mobileLabelActions: window.t('common.actions'),
+    mobileLabelMultiplier: window.t('channels.costMultiplier'),
+    costMultiplier: keyRow.cost_multiplier,
+    fetchRateTitle: window.t('channels.fetchRateTitle'),
+    fetchRateLabel: window.t('channels.fetchRate'),
     notePlaceholder: window.t('channels.keyNotePlaceholder')
   };
 
   // 使用模板引擎渲染
   const row = TemplateEngine.render('tpl-key-row', rowData);
   if (!row) return null;
+
+  const fetchRateButton = row.querySelector('[data-action="fetch-rate"]');
+  if (fetchRateButton) fetchRateButton.hidden = !canFetchInlineKeyRate();
 
   // 禁用状态：输入框只读（不设整行半透明，与 URL 表保持一致，状态通过徽章/开关颜色表达）
   const keyCooldown = currentChannelKeyCooldowns.find(kc => kc.key_index === index);
@@ -969,6 +1012,7 @@ function initKeyTableEventDelegation() {
       else if (action === 'delete') deleteInlineKey(index);
       else if (action === 'toggle-disabled') toggleKeyDisabled(index);
       else if (action === 'models') openKeyModelScopeModal(index, actionBtn);
+      else if (action === 'fetch-rate') fetchKeyRate(index, actionBtn);
       return;
     }
 
@@ -982,6 +1026,12 @@ function initKeyTableEventDelegation() {
 
   // 处理输入框变更
   tbody.addEventListener('change', (e) => {
+    const multiplierInput = e.target.closest('.inline-key-multiplier-input');
+    if (multiplierInput) {
+      const index = parseInt(multiplierInput.dataset.index);
+      updateInlineKeyCostMultiplier(index, multiplierInput.value);
+      return;
+    }
     if (isChannelKeyEditorReadOnly()) return;
     const input = e.target.closest('.inline-key-input');
     if (input) {
@@ -993,12 +1043,13 @@ function initKeyTableEventDelegation() {
     if (noteInput) {
       const index = parseInt(noteInput.dataset.index);
       updateInlineKeyNote(index, noteInput.value);
+      return;
     }
   });
 
   // 处理输入框焦点样式
   tbody.addEventListener('focusin', (e) => {
-    const input = e.target.closest('.inline-key-input, .inline-key-note-input');
+    const input = e.target.closest('.inline-key-input, .inline-key-note-input, .inline-key-multiplier-input');
     if (input) {
       input.style.borderColor = 'var(--primary-500)';
       input.style.boxShadow = '0 0 0 3px rgba(59,130,246,0.1)';
@@ -1008,7 +1059,7 @@ function initKeyTableEventDelegation() {
   });
 
   tbody.addEventListener('focusout', (e) => {
-    const input = e.target.closest('.inline-key-input, .inline-key-note-input');
+    const input = e.target.closest('.inline-key-input, .inline-key-note-input, .inline-key-multiplier-input');
     if (input) {
       input.style.borderColor = 'var(--neutral-300)';
       input.style.boxShadow = 'none';
@@ -1189,6 +1240,16 @@ function updateInlineKeyNote(index, value) {
   if (row.note === nextValue) return;
 
   row.note = nextValue;
+  inlineKeyTableData[index] = row;
+  markChannelFormDirty();
+}
+
+function updateInlineKeyCostMultiplier(index, value) {
+  const nextValue = normalizeKeyCostMultiplier(value);
+  const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
+  if (row.cost_multiplier === nextValue) return;
+
+  row.cost_multiplier = nextValue;
   inlineKeyTableData[index] = row;
   markChannelFormDirty();
 }
@@ -1677,6 +1738,15 @@ async function toggleKeyDisabled(index) {
       body: JSON.stringify({ key_index: index })
     });
 
+    const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
+    if (row.model_scope_empty) {
+      // The backend treats an explicit toggle as taking ownership of the
+      // disabled state. Keep the editor aligned so a later save does not
+      // re-submit the stale automatic empty-scope marker.
+      delete row.model_scope_empty;
+      inlineKeyTableData[index] = row;
+    }
+
     await refreshKeyCooldownStatus();
 
     const action = isCurrentlyDisabled ? window.t('common.enabled') : window.t('common.disabled');
@@ -1702,6 +1772,8 @@ if (typeof module !== 'undefined' && module.exports) {
     detectKeyModelScope,
     initKeyModelScopeModalEvents,
     setVisibleKeyModelScopeChecked,
-    updateKeyModelScopeSelectionCount
+    updateKeyModelScopeSelectionCount,
+    canFetchInlineKeyRate,
+    toggleKeyDisabled
   };
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,10 +63,12 @@ type oauthUsageBatchRequest struct {
 }
 
 type oauthUsageBatchResult struct {
-	ChannelID int64              `json:"channel_id"`
-	Status    string             `json:"status"`
-	Usage     *oauthUsageSummary `json:"usage,omitempty"`
-	Error     string             `json:"error,omitempty"`
+	ChannelID  int64                  `json:"channel_id"`
+	Status     string                 `json:"status"`
+	Usage      *oauthUsageSummary     `json:"usage,omitempty"`
+	Kind       string                 `json:"kind,omitempty"`
+	Management *channelManagementView `json:"management,omitempty"`
+	Error      string                 `json:"error,omitempty"`
 }
 
 type oauthUsageBatchEvent struct {
@@ -191,6 +194,8 @@ type oauthUsageWindow struct {
 }
 
 type oauthUsageSummary struct {
+	// Partial means omitted windows were not observed, rather than retired.
+	Partial               bool                    `json:"-"`
 	Provider              string                  `json:"provider"`
 	PlanType              string                  `json:"plan_type,omitempty"`
 	SubscriptionTier      string                  `json:"subscription_tier,omitempty"`
@@ -910,6 +915,7 @@ func requestXAIUsage(
 
 	summary := &oauthUsageSummary{
 		Provider:          xaiauth.ChannelType,
+		Partial:           !credits.recognized || !monthly.recognized,
 		SubscriptionTier:  strings.TrimSpace(credential.SubscriptionTier),
 		EntitlementStatus: strings.TrimSpace(credential.EntitlementStatus),
 		Windows:           make([]oauthUsageWindow, 0, len(credits.windows)+len(monthly.windows)),
@@ -1332,6 +1338,121 @@ func (s *Server) HandleOAuthUsageBatchStream(c *gin.Context) {
 	})
 }
 
+// HandleActiveChannelUsageBatchStream refreshes eligible channels from the
+// currently displayed list page. The server still verifies today's activity
+// and channel type instead of trusting the browser's selection.
+func (s *Server) HandleActiveChannelUsageBatchStream(c *gin.Context) {
+	var request oauthUsageBatchRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	requestedIDs := normalizeBatchChannelIDs(request.ChannelIDs)
+	if len(requestedIDs) == 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "channel_ids must not be empty")
+		return
+	}
+	if len(requestedIDs) > maxOAuthUsageBatchChannels {
+		RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("channel_ids must contain at most %d channels", maxOAuthUsageBatchChannels))
+		return
+	}
+
+	channelIDs, err := s.activeChannelUsageIDs(c.Request.Context(), requestedIDs)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	s.streamChannelUsageBatch(c, channelIDs)
+}
+
+func (s *Server) streamChannelUsageBatch(c *gin.Context, channelIDs []int64) {
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Header("X-Content-Type-Options", "nosniff")
+	disableResponseWriteTimeout(c.Writer, "channel usage batch stream")
+	c.Status(http.StatusOK)
+	total := len(channelIDs)
+	if err := writeSSEEvent(c, "start", oauthUsageBatchEvent{Event: "start", Total: total}); err != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+	processed, succeeded, failed := 0, 0, 0
+	for result := range s.runChannelUsageBatch(ctx, channelIDs) {
+		processed++
+		if result.Status == "succeeded" {
+			succeeded++
+		} else {
+			failed++
+		}
+		if err := writeSSEEvent(c, "progress", oauthUsageBatchEvent{
+			Event: "progress", Processed: processed, Total: total,
+			Succeeded: succeeded, Failed: failed, Result: &result,
+		}); err != nil {
+			return
+		}
+	}
+	if ctx.Err() == nil {
+		_ = writeSSEEvent(c, "complete", oauthUsageBatchEvent{
+			Event: "complete", Processed: processed, Total: total,
+			Succeeded: succeeded, Failed: failed,
+		})
+	}
+}
+
+func (s *Server) activeChannelUsageIDs(ctx context.Context, requestedIDs []int64) ([]int64, error) {
+	requested := make(map[int64]struct{}, len(requestedIDs))
+	for _, channelID := range requestedIDs {
+		requested[channelID] = struct{}{}
+	}
+	startTime, endTime := (&PaginationParams{Range: "today"}).GetTimeRange()
+	stats, err := s.statsCache.GetStatsLite(ctx, startTime, endTime, &model.LogFilter{LogSource: model.LogSourceProxy})
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[int64]struct{}, len(stats))
+	for _, entry := range stats {
+		if entry.ChannelID == nil {
+			continue
+		}
+		channelID := int64(*entry.ChannelID)
+		if _, ok := requested[channelID]; ok {
+			active[channelID] = struct{}{}
+		}
+	}
+	configs, err := s.store.ListConfigs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	channelIDs := make([]int64, 0, min(len(active), len(requested)))
+	for _, cfg := range configs {
+		if cfg == nil {
+			continue
+		}
+		if _, ok := requested[cfg.ID]; !ok {
+			continue
+		}
+		if _, ok := active[cfg.ID]; !ok {
+			continue
+		}
+		if cfg.GetAuthType() == model.AuthTypeAPIKey {
+			view := s.managementAccountView(cfg)
+			if view != nil && view.CredentialConfigured {
+				channelIDs = append(channelIDs, cfg.ID)
+			}
+			continue
+		}
+		if cfg.UsesAntigravityOAuth() || cfg.UsesZAIOAuth() ||
+			cfg.UsesCursorOAuth() || cfg.UsesZedOAuth() {
+			channelIDs = append(channelIDs, cfg.ID)
+		}
+	}
+	sort.Slice(channelIDs, func(i, j int) bool { return channelIDs[i] < channelIDs[j] })
+	return channelIDs, nil
+}
+
 func (s *Server) refreshOAuthUsage(ctx context.Context, id int64) (*oauthUsageSummary, error) {
 	cfg, err := s.store.GetConfig(ctx, id)
 	if err != nil {
@@ -1379,6 +1500,14 @@ func oauthUsageHTTPStatus(err error) int {
 }
 
 func (s *Server) runOAuthUsageBatch(ctx context.Context, channelIDs []int64) <-chan oauthUsageBatchResult {
+	return s.runUsageBatch(ctx, channelIDs, false)
+}
+
+func (s *Server) runChannelUsageBatch(ctx context.Context, channelIDs []int64) <-chan oauthUsageBatchResult {
+	return s.runUsageBatch(ctx, channelIDs, true)
+}
+
+func (s *Server) runUsageBatch(ctx context.Context, channelIDs []int64, includeAPIManagement bool) <-chan oauthUsageBatchResult {
 	results := make(chan oauthUsageBatchResult)
 	go func() {
 		defer close(results)
@@ -1390,11 +1519,17 @@ func (s *Server) runOAuthUsageBatch(ctx context.Context, channelIDs []int64) <-c
 			go func() {
 				defer workers.Done()
 				for channelID := range jobs {
-					usage, err := s.refreshOAuthUsage(ctx, channelID)
-					result := oauthUsageBatchResult{ChannelID: channelID, Status: "succeeded", Usage: usage}
+					result := oauthUsageBatchResult{ChannelID: channelID, Status: "succeeded"}
+					var err error
+					if includeAPIManagement {
+						result.Kind, result.Usage, result.Management, err = s.refreshChannelUsage(ctx, channelID)
+					} else {
+						result.Usage, err = s.refreshOAuthUsage(ctx, channelID)
+					}
 					if err != nil {
 						result.Status = "failed"
 						result.Usage = nil
+						result.Management = nil
 						result.Error = err.Error()
 					}
 					select {
@@ -1419,6 +1554,22 @@ func (s *Server) runOAuthUsageBatch(ctx context.Context, channelIDs []int64) <-c
 		workers.Wait()
 	}()
 	return results
+}
+
+func (s *Server) refreshChannelUsage(ctx context.Context, channelID int64) (string, *oauthUsageSummary, *channelManagementView, error) {
+	cfg, err := s.store.GetConfig(ctx, channelID)
+	if err != nil {
+		return "", nil, nil, errOAuthUsageChannelNotFound
+	}
+	if cfg.GetAuthType() == model.AuthTypeAPIKey {
+		if s.channelManagement == nil {
+			return "management", nil, nil, errChannelManagementProviderUnavailable
+		}
+		view, err := s.channelManagement.RefreshBalance(ctx, channelID)
+		return "management", nil, view, err
+	}
+	usage, err := s.refreshOAuthUsage(ctx, channelID)
+	return "oauth", usage, nil, err
 }
 
 func (s *Server) persistOAuthUsage(
@@ -1550,11 +1701,80 @@ func latestOAuthUsage(
 	}
 	passiveTime, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(passiveSampledAt))
 	if err == nil && passiveTime.After(activeSampledAt) {
+		if strings.EqualFold(strings.TrimSpace(active.Provider), codexauth.ChannelType) {
+			return mergeLatestCodexOAuthUsage(active, activeSampledAt, passive, passiveTime)
+		}
 		merged := *passive
 		merged.RateLimitResetCredits = cloneCodexQuotaResetCredits(active.RateLimitResetCredits)
 		return &merged
 	}
 	return active
+}
+
+// mergeLatestCodexOAuthUsage lets a newer passive sample refresh windows that
+// are already present in the official usage snapshot. The passive stream can
+// expose transient or stale quota groups (for example codex|secondary after
+// the official endpoint stopped returning it); allowing those groups to
+// replace the whole snapshot makes the admin page display phantom windows.
+// The official window identities therefore define the result set.
+func mergeLatestCodexOAuthUsage(active *oauthUsageSummary, activeSampledAt time.Time, passive *oauthUsageSummary, passiveSampledAt time.Time) *oauthUsageSummary {
+	if active == nil {
+		return passive
+	}
+	if passive == nil {
+		return active
+	}
+	merged := *active
+	passiveByKey := make(map[string][]oauthUsageWindow, len(passive.Windows))
+	for _, window := range passive.Windows {
+		key := oauthcost.Key(window.LimitName, window.Kind)
+		passiveByKey[key] = append(passiveByKey[key], window)
+	}
+	merged.Windows = make([]oauthUsageWindow, 0, len(active.Windows))
+	for _, window := range active.Windows {
+		windowSampledAt := window.SampledAt
+		if windowSampledAt.IsZero() {
+			windowSampledAt = activeSampledAt
+		}
+		key := oauthcost.Key(window.LimitName, window.Kind)
+		candidates := passiveByKey[key]
+		for i, passiveWindow := range candidates {
+			if window.LimitWindowSeconds <= 0 || passiveWindow.LimitWindowSeconds != window.LimitWindowSeconds ||
+				window.ResetAt <= 0 || passiveWindow.ResetAt <= 0 {
+				continue
+			}
+			sampledAt := passiveWindow.SampledAt
+			if sampledAt.IsZero() {
+				sampledAt = passiveSampledAt
+			}
+			if !sampledAt.After(windowSampledAt) {
+				continue
+			}
+			if !oauthQuotaCostMatchesSampledWindow(passiveWindow, &oauthcost.Window{
+				WindowSeconds: window.LimitWindowSeconds, ResetAt: window.ResetAt,
+			}) {
+				// A completed official period cannot pin the display forever.
+				// Accept a forward rollover only once both periods' boundaries
+				// and the passive sample prove the new period is current.
+				at := sampledAt.Unix()
+				if passiveWindow.ResetAt <= window.ResetAt || at < window.ResetAt ||
+					at < passiveWindow.ResetAt-passiveWindow.LimitWindowSeconds || at >= passiveWindow.ResetAt {
+					continue
+				}
+				window.ResetAt = passiveWindow.ResetAt
+			}
+			// Same-period jitter retains the official boundary; a new period
+			// uses its own boundary so its accumulated cost can also be attached.
+			window.UsedPercent = passiveWindow.UsedPercent
+			window.RemainingPercent = passiveWindow.RemainingPercent
+			window.SampledAt = sampledAt
+			passiveByKey[key] = append(candidates[:i], candidates[i+1:]...)
+			break
+		}
+		merged.Windows = append(merged.Windows, window)
+	}
+	merged.RateLimitResetCredits = cloneCodexQuotaResetCredits(active.RateLimitResetCredits)
+	return &merged
 }
 
 func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oauthUsageSummary, error) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +14,10 @@ import (
 	"ccLoad/internal/model"
 	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/util"
+
+	"github.com/bytedance/sonic"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 type oauthQuotaCostCredentialEnvelope struct {
@@ -174,56 +179,65 @@ func (s *SQLStore) sumOAuthQuotaCostByFamily(
 		return nil, nil
 	}
 	rows, err := s.queryTx(ctx, tx, `
-		SELECT model, actual_model, COALESCE(SUM(cost), 0) FROM logs
+		SELECT model, actual_model, cost FROM logs
 		WHERE channel_id = ? AND time >= ? AND cost > 0
-		GROUP BY model, actual_model
 	`, channelID, resetAt.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	costUSDByFamily := make(map[string]float64, len(families))
+	costByFamily := make(map[string]int64, len(families))
 	for rows.Next() {
 		var modelName, actualModel string
 		var costUSD float64
 		if err := rows.Scan(&modelName, &actualModel, &costUSD); err != nil {
 			return nil, err
 		}
+		// Match incremental accounting: round each log before accumulating.
+		costMicroUSD, err := util.USDToMicroUSDSafe(costUSD)
+		if err != nil {
+			return nil, err
+		}
 		if actual := strings.TrimSpace(actualModel); actual != "" {
 			modelName = actual
 		}
-		for _, family := range families {
-			if oauthcost.FamilyMatches(family, modelName) {
-				costUSDByFamily[family] += costUSD
+		matchedFamilies := make(map[string]struct{}, len(families))
+		for _, window := range usage.Windows {
+			if window == nil {
+				continue
+			}
+			if _, matched := matchedFamilies[window.Family]; matched {
+				continue
+			}
+			if oauthcost.WindowMatchesModel(window, modelName) {
+				if costByFamily[window.Family] > math.MaxInt64-costMicroUSD {
+					return nil, errors.New("OAuth quota standard cost overflow")
+				}
+				costByFamily[window.Family] += costMicroUSD
+				matchedFamilies[window.Family] = struct{}{}
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	costByFamily := make(map[string]int64, len(costUSDByFamily))
-	for family, costUSD := range costUSDByFamily {
-		costMicroUSD, err := util.USDToMicroUSDSafe(costUSD)
-		if err != nil {
-			return nil, err
-		}
-		costByFamily[family] = costMicroUSD
-	}
 	return costByFamily, nil
 }
 
 func replaceOAuthQuotaCostUsage(credentialJSON string, usage *oauthcost.Usage) (string, error) {
-	var credentialFields map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(credentialJSON), &credentialFields); err != nil {
-		return "", err
+	raw := []byte(credentialJSON)
+	if !sonic.Valid(raw) || !gjson.ParseBytes(raw).IsObject() {
+		return "", errors.New("oauth credential must be a JSON object")
 	}
 	costJSON, err := json.Marshal(usage)
 	if err != nil {
 		return "", err
 	}
-	credentialFields["quota_cost_usage"] = costJSON
-	updatedCredential, err := json.Marshal(credentialFields)
-	return string(updatedCredential), err
+	updatedCredential, err := sjson.SetRawBytes(raw, "quota_cost_usage", costJSON)
+	if err != nil {
+		return "", err
+	}
+	return string(updatedCredential), nil
 }
 
 func isOAuthAuthType(authType string) bool {

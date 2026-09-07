@@ -50,7 +50,8 @@ func (s *Server) managementCheckinLoop() {
 
 // runDueManagementCheckins claims all channels due at now and waits for their
 // check-ins to finish. Claiming the local calendar day before queueing is what
-// makes repeated scans and concurrent scans idempotent.
+// makes repeated scans and concurrent scans idempotent. Channel enabled state
+// only controls proxy routing and does not suppress management-account jobs.
 func (s *Server) runDueManagementCheckins(ctx context.Context, now time.Time) error {
 	if s == nil || s.store == nil {
 		return nil
@@ -63,7 +64,9 @@ func (s *Server) runDueManagementCheckins(ctx context.Context, now time.Time) er
 		return err
 	}
 
-	day := now.In(time.Local).Format("2006-01-02")
+	// 和 isManagementCheckinDue 用同一个日历：day 是 CAS claim 的幂等键，
+	// 两处若按不同时区取日期，claim 的日子和判定的日子会错位。
+	day := now.Format("2006-01-02")
 	channelIDs := make([]int64, 0, len(configs))
 	var scanErr error
 	for _, cfg := range configs {
@@ -71,7 +74,7 @@ func (s *Server) runDueManagementCheckins(ctx context.Context, now time.Time) er
 			scanErr = ctx.Err()
 			break
 		}
-		if cfg == nil || cfg.AuthType != model.AuthTypeAPIKey || !cfg.Enabled {
+		if cfg == nil || cfg.AuthType != model.AuthTypeAPIKey {
 			continue
 		}
 		envelope, parseErr := model.ParseChannelManagementEnvelope(cfg.OAuthCredential)
@@ -134,7 +137,7 @@ func (s *Server) claimManagementCheckinDay(
 	// permanently failing store.
 	for attempt := 0; attempt < 2; attempt++ {
 		envelope, err := model.ParseChannelManagementEnvelope(current.OAuthCredential)
-		if err != nil || current.AuthType != model.AuthTypeAPIKey || !current.Enabled || !isManagementCheckinDue(envelope, now) {
+		if err != nil || current.AuthType != model.AuthTypeAPIKey || !isManagementCheckinDue(envelope, now) {
 			return false, nil
 		}
 		next := *envelope
@@ -177,7 +180,7 @@ func (s *Server) runManagementCheckinJob(ctx context.Context, channelID int64) {
 		s.writeManagementCheckinAudit(ctx, cfg, nil, parseErr)
 		return
 	}
-	if cfg.AuthType != model.AuthTypeAPIKey || !cfg.Enabled ||
+	if cfg.AuthType != model.AuthTypeAPIKey ||
 		(envelope.Profile != model.ChannelManagementProfileNewAPI && envelope.Profile != model.ChannelManagementProfileSub2APIPro) ||
 		!envelope.Settings.DailyCheckinEnabled {
 		s.writeManagementCheckinAudit(ctx, cfg, &channelCheckinResult{Status: newAPICheckinSkippedDisabled}, nil)
@@ -205,22 +208,27 @@ func (s *Server) writeManagementCheckinAudit(ctx context.Context, cfg *model.Con
 
 // isManagementCheckinDue interprets the configured HH:MM in the server's local
 // calendar and intentionally ignores manual check-in state.
+//
+// 时区取自 now 自身而不是包级 time.Local：调用方传的 now 来自 ticker（即
+// time.Now()），两者在生产中是同一个 Location。读全局会让这个本可以是纯函数的
+// 判定挂上进程级依赖，测试为了控制时区只能去写 time.Local，那是真实的数据竞争
+// ——同包里任何并行测试的 time.Now() 都在读它。
 func isManagementCheckinDue(envelope *model.ChannelManagementEnvelope, now time.Time) bool {
 	if envelope == nil || !envelope.Settings.DailyCheckinEnabled ||
 		(envelope.Profile != model.ChannelManagementProfileNewAPI && envelope.Profile != model.ChannelManagementProfileSub2APIPro) {
 		return false
 	}
-	localNow := now.In(time.Local)
-	if envelope.State.LastScheduledDay == localNow.Format("2006-01-02") {
+	location := now.Location()
+	if envelope.State.LastScheduledDay == now.Format("2006-01-02") {
 		return false
 	}
-	scheduledClock, err := time.ParseInLocation("15:04", envelope.Settings.DailyCheckinTime, time.Local)
+	scheduledClock, err := time.ParseInLocation("15:04", envelope.Settings.DailyCheckinTime, location)
 	if err != nil {
 		return false
 	}
 	scheduled := time.Date(
-		localNow.Year(), localNow.Month(), localNow.Day(),
-		scheduledClock.Hour(), scheduledClock.Minute(), 0, 0, time.Local,
+		now.Year(), now.Month(), now.Day(),
+		scheduledClock.Hour(), scheduledClock.Minute(), 0, 0, location,
 	)
-	return !localNow.Before(scheduled)
+	return !now.Before(scheduled)
 }

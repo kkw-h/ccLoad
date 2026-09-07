@@ -232,13 +232,13 @@
               </div>
               <div id="zedOAuthControls" hidden>
                 <div class="oauth-field">
-                  <label for="zedSystemID" data-i18n="channels.zed.systemIDLabel">Zed system ID（可选）</label>
+                  <label for="zedSystemID" data-i18n="channels.zed.systemIDLabel">Zed system ID（可选；试用需要）</label>
                   <input id="zedSystemID" name="zed_system_id" type="text"
                     class="form-input" autocomplete="off" autocapitalize="none" spellcheck="false"
                     placeholder="9d4b8c17-12ae-4091-96bc-1a79ce2de601"
                     aria-describedby="zedSystemIDHint oauthLoginDialogStatus">
                   <p id="zedSystemIDHint" class="oauth-field-hint"
-                    data-i18n="channels.zed.systemIDHint">本机运行 ccLoad 时会自动读取 Zed；远程或容器部署需要填写本机 Zed 数据库中的 system_id。</p>
+                    data-i18n="channels.zed.systemIDHint">本机运行 ccLoad 时会自动读取 Zed。没有该值时仍可尝试登录，但 Zed 试用权限可能不可用；远程或容器部署可填写本机 Zed 数据库中的 system_id。</p>
                 </div>
               </div>
               <div id="oauthLoginActions" class="oauth-actions">
@@ -634,7 +634,7 @@
                     <span id="batchPriorityError" class="channel-batch-advanced__error" role="alert" hidden></span>
                   </div>
                   <div class="channel-batch-advanced__field">
-                    <label for="batchCostMultiplier" data-i18n="channels.batchCostMultiplier">倍率</label>
+                    <label for="batchCostMultiplier" data-i18n="channels.batchCostMultiplier">Key 倍率</label>
                     <div class="channel-batch-advanced__control">
                       <input id="batchCostMultiplier" class="channel-batch-input" type="number" value="1" min="0"
                         step="0.01" inputmode="decimal"
@@ -642,7 +642,7 @@
                       <button id="batchApplyCostMultiplierBtn" type="button"
                         class="btn btn-sm channel-batch-action channel-batch-action--apply"
                         data-action="batch-set-cost-multiplier" disabled>
-                        <span data-i18n="channels.batchApplyCostMultiplier">设置倍率</span>
+                        <span data-i18n="channels.batchApplyCostMultiplier">设置全部 Key 倍率</span>
                       </button>
                     </div>
                     <span id="batchCostMultiplierHint" class="channel-batch-advanced__hint"
@@ -995,6 +995,7 @@
                       <option value="disabled" data-i18n="channels.keyStatusDisabled">已禁用</option>
                     </select>
                   </th>
+                  <th style="width: 190px;" data-i18n="channels.costMultiplier">倍率</th>
                   <th style="width: 80px;"></th>
                 </tr>
               </thead>
@@ -1090,8 +1091,9 @@
                 <tr>
                   <th style="width: 70px;">
                     <div style="display: flex; align-items: center; gap: 6px;">
-                      <input type="checkbox" id="selectAllModels" data-change-action="toggle-select-all-models"
-                        style="width: 16px; height: 16px;" data-i18n-title="common.selectAll" title="全选/取消全选">
+                      <input type="checkbox" id="selectAllModels" data-change-action="invert-model-selection"
+                        style="width: 16px; height: 16px;" data-i18n-title="channels.invertVisibleModels" title="反选当前显示的模型"
+                        data-i18n-aria-label="channels.invertVisibleModels" aria-label="反选当前显示的模型">
                       <span>#</span>
                     </div>
                   </th>
@@ -1154,20 +1156,6 @@
                     placeholder="0=无限制">
                 </div>
               </div>
-              <div class="channel-editor-inline-field channel-editor-inline-field--rate">
-                <label class="form-label channel-editor-inline-label" for="channelCostMultiplier"
-                  data-i18n="channels.costMultiplier">倍率</label>
-                <div class="channel-editor-inline-field-input channel-editor-rate-input">
-                  <input type="number" id="channelCostMultiplier" class="form-input" value="1" min="0" step="0.01"
-                    style="width: 84px; min-width: 84px;" data-i18n-placeholder="channels.costMultiplierPlaceholder"
-                    placeholder="默认1">
-                  <button type="button" id="fetchSub2APIRateBtn" class="btn btn-secondary btn-sm channel-editor-rate-fetch-btn"
-                    data-action="fetch-sub2api-rate" data-i18n-title="channels.fetchRateTitle"
-                    title="从 Sub2API 获取当前有效倍率">
-                    <span id="fetchSub2APIRateLabel" data-i18n="channels.fetchRate">获取倍率</span>
-                  </button>
-                </div>
-              </div>
             </div>
             <div class="channel-editor-footer-actions">
               <label id="channelEnabledWrapper" class="form-label channel-editor-checkbox-label channel-editor-footer-enabled">
@@ -1183,7 +1171,7 @@
               </button>
               <button type="submit" id="channelSaveBtn" class="btn btn-primary channel-editor-footer-btn">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M5 12L10 17L19 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <span data-i18n="common.save">保存</span>
+                <span id="channelSaveLabel" data-i18n="common.save">保存</span>
               </button>
             </div>
           </div>
@@ -1466,9 +1454,9 @@
           </div>
         </div>
         <div class="codex-credential-toolbar">
-          <p class="codex-credential-description" data-i18n="channels.oauthCredentialFullDescription">默认显示解码视图；如需备份或复制用于重新导入，请切换到原始视图。</p>
+          <p id="codexCredentialViewDescription" class="codex-credential-description" data-i18n="channels.oauthCredentialFullDescription">默认显示解码视图；如需备份或复制用于重新导入，请切换到原始视图。</p>
           <div class="codex-credential-toolbar-actions">
-            <div class="codex-credential-view-switch" role="group" data-i18n-aria-label="channels.codex.credentialViewLabel" aria-label="凭证视图">
+            <div id="codexCredentialViewSwitch" class="codex-credential-view-switch" role="group" data-i18n-aria-label="channels.codex.credentialViewLabel" aria-label="凭证视图">
               <button type="button" class="btn btn-secondary btn-sm active" data-codex-credential-view="decoded" aria-pressed="true"
                 data-i18n="channels.codex.credentialViewDecoded">解码</button>
               <button type="button" class="btn btn-secondary btn-sm" data-codex-credential-view="raw" aria-pressed="false"
@@ -1581,6 +1569,52 @@
                 <small id="channelManagementTokenError" class="advanced-settings-management-error" role="status" hidden></small>
               </div>
             </div>
+            <div id="channelManagementLoginField" class="advanced-settings-management-login" hidden>
+              <div class="advanced-settings-field-meta">
+                <small id="channelManagementLoginHelp" class="advanced-settings-field-help"
+                  data-i18n="channels.management.loginHelp">填写邮箱和密码后点击“登录”获取 refresh token。点“确定”写入渠道草稿，保存渠道后才会落库。邮箱和密码保存在管理凭证中，TOTP 不会保存。</small>
+              </div>
+              <div id="channelManagementRefreshTokenField" class="advanced-settings-other-field" hidden>
+                <label class="form-label" for="channelManagementRefreshToken" data-i18n="channels.management.refreshToken">Refresh Token</label>
+                <input type="text" id="channelManagementRefreshToken" class="form-input" autocomplete="off" spellcheck="false"
+                  readonly aria-describedby="channelManagementLoginHelp channelManagementRefreshTokenError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementRefreshTokenError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-other-field">
+                <label class="form-label" for="channelManagementEmail" data-i18n="channels.management.email">登录邮箱</label>
+                <input type="email" id="channelManagementEmail" class="form-input" autocomplete="off" spellcheck="false"
+                  maxlength="320" aria-describedby="channelManagementLoginHelp channelManagementEmailError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementEmailError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-other-field">
+                <label class="form-label" for="channelManagementPassword" data-i18n="channels.management.password">登录密码</label>
+                <input type="text" id="channelManagementPassword" class="form-input" autocomplete="off" spellcheck="false"
+                  maxlength="4096" autocapitalize="off" autocorrect="off"
+                  aria-describedby="channelManagementLoginHelp channelManagementPasswordError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementPasswordError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-other-field">
+                <label class="form-label" for="channelManagementTOTP" data-i18n="channels.management.totp">TOTP(可选)</label>
+                <input type="text" id="channelManagementTOTP" class="form-input" inputmode="numeric" autocomplete="one-time-code"
+                  maxlength="6" pattern="[0-9]{6}" aria-describedby="channelManagementTOTPHelp channelManagementTOTPError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementTOTPHelp" class="advanced-settings-field-help"
+                    data-i18n="channels.management.totpHelp">Sub2API 账户启用两步验证时填写当前 6 位验证码。</small>
+                  <small id="channelManagementTOTPError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-management-login-action">
+                <button type="button" id="channelManagementLoginBtn" class="btn btn-primary btn-sm" data-action="login-channel-management">
+                  <span data-i18n="channels.management.login">登录</span>
+                </button>
+              </div>
+            </div>
             <div id="channelManagementUserIDField" class="advanced-settings-other-field" hidden>
               <label class="form-label" for="channelManagementUserID" data-i18n="channels.management.userID">用户 ID</label>
               <input type="text" id="channelManagementUserID" class="form-input" inputmode="numeric" autocomplete="off"
@@ -1630,8 +1664,8 @@
       </div>
       <div class="channel-test-grid">
         <div class="form-group channel-test-field">
-          <label class="form-label" for="testModelSelect" data-i18n="channels.selectTestModel">选择测试模型</label>
-          <select id="testModelSelect" class="model-select">
+          <label class="form-label" for="channelTestModelSelect" data-i18n="channels.selectTestModel">选择测试模型</label>
+          <select id="channelTestModelSelect" class="model-select">
             <!-- 动态填充模型选项 -->
           </select>
         </div>
@@ -1675,7 +1709,7 @@
       </div>
 
       <!-- 测试进度 -->
-      <div id="testProgress" class="test-progress">
+      <div id="channelTestProgress" class="test-progress">
         <div class="test-spinner"></div>
         <span id="testProgressText" data-i18n="channels.testingApi">正在测试API连接...</span>
       </div>
@@ -1702,7 +1736,7 @@
         <button type="button" id="testUpstreamDetailBtn" class="btn btn-secondary channel-test-upstream-btn hidden"
           data-action="show-upstream-detail" data-i18n="channels.test.viewUpstreamDetail">查看详情</button>
         <button type="button" class="btn btn-secondary" data-action="close-test-modal" data-i18n="common.close">关闭</button>
-        <button type="button" id="runTestBtn" class="btn btn-primary" data-action="run-channel-test"
+        <button type="button" id="channelRunTestBtn" class="btn btn-primary" data-action="run-channel-test"
           data-i18n="channels.singleTest">单个测试</button>
         <button type="button" id="batchTestBtn" class="btn btn-primary hidden" data-action="run-batch-test"
           data-i18n="channels.batchTestAllKeys">批量测试所有Key</button>
@@ -2002,13 +2036,24 @@
         </div>
       </td>
       <td class="inline-key-col-status" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelStatus}}">{{{cooldownHtml}}}</td>
+      <td class="inline-key-col-multiplier" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelMultiplier}}">
+        <div class="inline-key-multiplier-scope">
+          <input type="number" value="{{costMultiplier}}" class="inline-key-multiplier-input modal-inline-input"
+            data-index="{{index}}" min="0" step="0.01" inputmode="decimal"
+            style="width: 58px; padding: 4px 5px; border: 1px solid var(--neutral-300); border-radius: 6px; font-size: 13px; transition: border-color 0.2s, box-shadow 0.2s;">
+          <button type="button" class="key-action-btn key-fetch-rate-btn" data-action="fetch-rate"
+            data-index="{{index}}" title="{{fetchRateTitle}}" aria-label="{{fetchRateTitle}}">
+            <span style="font-size: 12px;">{{fetchRateLabel}}</span>
+          </button>
+        </div>
+      </td>
       <td class="inline-key-col-actions" style="padding: 4px 8px; text-align: center;" data-mobile-label="{{mobileLabelActions}}">{{{actionsHtml}}}</td>
     </tr>
   </template>
 
   <template id="tpl-key-empty">
     <tr>
-      <td colspan="5" style="padding: 30px; text-align: center; color: var(--neutral-500); font-size: 14px;">
+      <td colspan="6" style="padding: 30px; text-align: center; color: var(--neutral-500); font-size: 14px;">
         {{message}}
       </td>
     </tr>
@@ -2138,7 +2183,6 @@
       </td>
       <td class="ch-col-duration {{durationCellClass}}" data-mobile-label="{{mobileLabelDuration}}">{{{durationHtml}}}</td>
       <td class="ch-col-usage {{usageCellClass}}" data-mobile-label="{{mobileLabelUsage}}">{{{usageHtml}}}</td>
-      <td class="ch-col-cost {{costCellClass}}" data-mobile-label="{{mobileLabelCost}}">{{{costHtml}}}</td>
       <td class="ch-col-last-success {{lastSuccessCellClass}}" data-mobile-label="{{mobileLabelLastSuccess}}">{{{runtimeStatusHtml}}}</td>
       <td class="ch-col-enabled" data-mobile-label="{{mobileLabelEnabled}}">
         <button class="channel-enable-switch channel-action-btn {{toggleSwitchClass}}" data-action="toggle"

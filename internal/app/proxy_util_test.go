@@ -39,6 +39,18 @@ func TestWriteResponseWithHeaders_PreservesContentType(t *testing.T) {
 	}
 }
 
+func TestShouldValidateStrictJSONBodyHonorsDeclaredJSONAndMultipart(t *testing.T) {
+	if !shouldValidateStrictJSONBody("application/json", []byte("true")) {
+		t.Fatal("declared JSON scalar must be validated")
+	}
+	if !shouldValidateStrictJSONBody("application/vnd.example+json; charset=utf-8", []byte("null")) {
+		t.Fatal("+json media type must be validated")
+	}
+	if shouldValidateStrictJSONBody("multipart/form-data; boundary=abc", []byte(`{"looks":"json"}`)) {
+		t.Fatal("multipart body must not be treated as JSON")
+	}
+}
+
 func TestWriteResponseWithHeaders_DefaultsToJSONContentTypeWhenBodyLooksJSON(t *testing.T) {
 	t.Parallel()
 
@@ -539,6 +551,38 @@ func TestComputeRequestCost_ServiceTierAppliesOnlyAsOpenAIPriceMultiplier(t *tes
 	want = util.CalculateCostDetailed("qwen3.5-plus", 300_000, 1_000_000, 0, 0, 0)
 	if !floatEquals(got, want) {
 		t.Fatalf("qwen priority cost=%.6f, want service_tier ignored cost %.6f", got, want)
+	}
+}
+
+func TestResolveBillingServiceTier(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		requested string
+		observed  string
+		want      string
+	}{
+		{name: "priority request is billing floor", requested: "priority", observed: "default", want: "priority"},
+		{name: "priority request ignores standard response", requested: "priority", observed: "standard", want: "priority"},
+		{name: "priority request ignores flex response", requested: "priority", observed: "flex", want: "priority"},
+		{name: "anthropic downgrade", requested: "fast", observed: "standard", want: "standard"},
+		{name: "codex auto is explicit fast tier", requested: "priority", observed: "auto", want: "auto"},
+		{name: "codex auto is retained without request tier", requested: "", observed: "auto", want: "auto"},
+		{name: "ultrafast is retained when served", requested: "ultrafast", observed: "ultrafast", want: "ultrafast"},
+		{name: "ultrafast downgrade", requested: "ultrafast", observed: "priority", want: "priority"},
+		{name: "ultrafast response is billed at actual tier", requested: "priority", observed: "ultrafast", want: "ultrafast"},
+		{name: "ultrafast response is billed without request tier", requested: "", observed: "ultrafast", want: "ultrafast"},
+		{name: "missing response uses request", requested: "priority", observed: "", want: "priority"},
+		{name: "case and whitespace normalize", requested: " Priority ", observed: " DEFAULT ", want: "priority"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveBillingServiceTier(tt.requested, tt.observed); got != tt.want {
+				t.Fatalf("resolveBillingServiceTier(%q, %q)=%q, want %q", tt.requested, tt.observed, got, tt.want)
+			}
+		})
 	}
 }
 

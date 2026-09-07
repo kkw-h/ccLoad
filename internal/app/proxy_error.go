@@ -250,7 +250,7 @@ func buildProxyLogEntry(
 		ErrMsg:           errMsg,
 		StartTime:        reqCtx.attemptStartTime,
 		DebugData:        reqCtx.debugData,
-		CostMultiplier:   cfg.CostMultiplier,
+		CostMultiplier:   reqCtx.attemptCostMultiplier,
 		ThinkingEffort:   reqCtx.thinkingEffort,
 		TokenHash:        reqCtx.tokenHash,
 		TokenEnvironment: reqCtx.tokenEnvironment,

@@ -17,8 +17,12 @@ const {
   pollAnthropicOAuthStatus,
   pollXAIOAuthStatus,
   getOAuthUsageState,
+  snapshotOAuthUsageStates,
+  syncOAuthUsageFromChannels,
+  maybeAutoRefreshActiveChannelUsage,
   refreshOAuthUsage,
   refreshOAuthUsageBatch,
+  resetActiveChannelUsageAutoRefreshState,
   resetCodexQuota,
   batchRefreshSelectedOAuthUsage,
   refreshOAuthCredential,
@@ -853,14 +857,18 @@ test('closing and pagehide abort active OAuth secret submissions and clear brows
   }
 });
 
-test('logs channel editor opens a channel and displays Codex auth', async () => {
+for (const failFirstScript of [false, true]) {
+test(`logs channel editor supports Codex auth and Key models${failFirstScript ? ' after retrying a failed script' : ''}`, async () => {
   const requiredMarkupIDs = new Set([
     'channelModal',
+    'quickAddChannelModal',
     'commonModelsModal',
     'keyImportModal',
     'keyExportModal',
     'modelImportModal',
     'customRulesModal',
+    'testModal',
+    'upstreamDetailModal',
     'tpl-key-row',
     'tpl-key-empty',
     'tpl-cooldown-badge',
@@ -869,7 +877,10 @@ test('logs channel editor opens a channel and displays Codex auth', async () => 
     'tpl-url-row',
     'tpl-url-empty',
     'tpl-redirect-row',
-    'tpl-redirect-empty'
+    'tpl-redirect-empty',
+    'tpl-test-result-header',
+    'tpl-response-section',
+    'tpl-batch-fail-item'
   ]);
   const elements = new Map();
   for (const id of [
@@ -890,9 +901,20 @@ test('logs channel editor opens a channel and displays Codex auth', async () => 
     removeAttribute() {},
     classList: { add() {}, remove() {} }
   });
+  elements.set('channelModal', {
+    setAttribute(name, value) { this[name] = value; },
+    removeAttribute(name) { delete this[name]; }
+  });
+  const keyModelScopeModal = {
+    id: 'keyModelScopeModal',
+    classList: { add() {}, remove() {} },
+    setAttribute(name, value) { this[name] = value; }
+  };
 
   const scripts = [{ src: 'http://localhost/web/assets/js/logs-channel-editor.js?v=test' }];
   let openedChannelID = null;
+  let oauthSetupCalls = 0;
+  let scriptFailed = false;
   const previous = new Map();
   const installGlobal = (name, value) => {
     previous.set(name, Object.getOwnPropertyDescriptor(global, name));
@@ -904,11 +926,27 @@ test('logs channel editor opens a channel and displays Codex auth', async () => 
     t: key => key,
     showError() {}
   });
+  installGlobal('setupOAuthActions', () => { oauthSetupCalls++; });
+  installGlobal('editingChannelAuthType', 'api_key');
+  installGlobal('inlineKeyTableData', [{ api_key: 'sk-log-editor' }]);
+  installGlobal('fetch', async () => ({ ok: true, text: async () => '' }));
+  installGlobal('DOMParser', class {
+    parseFromString() {
+      return { getElementById: id => id === keyModelScopeModal.id ? keyModelScopeModal : null };
+    }
+  });
   installGlobal('document', {
     scripts,
+    body: { appendChild(node) { elements.set(node.id, node); } },
+    importNode: node => node,
     head: {
       appendChild(script) {
         scripts.push(script);
+        if (failFirstScript && !scriptFailed) {
+          scriptFailed = true;
+          script.onerror();
+          return;
+        }
         const path = new URL(script.src, global.window.location.origin).pathname;
         if (path === '/web/assets/js/channels-codex-auth.js') {
           global.applyChannelAuthEditorMode = applyChannelAuthEditorMode;
@@ -916,9 +954,10 @@ test('logs channel editor opens a channel and displays Codex auth', async () => 
         if (path === '/web/assets/js/channels-modals.js') {
           global.editChannel = async id => {
             openedChannelID = id;
+            global.editingChannelAuthType = id === 42 ? 'codex_oauth' : 'api_key';
             if (typeof global.applyChannelAuthEditorMode === 'function') {
               global.applyChannelAuthEditorMode(
-                'codex_oauth',
+                global.editingChannelAuthType,
                 { access_token: 'at-from-log-editor', refresh_token: 'rt-secret' },
                 { codex_plan_type: 'plus' }
               );
@@ -928,7 +967,7 @@ test('logs channel editor opens a channel and displays Codex auth', async () => 
         script.onload();
       }
     },
-    createElement: () => ({}),
+    createElement: () => ({ remove() { scripts.splice(scripts.indexOf(this), 1); } }),
     getElementById: id => elements.get(id) || (requiredMarkupIDs.has(id) ? {} : null),
     querySelectorAll: () => [],
     addEventListener() {}
@@ -943,10 +982,24 @@ test('logs channel editor opens a channel and displays Codex auth', async () => 
   try {
     require(modulePath);
     await global.window.openLogChannelEditor(42);
+    if (failFirstScript) {
+      assert.equal(openedChannelID, null);
+      await global.window.openLogChannelEditor(42);
+    }
 
     assert.equal(openedChannelID, 42);
+    assert.equal(oauthSetupCalls, 1);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
     assert.match(elements.get('codexCredentialContent').textContent, /at-from-log-editor/);
+
+    await global.window.openLogChannelEditor(43);
+    const { openKeyModelScopeModal, closeKeyModelScopeModal } = require('./channels-keys.js');
+    assert.equal(openKeyModelScopeModal(0), true);
+    assert.equal(keyModelScopeModal['aria-hidden'], 'false');
+    assert.equal(elements.get('channelModal').inert, '');
+    closeKeyModelScopeModal(false);
+    assert.equal(keyModelScopeModal['aria-hidden'], 'true');
+    assert.equal(elements.get('channelModal').inert, undefined);
 
   } finally {
     delete require.cache[modulePath];
@@ -956,6 +1009,7 @@ test('logs channel editor opens a channel and displays Codex auth', async () => 
     }
   }
 });
+}
 
 test('Codex OAuth status polling waits for completion and encodes state', async () => {
   const requests = [];
@@ -1639,6 +1693,59 @@ test('manual Codex credential refresh targets the saved channel', async () => {
   await assert.rejects(() => refreshOAuthCredential(0, async () => response), /saved Codex channel/);
 });
 
+test('credential refresh succeeds in an editor without the channels list', async () => {
+  const { handleChannelUpdateSuccess } = require('./channels-modals.js');
+  const messages = [];
+  const updates = [];
+  let refresh;
+  const button = {
+    dataset: {},
+    addEventListener(type, handler) { if (type === 'click') refresh = handler; }
+  };
+  const content = { textContent: '', removeAttribute() {}, classList: { add() {}, remove() {} } };
+  const response = { oauth_credential: { access_token: 'at-refreshed', refresh_token: 'rt-refreshed' } };
+  const globals = {
+    window: {
+      t: key => key,
+      showSuccess: message => messages.push({ type: 'success', message }),
+      showError: message => messages.push({ type: 'error', message }),
+      ChannelModalHooks: { afterUpdate: async update => updates.push(update) }
+    },
+    document: {
+      getElementById: id => ({ codexCredentialRefreshButton: button, codexCredentialContent: content }[id] || null),
+      querySelectorAll: () => []
+    },
+    editingChannelId: 42,
+    editingChannelAuthType: 'codex_oauth',
+    reloadChannelsList: undefined,
+    handleChannelUpdateSuccess,
+    fetchDataWithAuth: async (url, options) => {
+      assert.equal(url, '/admin/channels/42/codex-credential/refresh');
+      assert.deepEqual(options, { method: 'POST' });
+      return response;
+    }
+  };
+  const previous = new Map();
+  for (const [name, value] of Object.entries(globals)) {
+    previous.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  }
+  try {
+    setupOAuthActions();
+    await refresh();
+    assert.equal(JSON.parse(content.textContent).access_token, 'at-refreshed');
+    assert.deepEqual(messages, [{ type: 'success', message: 'channels.codex.credentialRefreshed' }]);
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].savedChannelId, 42);
+    assert.equal(button.disabled, false);
+  } finally {
+    for (const [name, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(global, name, descriptor);
+      else delete global[name];
+    }
+  }
+});
+
 test('Codex quota overdraft setting updates only the saved credential endpoint', async () => {
   let captured;
   const response = { quota_overdraft: { enabled: true, successful_requests: 2, cost_microusd: 1250 } };
@@ -1844,6 +1951,113 @@ test('OAuth usage refresh stores one safe per-channel quota summary', async () =
     assert.equal(renders, 2);
   } finally {
     global.filterChannels = previousFilterChannels;
+  }
+});
+
+test('channel reload updates quota percentages and costs without overwriting newer operations', async () => {
+  const previousGlobals = new Map();
+  const setGlobal = (name, value) => {
+    previousGlobals.set(name, Object.getOwnPropertyDescriptor(global, name));
+    Object.defineProperty(global, name, { configurable: true, writable: true, value });
+  };
+  const pendingLists = [];
+  const usage = cost => ({
+    provider: 'codex',
+    windows: [
+      { limit_name: 'codex', kind: 'primary', remaining_percent: 54, standard_cost_microusd: cost },
+      { limit_name: 'codex', kind: 'secondary', remaining_percent: 45, standard_cost_microusd: cost * 10 }
+    ]
+  });
+  const channelID = 1499;
+  const finishList = (resolve, data) => resolve({
+    success: true, count: 1, data: [{ id: channelID, auth_type: 'codex_oauth', oauth_usage: data }]
+  });
+  setGlobal('filters', {});
+  setGlobal('channels', []);
+  setGlobal('channelsPageSize', 20);
+  setGlobal('channelsCurrentPage', 1);
+  setGlobal('channelsTotalCount', 0);
+  setGlobal('channelsTotalPages', 1);
+  setGlobal('channelStatsRange', 'today');
+  setGlobal('channelsReadURL', value => value);
+  setGlobal('filterChannels', () => {});
+  setGlobal('window', { t: key => key });
+  setGlobal('fetchAPIWithAuth', () => new Promise(resolve => pendingLists.push(resolve)));
+  setGlobal('snapshotOAuthUsageStates', snapshotOAuthUsageStates);
+  setGlobal('syncOAuthUsageFromChannels', syncOAuthUsageFromChannels);
+  setGlobal('maybeAutoRefreshActiveChannelUsage', undefined);
+  const { loadChannels } = require('./channels-data.js');
+  try {
+    await refreshOAuthUsage(channelID, async () => usage(1), { reload: false });
+    let request = loadChannels();
+    const updated = usage(5_697_691);
+    finishList(pendingLists.shift(), updated);
+    await request;
+    assert.deepEqual(getOAuthUsageState(channelID).data, updated);
+
+    // Concurrent lists must always leave the last requested snapshot visible,
+    // regardless of which network response finishes first.
+    for (const reverse of [false, true]) {
+      const first = loadChannels();
+      const second = loadChannels();
+      const resolveFirst = pendingLists.shift();
+      const resolveSecond = pendingLists.shift();
+      const newest = usage(reverse ? 30 : 20);
+      if (reverse) {
+        finishList(resolveSecond, newest);
+        await second;
+        finishList(resolveFirst, usage(2));
+      } else {
+        finishList(resolveFirst, usage(2));
+        await first;
+        finishList(resolveSecond, newest);
+      }
+      await Promise.all([first, second]);
+      assert.deepEqual(getOAuthUsageState(channelID).data, newest);
+      assert.deepEqual(global.channels[0].oauth_usage, newest);
+    }
+
+    request = loadChannels();
+    const manual = usage(40);
+    await refreshOAuthUsage(channelID, async () => manual, { reload: false });
+    finishList(pendingLists.shift(), usage(3));
+    await request;
+    assert.deepEqual(getOAuthUsageState(channelID).data, manual);
+
+    let resolveReset;
+    const reset = resetCodexQuota(channelID, () => new Promise(resolve => { resolveReset = resolve; }), { reload: false });
+    request = loadChannels();
+    finishList(pendingLists.shift(), usage(4));
+    await request;
+    assert.equal(getOAuthUsageState(channelID).reset_status, 'loading');
+    assert.deepEqual(getOAuthUsageState(channelID).data, manual);
+    request = loadChannels();
+    const resetUsage = usage(0);
+    resolveReset({ reset: true, usage: resetUsage });
+    await reset;
+    finishList(pendingLists.shift(), usage(5));
+    await request;
+    assert.deepEqual(getOAuthUsageState(channelID).data, resetUsage);
+    assert.equal(getOAuthUsageState(channelID).reset_status, 'ready');
+
+    // The first list response cannot overwrite an automatic refresh that
+    // completed while that list was in flight.
+    resetActiveChannelUsageAutoRefreshState();
+    request = loadChannels();
+    const automatic = usage(50);
+    await maybeAutoRefreshActiveChannelUsage([channelID], async () => oauthUsageBatchSSE([
+      { event: 'progress', result: { channel_id: channelID, kind: 'oauth', status: 'succeeded', usage: automatic } },
+      { event: 'complete', total: 1, processed: 1, succeeded: 1, failed: 0 }
+    ]));
+    finishList(pendingLists.shift(), usage(6));
+    await request;
+    assert.deepEqual(getOAuthUsageState(channelID).data, automatic);
+  } finally {
+    resetActiveChannelUsageAutoRefreshState();
+    for (const [name, descriptor] of previousGlobals) {
+      if (descriptor) Object.defineProperty(global, name, descriptor);
+      else delete global[name];
+    }
   }
 });
 
@@ -2055,6 +2269,146 @@ test('newer batch OAuth usage result is not overwritten by an older single refre
   }
 });
 
+test('channel list auto-refresh submits only newly displayed page channel IDs', async () => {
+  resetActiveChannelUsageAutoRefreshState();
+  const previous = {
+    isTokenChannelsReadOnly: global.isTokenChannelsReadOnly,
+    filterChannels: global.filterChannels,
+    loadChannels: global.loadChannels,
+    window: global.window
+  };
+  let reloads = 0;
+  const requested = [];
+  global.isTokenChannelsReadOnly = () => false;
+  global.filterChannels = () => {};
+  global.loadChannels = async () => { reloads++; };
+  global.window = { t: key => key };
+
+  try {
+    const first = await maybeAutoRefreshActiveChannelUsage([81, 82, 83, 83, 0], async (url, options) => {
+      requested.push({ url, options });
+      return oauthUsageBatchSSE([
+        { event: 'start', processed: 0, total: 2, succeeded: 0, failed: 0 },
+        {
+          event: 'progress', processed: 1, total: 2, succeeded: 1, failed: 0,
+          result: { channel_id: 81, kind: 'oauth', status: 'succeeded', usage: { windows: [{ kind: 'gemini-5h' }] } }
+        },
+        {
+          event: 'progress', processed: 2, total: 2, succeeded: 2, failed: 0,
+          result: { channel_id: 83, kind: 'oauth', status: 'succeeded', usage: { windows: [{ kind: 'spend' }] } }
+        },
+        { event: 'complete', processed: 2, total: 2, succeeded: 2, failed: 0 }
+      ]);
+    });
+    const repeated = await maybeAutoRefreshActiveChannelUsage([81, 82, 83], async () => {
+      throw new Error('displayed channels should refresh once');
+    });
+    const secondPage = await maybeAutoRefreshActiveChannelUsage([83, 85], async (url, options) => {
+      requested.push({ url, options });
+      return oauthUsageBatchSSE([
+        { event: 'start', processed: 0, total: 0, succeeded: 0, failed: 0 },
+        { event: 'complete', processed: 0, total: 0, succeeded: 0, failed: 0 }
+      ]);
+    });
+    assert.deepEqual(first, { total: 2, succeeded: 2, failed: 0 });
+    assert.equal(repeated, null);
+    assert.deepEqual(secondPage, { total: 0, succeeded: 0, failed: 0 });
+    assert.equal(reloads, 0);
+    assert.equal(requested.length, 2);
+    assert.equal(requested[0].url, '/admin/channels/usage/active/batch/stream');
+    assert.equal(requested[0].options.method, 'POST');
+    assert.deepEqual(JSON.parse(requested[0].options.body), { channel_ids: [81, 82, 83] });
+    assert.deepEqual(JSON.parse(requested[1].options.body), { channel_ids: [85] });
+    assert.equal(getOAuthUsageState(81).status, 'ready');
+    assert.equal(getOAuthUsageState(83).status, 'ready');
+  } finally {
+    resetActiveChannelUsageAutoRefreshState();
+    global.isTokenChannelsReadOnly = previous.isTokenChannelsReadOnly;
+    global.filterChannels = previous.filterChannels;
+    global.loadChannels = previous.loadChannels;
+    global.window = previous.window;
+  }
+});
+
+test('a completed manual quota refresh is not overwritten by an older list refresh', async () => {
+  resetActiveChannelUsageAutoRefreshState();
+  const previous = {
+    isTokenChannelsReadOnly: global.isTokenChannelsReadOnly,
+    filterChannels: global.filterChannels,
+    window: global.window
+  };
+  global.isTokenChannelsReadOnly = () => false;
+  global.filterChannels = () => {};
+  global.window = { t: key => key };
+  let releaseAuto;
+  try {
+    const automatic = maybeAutoRefreshActiveChannelUsage([84], async () => ({
+      ok: true,
+      status: 200,
+      text: () => new Promise(resolve => { releaseAuto = resolve; })
+    }));
+    await new Promise(resolve => setImmediate(resolve));
+
+    const manualUsage = { windows: [{ limit_name: 'manual-newer' }] };
+    await refreshOAuthUsage(84, async () => manualUsage, { reload: false });
+    const stale = await oauthUsageBatchSSE([
+      { event: 'start', processed: 0, total: 1, succeeded: 0, failed: 0 },
+      {
+        event: 'progress', processed: 1, total: 1, succeeded: 1, failed: 0,
+        result: {
+          channel_id: 84, kind: 'oauth', status: 'succeeded',
+          usage: { windows: [{ limit_name: 'automatic-older' }] }
+        }
+      },
+      { event: 'complete', processed: 1, total: 1, succeeded: 1, failed: 0 }
+    ]).text();
+    releaseAuto(stale);
+    await automatic;
+
+    assert.deepEqual(getOAuthUsageState(84), { status: 'ready', data: manualUsage });
+  } finally {
+    resetActiveChannelUsageAutoRefreshState();
+    global.isTokenChannelsReadOnly = previous.isTokenChannelsReadOnly;
+    global.filterChannels = previous.filterChannels;
+    global.window = previous.window;
+  }
+});
+
+test('list auto-refresh can retry after the batch stream fails', async () => {
+  resetActiveChannelUsageAutoRefreshState();
+  const previousWindow = global.window;
+  const previousReadOnly = global.isTokenChannelsReadOnly;
+  const previousFilterChannels = global.filterChannels;
+  const previousConsoleError = console.error;
+  global.window = { t: key => key };
+  global.isTokenChannelsReadOnly = () => false;
+  global.filterChannels = () => {};
+  console.error = () => {};
+  let attempts = 0;
+  try {
+    const first = await maybeAutoRefreshActiveChannelUsage([91], async () => {
+      attempts++;
+      throw new Error('temporary network error');
+    });
+    const second = await maybeAutoRefreshActiveChannelUsage([91], async () => {
+      attempts++;
+      return oauthUsageBatchSSE([
+        { event: 'start', processed: 0, total: 0, succeeded: 0, failed: 0 },
+        { event: 'complete', processed: 0, total: 0, succeeded: 0, failed: 0 }
+      ]);
+    });
+    assert.equal(first, null);
+    assert.deepEqual(second, { total: 0, succeeded: 0, failed: 0 });
+    assert.equal(attempts, 2);
+  } finally {
+    resetActiveChannelUsageAutoRefreshState();
+    global.window = previousWindow;
+    global.isTokenChannelsReadOnly = previousReadOnly;
+    global.filterChannels = previousFilterChannels;
+    console.error = previousConsoleError;
+  }
+});
+
 test('selected quota refresh skips non-OAuth channels and reports one batch result', async () => {
   const previousGlobals = new Map();
   const setGlobal = (name, value) => {
@@ -2156,6 +2510,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     'selectAllKeys',
     'codexCredentialTab',
     'codexCredentialContent',
+    'codexCredentialViewDescription',
+    'codexCredentialViewSwitch',
     'codexCredentialRefreshButton',
     'channelCodexPlanBadge',
     'codexQuotaOverdraftSettings',
@@ -2211,6 +2567,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('batchDeleteKeysBtn').disabled, true);
     assert.equal(elements.get('selectAllKeys').disabled, true);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialViewDescription').hidden, false);
+    assert.equal(elements.get('codexCredentialViewSwitch').hidden, false);
     assert.equal(elements.get('channelCodexPlanBadge').hidden, false);
     assert.equal(elements.get('channelCodexPlanBadge').textContent, 'plus · 2030-02-03');
     assert.equal(elements.get('codexQuotaOverdraftSettings').hidden, false);
@@ -2247,6 +2605,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('codexCredentialReadOnlyNotice').hidden, false);
     assert.equal(elements.get('channelApiKey').required, false);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialViewDescription').hidden, true);
+    assert.equal(elements.get('codexCredentialViewSwitch').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').hidden, true);
     assert.equal(elements.get('codexQuotaOverdraftSettings').hidden, true);
     assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(antigravityCredential, null, 2));
@@ -2308,6 +2668,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('importKeysBtn').disabled, false);
     assert.equal(elements.get('selectAllKeys').disabled, false);
     assert.equal(elements.get('codexCredentialTab').hidden, true);
+    assert.equal(elements.get('codexCredentialViewDescription').hidden, true);
+    assert.equal(elements.get('codexCredentialViewSwitch').hidden, true);
     assert.equal(elements.get('codexCredentialRefreshButton').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').textContent, '');

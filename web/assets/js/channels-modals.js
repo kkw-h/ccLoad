@@ -282,9 +282,9 @@ async function detectChannelWebsocketSupport(button) {
   }
 }
 
-async function handleChannelSaveSuccess({ isNewChannel, savedChannelId, response }) {
-  if (window.ChannelModalHooks && typeof window.ChannelModalHooks.afterSave === 'function') {
-    await window.ChannelModalHooks.afterSave({
+async function handleChannelUpdateSuccess({ isNewChannel = false, savedChannelId, response } = {}) {
+  if (window.ChannelModalHooks && typeof window.ChannelModalHooks.afterUpdate === 'function') {
+    await window.ChannelModalHooks.afterUpdate({
       isNewChannel,
       savedChannelId,
       response
@@ -340,8 +340,15 @@ function initChannelEditorActions() {
         'add-common-models': (actionTarget) => openCommonModelsModal(actionTarget),
         'close-common-models-modal': () => closeCommonModelsModal(),
         'confirm-common-models': () => confirmCommonModelsSelection(),
+        'close-test-modal': () => closeTestModal(),
+        'run-channel-test': () => runChannelTest(),
+        'run-batch-test': () => runBatchTest(),
+        'show-upstream-detail': () => window.UpstreamDetailModal?.show(window._lastTestUpstreamData),
+        'toggle-channel-test-response': (actionTarget) => {
+          const responseTarget = actionTarget.dataset.responseTarget;
+          if (responseTarget) window.toggleResponse(responseTarget);
+        },
         'fetch-models-from-api': () => invokeChannelEditorAction('fetchModelsFromAPI'),
-        'fetch-sub2api-rate': () => invokeChannelEditorAction('fetchSub2APIRate'),
         'add-redirect-row': () => invokeChannelEditorAction('addRedirectRow'),
         'export-channel-models': () => invokeChannelEditorAction('exportChannelModels'),
         'open-batch-model-import': () => invokeChannelEditorAction('openBatchModelImportModal'),
@@ -362,6 +369,7 @@ function initChannelEditorActions() {
         'close-custom-rules-modal': () => invokeChannelEditorAction('closeCustomRulesModal'),
         'switch-advanced-settings-tab': (actionTarget) => invokeChannelEditorAction('switchAdvancedSettingsTab', actionTarget?.dataset?.advancedSettingsTab || ''),
         'apply-advanced-settings': () => invokeChannelEditorAction('applyAdvancedSettingsFromForm'),
+        'login-channel-management': () => invokeChannelEditorAction('loginManagementAccount'),
         'add-custom-rule': (actionTarget) => invokeChannelEditorAction('addCustomRule', actionTarget?.dataset?.customRulesTarget || ''),
         'remove-custom-rule': (actionTarget) => invokeChannelEditorAction('removeCustomRule', actionTarget?.dataset?.customRulesTarget || '', Number(actionTarget?.dataset?.customRulesIndex || '-1')),
         'close-custom-rules-help': () => invokeChannelEditorAction('closeCustomRulesHelp'),
@@ -374,7 +382,7 @@ function initChannelEditorActions() {
         'toggle-select-all-urls': (actionTarget) => invokeChannelEditorAction('toggleSelectAllURLs', actionTarget.checked),
         'toggle-select-all-keys': (actionTarget) => invokeChannelEditorAction('toggleSelectAllKeys', actionTarget.checked),
         'filter-keys-by-status': (actionTarget) => invokeChannelEditorAction('filterKeysByStatus', actionTarget.value),
-        'toggle-select-all-models': (actionTarget) => invokeChannelEditorAction('toggleSelectAllModels', actionTarget.checked),
+        'invert-model-selection': () => invokeChannelEditorAction('invertVisibleModelSelection'),
         'switch-model-import-format': (actionTarget) => invokeChannelEditorAction('switchModelImportFormat', actionTarget.value),
         'update-export-preview': () => invokeChannelEditorAction('updateExportPreview')
       },
@@ -459,12 +467,12 @@ async function showAddModal() {
   inlineKeyVisible = true;
   document.getElementById('inlineEyeIcon').style.display = 'none';
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
+  invokeChannelEditorAction('resetManagementAccountDraft', null, getValidInlineURLConfigs(), 'api_key');
   renderInlineKeyTable();
   if (typeof applyChannelAuthEditorMode === 'function') applyChannelAuthEditorMode(editingChannelAuthType, null);
 
   invokeChannelEditorAction('resetCustomRulesState', null);
   invokeChannelEditorAction('resetCooldownDetectionState', null);
-  invokeChannelEditorAction('resetManagementAccountDraft', null, getValidInlineURLConfigs(), 'api_key');
 
   resetChannelFormDirty();
   document.getElementById('channelModal').classList.add('show');
@@ -543,6 +551,12 @@ async function editChannel(id) {
   inlineKeyVisible = true;
   document.getElementById('inlineEyeIcon').style.display = 'none';
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
+  invokeChannelEditorAction(
+    'resetManagementAccountDraft',
+    editorData.management_account || null,
+    channel.urls || [],
+    editingChannelAuthType
+  );
   renderInlineKeyTable();
   if (typeof applyChannelAuthEditorMode === 'function') {
     applyChannelAuthEditorMode(
@@ -552,13 +566,6 @@ async function editChannel(id) {
       editorData.oauth_credential_info || null
     );
   }
-  invokeChannelEditorAction(
-    'resetManagementAccountDraft',
-    editorData.management_account || null,
-    channel.urls || [],
-    editingChannelAuthType
-  );
-
   const keyStrategy = channel.key_strategy || 'sequential';
   const strategyRadio = document.querySelector(`input[name="keyStrategy"][value="${keyStrategy}"]`);
   if (strategyRadio) {
@@ -568,7 +575,6 @@ async function editChannel(id) {
   document.getElementById('channelRPMLimit').value = channel.rpm_limit || 0;
   document.getElementById('channelMaxConcurrency').value = String(channel.max_concurrency || 0);
   document.getElementById('channelDailyCostLimit').value = channel.daily_cost_limit || 0;
-  document.getElementById('channelCostMultiplier').value = (Number(channel.cost_multiplier) >= 0 ? Number(channel.cost_multiplier) : 1);
   document.getElementById('channelEnabled').checked = channel.enabled;
   const websocketCheckbox = document.getElementById('channelWebsockets');
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
@@ -835,17 +841,14 @@ async function saveChannel(event) {
       api_key: row.api_key,
       note: row.note || '',
       allowed_models: Array.isArray(row.allowed_models) ? [...row.allowed_models] : [],
-      model_scope_empty: row.model_scope_empty === true
+      model_scope_empty: row.model_scope_empty === true,
+      cost_multiplier: row.cost_multiplier
     })),
     protocol_transform_mode: getProtocolTransformMode(),
     priority: parseInt(document.getElementById('channelPriority').value) || 0,
     rpm_limit: parseInt(document.getElementById('channelRPMLimit').value) || 0,
     max_concurrency: parseInt(document.getElementById('channelMaxConcurrency').value) || 0,
     daily_cost_limit: parseFloat(document.getElementById('channelDailyCostLimit').value) || 0,
-    cost_multiplier: (function () {
-      const v = parseFloat(document.getElementById('channelCostMultiplier').value);
-      return Number.isFinite(v) && v >= 0 ? v : 1;
-    })(),
     models: models,
     enabled: document.getElementById('channelEnabled').checked,
     scheduled_check_enabled: document.getElementById('channelScheduledCheckEnabled').checked,
@@ -859,6 +862,16 @@ async function saveChannel(event) {
     retry_other_keys_on_failure: !!document.getElementById('channelRetryOtherKeysOnFailure')?.checked
   };
   if (!isOAuth) formData.key_strategy = keyStrategy;
+  if (isOAuth) {
+    // OAuth 凭证 1:1：倍率经合成 Key 行提交（后端 ToConfig 取 APIKeys[0].CostMultiplier 写入渠道列）。
+    // 合成行的 api_key 为掩码后的非空值，保证不被 normalizeAPIKeys 丢弃；未提交时后端保底现值。
+    const synthetic = inlineKeyTableData && inlineKeyTableData.length > 0
+      ? normalizeInlineKeyRow(inlineKeyTableData[0])
+      : null;
+    if (synthetic && synthetic.api_key) {
+      formData.api_keys = [{ api_key: synthetic.api_key, cost_multiplier: synthetic.cost_multiplier }];
+    }
+  }
   applyChannelManagementPayload(formData);
 
   if (!formData.name || formData.urls.length === 0 || (!isOAuth && !formData.api_key) || formData.models.length === 0) {
@@ -890,9 +903,10 @@ async function saveChannel(event) {
     const isNewChannel = !editingChannelId;
     const savedChannelId = editingChannelId;
 
+    invokeChannelEditorAction('completeManagementAccountSave');
     resetChannelFormDirty(); // 保存成功，重置dirty状态（避免closeModal弹确认框）
     closeModal();
-    await handleChannelSaveSuccess({ isNewChannel, savedChannelId, response: resp });
+    await handleChannelUpdateSuccess({ isNewChannel, savedChannelId, response: resp });
     if (window.showSuccess) window.showSuccess(isNewChannel ? window.t('channels.channelAdded') : window.t('channels.channelUpdated'));
   } catch (e) {
     console.error('Save channel failed', e);
@@ -1582,7 +1596,9 @@ function buildBatchRefreshResultForItem(channelID, name, item, mode) {
     fetched: Number(item.fetched) || 0,
     added: Number(item.added) || 0,
     removed: Number(item.removed) || 0,
-    total: Number(item.total) || 0
+    total: Number(item.total) || 0,
+    warning: item.warning ? String(item.warning) : '',
+    detail: item.warning ? String(item.warning) : ''
   };
 }
 
@@ -1887,6 +1903,8 @@ async function copyChannel(id, name) {
   inlineKeyVisible = true;
   document.getElementById('inlineEyeIcon').style.display = 'none';
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
+  // 复制渠道不复制管理凭据；新草稿没有管理类型，因此也不显示倍率获取按钮。
+  invokeChannelEditorAction('resetManagementAccountDraft', null, channel.urls || [], channel.auth_type);
   renderInlineKeyTable();
 
   await ensureProtocolTransformModeCombobox(channel.protocol_transform_mode);
@@ -1900,7 +1918,6 @@ async function copyChannel(id, name) {
   document.getElementById('channelRPMLimit').value = channel.rpm_limit || 0;
   document.getElementById('channelMaxConcurrency').value = String(channel.max_concurrency || 0);
   document.getElementById('channelDailyCostLimit').value = channel.daily_cost_limit || 0;
-  document.getElementById('channelCostMultiplier').value = (Number(channel.cost_multiplier) >= 0 ? Number(channel.cost_multiplier) : 1);
   document.getElementById('channelEnabled').checked = true;
   const websocketCheckbox = document.getElementById('channelWebsockets');
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
@@ -2261,8 +2278,16 @@ async function confirmModelImport() {
   }
 }
 
+function getModelsForExport(rows, selectedIndices) {
+  const sourceRows = selectedIndices?.size > 0
+    ? (rows || []).filter((_, index) => selectedIndices.has(index))
+    : rows;
+  return collectModelsForSubmit(sourceRows);
+}
+
 function exportChannelModels() {
-  const models = collectModelsForSubmit(redirectTableData);
+  const selectedIndices = typeof selectedModelIndices !== 'undefined' ? selectedModelIndices : null;
+  const models = getModelsForExport(redirectTableData, selectedIndices);
   const text = window.ModelEntryParser.serializeModelEntries(models);
   if (!text) {
     if (window.showWarning) window.showWarning(window.t('channels.noModelsToExport'));
@@ -2374,18 +2399,16 @@ async function testRedirectModel(index, button) {
     return false;
   }
 
-  const channel = channels.find(item => item.id === editingChannelId);
-  if (!channel) {
-    if (window.showError) window.showError(window.t('channels.test.channelNotFound'));
-    return false;
-  }
-
   if (button) {
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
   }
   try {
-    const opened = await testChannel(channel.id, channel.name, modelName);
+    const opened = await testChannel({
+      id: editingChannelId,
+      name: document.getElementById('channelName').value,
+      models: redirectTableData
+    }, modelName);
     if (!opened) return false;
     await runChannelTest();
     return true;
@@ -2701,6 +2724,8 @@ function renderRedirectTable() {
   const validCount = redirectTableData.filter(r => r.model && r.model.trim()).length;
   countSpan.textContent = validCount;
   syncScheduledCheckModelState();
+  updateSelectAllModelsCheckbox();
+  updateModelBatchDeleteButton();
 
   // 初始化事件委托（仅一次）
   initRedirectTableEventDelegation();
@@ -2740,10 +2765,6 @@ function renderRedirectTable() {
   tbody.appendChild(fragment);
   syncChannelEditorTableSizing();
 
-  // 更新全选复选框和批量删除按钮状态
-  updateSelectAllModelsCheckbox();
-  updateModelBatchDeleteButton();
-
   // Translate dynamically rendered elements
   if (window.i18n && window.i18n.translatePage) {
     window.i18n.translatePage();
@@ -2766,18 +2787,19 @@ function toggleModelSelection(index, checked) {
 }
 
 /**
- * 全选/取消全选模型（仅操作当前可见的模型）
+ * 反选当前可见的模型；全选与全不选时互相切换
  */
-function toggleSelectAllModels(checked) {
+function invertVisibleModelSelection() {
   const visibleIndices = getVisibleModelIndices();
 
-  if (checked) {
-    visibleIndices.forEach(index => selectedModelIndices.add(index));
-  } else {
-    visibleIndices.forEach(index => selectedModelIndices.delete(index));
-  }
+  visibleIndices.forEach(index => {
+    if (selectedModelIndices.has(index)) {
+      selectedModelIndices.delete(index);
+    } else {
+      selectedModelIndices.add(index);
+    }
+  });
 
-  updateModelBatchDeleteButton();
   renderRedirectTable();
 }
 
@@ -3017,31 +3039,49 @@ function proposeFetchedKeyModelScopes(keyRows, modelRows, keyModels, requestEntr
   let changedCount = 0;
   let matchedCount = 0;
   let unmatchedCount = 0;
-  for (const [requestIndex, requestEntry] of (Array.isArray(requestEntries) ? requestEntries : []).entries()) {
-    const result = results.get(requestIndex);
-    if (!result || result.error || !Array.isArray(result.models) || result.models.length === 0) continue;
+  let failedCount = 0;
+  for (const requestEntry of (Array.isArray(requestEntries) ? requestEntries : [])) {
     const rowIndex = Number(requestEntry?.keyIndex);
     const row = rows[rowIndex];
     if (!row || String(row.api_key || '').trim() !== String(requestEntry?.apiKey || '').trim()) continue;
+
+    const result = results.get(rowIndex);
+    const setScope = (allowedModels, scopeEmpty) => {
+      const current = (row.allowed_models || []).map(name => String(name).toLowerCase());
+      const next = allowedModels.map(name => name.toLowerCase());
+      const currentEmpty = row.model_scope_empty === true;
+      if (current.length === next.length && current.every((name, index) => name === next[index]) &&
+          currentEmpty === scopeEmpty) {
+        return;
+      }
+      row.allowed_models = allowedModels;
+      if (scopeEmpty) row.model_scope_empty = true;
+      else delete row.model_scope_empty;
+      changedCount++;
+    };
+
+    if (!result || result.error || !Array.isArray(result.models) || result.models.length === 0) {
+      failedCount++;
+      setScope([], true);
+      continue;
+    }
+
     const allowedModels = detectedChannelModels(modelRows, result.models);
     if (allowedModels.length === 0) {
       unmatchedCount++;
+      setScope([], true);
       continue;
     }
     matchedCount++;
-    const current = (row.allowed_models || []).map(name => String(name).toLowerCase());
-    const next = allowedModels.map(name => name.toLowerCase());
-    if (current.length !== next.length || current.some((name, index) => name !== next[index])) {
-      row.allowed_models = allowedModels;
-      changedCount++;
-    }
+    setScope(allowedModels, false);
   }
   const complete = matchedCount === (Array.isArray(requestEntries) ? requestEntries.length : 0);
   return {
-    rows: complete ? rows : originalRows,
-    changedCount: complete ? changedCount : 0,
+    rows,
+    changedCount,
     matchedCount,
     unmatchedCount,
+    failedCount,
     complete
   };
 }
@@ -3375,6 +3415,13 @@ function initQuickAddChannelModalEvents() {
   modal.dataset.bound = '1';
 }
 
+// 单 Key 渠道不把模型范围写到 Key 上——唯一 Key 没有分流需求,限制只会误伤;多 Key 渠道一律弹确认框,确认后才应用。
+function fetchedKeyModelApplyAccepted(changedCount, isSingleKeyChannel) {
+  if (isSingleKeyChannel) return false;
+  return typeof window.confirm === 'function' &&
+    window.confirm(window.t('channels.applyFetchedKeyModelsConfirm', { count: changedCount }));
+}
+
 async function fetchModelsFromAPI() {
   let endpoint;
   let fetchOptions;
@@ -3391,7 +3438,7 @@ async function fetchModelsFromAPI() {
     const urls = getValidInlineURLConfigs();
     const channelUrl = urls[0]?.url || '';
     const keyRows = getInlineKeyRows();
-    modelFetchEntries = selectModelFetchKeyEntries(keyRows, currentChannelKeyCooldowns);
+    modelFetchEntries = selectModelFetchKeyEntries(keyRows, currentChannelKeyCooldowns, true, true);
     const availableKeys = modelFetchEntries.map(entry => entry.apiKey);
     skippedKeyCount = Math.max(
       0,
@@ -3458,20 +3505,15 @@ async function fetchModelsFromAPI() {
     renderRedirectTable();
     if (!areModelRowsEqual(previousRows, redirectTableData)) markChannelFormDirty();
 
-    if (modelFetchEntries.length > 0 && keyModels.length > 0) {
+    if (modelFetchEntries.length > 0) {
       const scopeProposal = proposeFetchedKeyModelScopes(
         getInlineKeyRows(),
         redirectTableData,
         keyModels,
         modelFetchEntries
       );
-      const completeScopeDetection = skippedKeyCount === 0 &&
-        failedKeyCount === 0 &&
-        keyModels.length === modelFetchEntries.length &&
-        scopeProposal.complete;
-      const shouldApply = completeScopeDetection && scopeProposal.changedCount > 0 &&
-        typeof window.confirm === 'function' &&
-        window.confirm(window.t('channels.applyFetchedKeyModelsConfirm', { count: scopeProposal.changedCount }));
+      const shouldApply = scopeProposal.changedCount > 0 &&
+        fetchedKeyModelApplyAccepted(scopeProposal.changedCount, countConfiguredInlineKeys(getInlineKeyRows()) === 1);
       if (shouldApply && scopeProposal.changedCount > 0) {
         inlineKeyTableData = scopeProposal.rows;
         renderInlineKeyTable();
@@ -3516,20 +3558,18 @@ async function fetchModelsFromAPI() {
   }
 }
 
-function setFetchSub2APIRatePending(pending) {
-  const button = document.getElementById('fetchSub2APIRateBtn');
-  const label = document.getElementById('fetchSub2APIRateLabel');
-  if (button) {
-    button.disabled = pending;
-    if (pending) button.setAttribute('aria-busy', 'true');
-    else button.removeAttribute('aria-busy');
-  }
+function setFetchKeyRatePending(button, pending) {
+  if (!button) return;
+  button.disabled = pending;
+  if (pending) button.setAttribute('aria-busy', 'true');
+  else button.removeAttribute('aria-busy');
+  const label = button.querySelector('span');
   if (label) {
     label.textContent = window.t(pending ? 'channels.fetchRateLoading' : 'channels.fetchRate');
   }
 }
 
-function showSub2APIRateError(code) {
+function showKeyRateError(code) {
   const knownCodes = new Set([
     'authentication_error',
     'permission_error',
@@ -3543,9 +3583,17 @@ function showSub2APIRateError(code) {
   else alert(message);
 }
 
-async function fetchSub2APIRate() {
-  const baseURL = getValidInlineURLConfigs()[0]?.url || '';
-  const apiKey = selectFirstEnabledInlineKey(getInlineKeyRows(), currentChannelKeyCooldowns);
+async function fetchKeyRate(keyIndex, actionBtn) {
+  const rateConfig = typeof window.getManagementAccountRateConfig === 'function'
+    ? window.getManagementAccountRateConfig()
+    : null;
+  if (!rateConfig) {
+    showKeyRateError('not_supported');
+    return;
+  }
+
+  const baseURL = String(rateConfig.base_url || '').trim();
+  const apiKey = getInlineKeyValue(keyIndex);
 
   if (!baseURL) {
     if (window.showError) window.showError(window.t('channels.fillApiUrlFirst'));
@@ -3557,40 +3605,54 @@ async function fetchSub2APIRate() {
     else alert(window.t('channels.addAtLeastOneEnabledKey'));
     return;
   }
+  if (rateConfig.profile === 'new_api' && !rateConfig.access_token) {
+    showKeyRateError('authentication_error');
+    return;
+  }
 
-  setFetchSub2APIRatePending(true);
+  setFetchKeyRatePending(actionBtn, true);
   try {
+    const payload = {
+      profile: rateConfig.profile,
+      base_url: baseURL,
+      api_key: apiKey
+    };
+    if (rateConfig.profile === 'new_api') {
+      payload.access_token = rateConfig.access_token;
+      if (Number.isInteger(rateConfig.user_id) && rateConfig.user_id > 0) {
+        payload.user_id = rateConfig.user_id;
+      }
+    }
     const response = await fetchAPIWithAuth('/admin/channels/billing/fetch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ base_url: baseURL, api_key: apiKey })
+      body: JSON.stringify(payload)
     });
     if (!response.success) {
-      showSub2APIRateError(response.data?.code);
+      showKeyRateError(response.data?.code);
       return;
     }
 
     const rate = response.data?.effective_rate_multiplier;
     if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0) {
-      showSub2APIRateError('invalid_response');
+      showKeyRateError('invalid_response');
       return;
     }
 
-    const input = document.getElementById('channelCostMultiplier');
-    if (!input) return;
+    // 写回触发行：输入框显示 + 表格数据同步（内部比对后按需标记表单脏）。
     const rateText = String(rate);
-    const currentRate = Number.parseFloat(input.value);
-    input.value = rateText;
-    if (!Number.isFinite(currentRate) || currentRate !== rate) markChannelFormDirty();
+    const input = document.querySelector(`.inline-key-multiplier-input[data-index="${keyIndex}"]`);
+    if (input) input.value = rateText;
+    updateInlineKeyCostMultiplier(keyIndex, rateText);
 
     const message = window.t('channels.fetchRateSuccess', { rate: rateText });
     if (window.showSuccess) window.showSuccess(message);
     else alert(message);
   } catch (error) {
-    console.error('Fetch Sub2API rate failed', error);
-    showSub2APIRateError('default');
+    console.error('Fetch key rate failed', error);
+    showKeyRateError('default');
   } finally {
-    setFetchSub2APIRatePending(false);
+    setFetchKeyRatePending(actionBtn, false);
   }
 }
 
@@ -3768,7 +3830,9 @@ function confirmCommonModelsSelection() {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    handleChannelUpdateSuccess,
     addCommonModels,
+    fetchedKeyModelApplyAccepted,
     addCommonModelsToRows,
     applyChannelManagementPayload,
     applyQuickAddChannelSetup,
@@ -3787,7 +3851,8 @@ if (typeof module !== 'undefined' && module.exports) {
     editChannel,
     exportChannelModels,
     fetchModelsFromAPI,
-    fetchSub2APIRate,
+    fetchKeyRate,
+    getModelsForExport,
     initModelNormalizationOptions,
     mergeModelRowsWithFetchedModels,
     openBatchModelImportModal,

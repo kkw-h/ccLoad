@@ -1220,7 +1220,11 @@ func TestAntigravityOAuthCreatesDatabaseChannel(t *testing.T) {
 	}
 	wantURLs := []string{antigravityDailyBaseURL}
 	if len(channel.URLs) != len(wantURLs) || !channel.SupportsModel("gemini-3-flash") ||
+		!channel.SupportsModel("gemini-3.7-flash") ||
 		!channel.SupportsModel("gemini-3.7-flash-high") ||
+		!channel.SupportsModel("gemini-3.8-flash") ||
+		!channel.SupportsModel("gemini-3.8-flash-high") ||
+		!channel.SupportsModel("gemini-3.8-flash-medium") ||
 		!strings.Contains(channel.OAuthCredential, `"project_id":"gravity-project"`) ||
 		!strings.Contains(channel.OAuthCredential, `"paid_tier":{"id":"g1-pro-tier","name":"Google AI Pro"}`) {
 		t.Fatalf("created Antigravity channel contract = %#v", channel)
@@ -1427,7 +1431,7 @@ func TestAntigravityChannelEditorExposesCredentialOnlyInEditor(t *testing.T) {
 		Keys            []*model.APIKey `json:"keys"`
 		OAuthCredential json.RawMessage `json:"oauth_credential"`
 	}](t, response.Body.Bytes())
-	if len(editor.Data.Keys) != 1 || editor.Data.Keys[0].APIKey != "gravity-editor-at" || !strings.Contains(string(editor.Data.OAuthCredential), `"project_id":"editor-project"`) {
+	if len(editor.Data.Keys) != 1 || editor.Data.Keys[0].APIKey != util.MaskAPIKey("gravity-editor-at") || editor.Data.Keys[0].CostMultiplier != channel.CostMultiplier || !strings.Contains(string(editor.Data.OAuthCredential), `"project_id":"editor-project"`) {
 		t.Fatalf("editor data=%#v", editor.Data)
 	}
 
@@ -1588,7 +1592,7 @@ func TestHandleImportAnthropicClaudeCredentialUsesEmailIdentity(t *testing.T) {
 	finalized, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(`{
 		"model":"claude-haiku-4-5-20251001",
 		"messages":[{"role":"user","content":"hello"}]
-	}`), channel, "", nil)
+	}`), channel, "", nil, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatalf("finalize imported Anthropic credential: %v", err)
 	}
@@ -3022,6 +3026,7 @@ func TestImportedOAuthCredentialUpsertsSameEmail(t *testing.T) {
 		"gpt-5.6-luna",
 		"gpt-5.6-sol",
 		"gpt-5.6-terra",
+		"gpt-6-astra",
 		"gpt-image-1.5",
 		"gpt-image-2",
 	}
@@ -3398,7 +3403,8 @@ func TestImportedOAuthCredentialRemovesModelsUnsupportedByPlan(t *testing.T) {
 	if err != nil || !wasCreated {
 		t.Fatalf("plus import = (%#v, %v, %v)", created, wasCreated, err)
 	}
-	if !created.SupportsModel("gpt-5.6-sol") || !created.SupportsModel("gpt-5.4") || !created.SupportsModel("gpt-5.3-codex-spark") {
+	if !created.SupportsModel("gpt-6-astra") || !created.SupportsModel("gpt-5.6-sol") ||
+		!created.SupportsModel("gpt-5.4") || !created.SupportsModel("gpt-5.3-codex-spark") {
 		t.Fatalf("plus channel models = %v", created.GetModels())
 	}
 
@@ -3422,17 +3428,20 @@ func TestImportedOAuthCredentialRemovesModelsUnsupportedByPlan(t *testing.T) {
 	if got := updated.GetModels(); !slices.Equal(got, want) {
 		t.Fatalf("free channel models = %v, want %v", got, want)
 	}
+	if updated.SupportsModel("gpt-6-astra") {
+		t.Fatalf("free channel unexpectedly supports gpt-6-astra: %v", updated.GetModels())
+	}
 }
 
 func TestImportedOAuthCredentialModelsFollowPlanType(t *testing.T) {
 	allModels := []string{
 		"codex-auto-review", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini",
 		"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-		"gpt-image-1.5", "gpt-image-2",
+		"gpt-6-astra", "gpt-image-1.5", "gpt-image-2",
 	}
 	teamModels := []string{
 		"codex-auto-review", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna",
-		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-image-1.5", "gpt-image-2",
+		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-image-1.5", "gpt-image-2",
 	}
 	freeModels := []string{
 		"codex-auto-review", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra",
@@ -3610,8 +3619,8 @@ func TestHandleChannelEditorExposesOAuthCredentialOnlyInEditorData(t *testing.T)
 			CodexSubscriptionActiveUntil *time.Time `json:"codex_subscription_active_until"`
 		} `json:"channel"`
 	}](t, w.Body.Bytes())
-	if len(resp.Data.Keys) != 1 || resp.Data.Keys[0].APIKey != "at-editor-secret" {
-		t.Fatalf("editor keys = %#v, want read-only AT", resp.Data.Keys)
+	if len(resp.Data.Keys) != 1 || resp.Data.Keys[0].APIKey != util.MaskAPIKey("at-editor-secret") || resp.Data.Keys[0].CostMultiplier != channel.CostMultiplier {
+		t.Fatalf("editor keys = %#v, want masked AT and current multiplier", resp.Data.Keys)
 	}
 	var exposed codexauth.Credential
 	if err := json.Unmarshal(resp.Data.OAuthCredential, &exposed); err != nil {
@@ -4356,6 +4365,167 @@ func TestCodexPassiveUsageDoesNotResetCostFromStaleMergedWindow(t *testing.T) {
 	}
 }
 
+func TestCodexPassiveSparkRollbackDoesNotResetCodexWeeklyCost(t *testing.T) {
+	t.Parallel()
+	store := newCodexAuthTestStore(t)
+	base := time.Date(2030, time.January, 1, 12, 0, 0, 0, time.UTC)
+	mainUsed := 70.0
+	sparkUsed := 80.0
+	mainResetAt := base.Add(6 * 24 * time.Hour)
+	sparkResetAt := base.Add(4 * time.Hour)
+	credential := &codexauth.Credential{
+		Type: "codex", AccessToken: "at-spark-reset", RefreshToken: "rt-spark-reset",
+		Expired: base.Add(time.Hour).Format(time.RFC3339), AccountID: "account-spark-reset", PlanType: "pro",
+		PassiveUsage: &codexauth.PassiveUsage{
+			SampledAt: base.Format(time.RFC3339Nano),
+			Windows: []codexauth.PassiveUsageWindow{
+				{Scope: "codex", LimitName: "codex", Kind: "secondary", UsedPercent: mainUsed,
+					LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAt: mainResetAt.Unix(), SampledAt: base.Format(time.RFC3339Nano)},
+				{Scope: "bengalfox", LimitName: "GPT-5.3-Codex-Spark", Kind: "primary", UsedPercent: sparkUsed,
+					LimitWindowSeconds: 5 * 60 * 60, ResetAt: sparkResetAt.Unix(), SampledAt: base.Format(time.RFC3339Nano)},
+			},
+		},
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{
+			{Key: "codex|secondary", Family: oauthcost.FamilyCodex, WindowSeconds: 7 * 24 * 60 * 60,
+				StartedAt: base.Add(-time.Hour).Unix(), ResetAt: mainResetAt.Unix(),
+				SampledUpstreamUsedPercent: &mainUsed, SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 7_000_000},
+			{Key: "gpt-5.3-codex-spark|primary", Family: oauthcost.FamilySpark, WindowSeconds: 5 * 60 * 60,
+				StartedAt: base.Add(-time.Hour).Unix(), ResetAt: sparkResetAt.Unix(),
+				SampledUpstreamUsedPercent: &sparkUsed, SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 900_000},
+		}},
+	}
+	channel, _, err := createOrUpdateCodexChannel(context.Background(), store, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newCodexCredentialManager(codexauth.NewService(nil), store, nil, nil)
+	sampledAt := base.Add(time.Hour)
+	updated, err := manager.updatePassiveUsage(context.Background(), channel, codexPassiveUsageUpdate{
+		SampledAt: sampledAt.Format(time.RFC3339Nano), ReplaceScopes: []string{"bengalfox"},
+		Windows: []codexauth.PassiveUsageWindow{{
+			Scope: "bengalfox", LimitName: "GPT-5.3-Codex-Spark", Kind: "primary", UsedPercent: 5,
+			LimitWindowSeconds: 5 * 60 * 60, ResetAt: sampledAt.Add(3 * time.Hour).Unix(), SampledAt: sampledAt.Format(time.RFC3339Nano),
+		}},
+	})
+	if err != nil || !updated {
+		t.Fatalf("persist Spark rollback = (%t, %v)", updated, err)
+	}
+	persisted, err := store.GetConfig(context.Background(), channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedCredential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
+	main := oauthcost.Find(persistedCredential.QuotaCostUsage, "codex|secondary")
+	spark := oauthcost.Find(persistedCredential.QuotaCostUsage, "gpt-5.3-codex-spark|primary")
+	if err != nil || main == nil || main.StandardCostMicroUSD != 7_000_000 ||
+		main.SampledUpstreamUsedPercent == nil || *main.SampledUpstreamUsedPercent != mainUsed {
+		t.Fatalf("Spark rollback reset Codex weekly cost: main=%#v err=%v", main, err)
+	}
+	if spark == nil || spark.StandardCostMicroUSD != 0 || spark.CountFromAt != sampledAt.Unix() ||
+		spark.SampledUpstreamUsedPercent == nil || *spark.SampledUpstreamUsedPercent != 5 {
+		t.Fatalf("Spark quota did not reset independently: %#v", spark)
+	}
+}
+
+func TestCodexWeeklyRoleChangePersistsCost(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		passive bool
+		stale   bool
+	}{
+		{name: "active"},
+		{name: "passive", passive: true},
+		{name: "stale_active", stale: true},
+		{name: "stale_passive", passive: true, stale: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := newCodexAuthTestStore(t)
+			ctx := context.Background()
+			base := time.Date(2030, time.January, 1, 12, 0, 0, 0, time.UTC)
+			latest := base.Add(2 * time.Minute)
+			weeklyResetAt := base.Add(6 * 24 * time.Hour).Unix()
+			credential := &codexauth.Credential{
+				Type: "codex", AccessToken: "at-weekly-role", RefreshToken: "rt-weekly-role",
+				Expired: base.Add(time.Hour).Format(time.RFC3339), AccountID: "account-weekly-role",
+				QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{
+					{Key: "codex|primary", Family: oauthcost.FamilyCodex, WindowSeconds: 18000,
+						StartedAt: base.Add(-time.Hour).Unix(), ResetAt: base.Add(4 * time.Hour).Unix(),
+						SampledUpstreamUsedPercent: float64Pointer(80), SampledUpstreamAtUnixNano: latest.UnixNano(), StandardCostMicroUSD: 100_000},
+					{Key: "codex|secondary", Family: oauthcost.FamilyCodex, WindowSeconds: 604800,
+						StartedAt: base.Add(-24 * time.Hour).Unix(), ResetAt: weeklyResetAt, CountFromAt: base.Unix(),
+						SampledUpstreamUsedPercent: float64Pointer(5), SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 900_000},
+					{Key: "codex-spark|secondary", Family: oauthcost.FamilySpark, WindowSeconds: 604800,
+						StartedAt: base.Add(-24 * time.Hour).Unix(), ResetAt: weeklyResetAt,
+						SampledUpstreamUsedPercent: float64Pointer(30), SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 700_000},
+				}},
+			}
+			channel, _, err := createOrUpdateCodexChannel(ctx, store, credential)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manager := newCodexCredentialManager(nil, store, nil, nil)
+			server := &Server{store: store, codexCredentials: manager}
+			sampledAt := base.Add(3 * time.Minute)
+			if test.stale {
+				sampledAt = base.Add(time.Minute)
+			}
+			if test.passive {
+				payload := fmt.Sprintf(`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":5,"window_minutes":10080,"reset_at":%d},"secondary":null}}`, weeklyResetAt)
+				update, ok := sampleCodexPassiveUsageEvent([]byte(payload), sampledAt)
+				if !ok {
+					t.Fatal("Codex quota event was not accepted")
+				}
+				if _, err := manager.updatePassiveUsage(ctx, channel, update); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				_, err := server.persistOAuthUsage(ctx, channel, &oauthUsageSummary{
+					Provider: codexauth.ChannelType, Windows: []oauthUsageWindow{
+						{LimitName: "codex", Kind: "primary", UsedPercent: 5, LimitWindowSeconds: 604800, ResetAt: weeklyResetAt, SampledAt: sampledAt},
+						{LimitName: "codex-spark", Kind: "secondary", UsedPercent: 40, LimitWindowSeconds: 604800, ResetAt: weeklyResetAt, SampledAt: sampledAt},
+					},
+				}, sampledAt, sampledAt)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.AddLog(ctx, &model.LogEntry{
+				Time: model.JSONTime{Time: latest.Add(time.Minute)}, ChannelID: channel.ID,
+				Model: "gpt-5.6-sol", StatusCode: http.StatusOK, Cost: 0.5,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := store.GetConfig(ctx, channel.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
+			if err != nil {
+				t.Fatal(err)
+			}
+			weeklyKey, wantWindows := "codex|primary", 2
+			if test.stale {
+				weeklyKey, wantWindows = "codex|secondary", 3
+			}
+			weekly := oauthcost.Find(actual.QuotaCostUsage, weeklyKey)
+			spark := oauthcost.Find(actual.QuotaCostUsage, "codex-spark|secondary")
+			if len(actual.QuotaCostUsage.Windows) != wantWindows || weekly == nil ||
+				weekly.StandardCostMicroUSD != 1_400_000 || weekly.CountFromAt != base.Unix() ||
+				spark == nil || spark.StandardCostMicroUSD != 700_000 {
+				t.Fatalf("persisted quota cost after role change = %#v", actual.QuotaCostUsage)
+			}
+			wantSparkUsed := 40.0
+			if test.passive {
+				wantSparkUsed = 30
+			}
+			if spark.SampledUpstreamUsedPercent == nil || *spark.SampledUpstreamUsedPercent != wantSparkUsed {
+				t.Fatalf("Codex layout change interfered with independent Spark sample: %#v", spark)
+			}
+		})
+	}
+}
+
 func TestCodexCredentialManagerReloadsPersistedCredentialBeforeRefresh(t *testing.T) {
 	t.Run("forced request reuses a newer access token", func(t *testing.T) {
 		store := newCodexAuthTestStore(t)
@@ -5087,6 +5257,402 @@ func TestHandleOAuthUsageReturnsCodexQuotaWithoutLeakingCredential(t *testing.T)
 	}
 }
 
+func TestCodexPassiveUsageSimulationMatchesUpstreamEvent(t *testing.T) {
+	t.Parallel()
+	sampledAt := time.Date(2026, time.August, 29, 13, 34, 37, 0, time.UTC)
+	payload := []byte(`{
+		"type":"codex.rate_limits",
+		"plan_type":"pro",
+		"rate_limits":{
+			"allowed":true,
+			"limit_reached":false,
+			"primary":{"used_percent":16,"window_minutes":10080,"reset_after_seconds":492244,"reset_at":1788504406},
+			"secondary":null
+		},
+		"code_review_rate_limits":null,
+		"additional_rate_limits":{
+			"GPT-5.3-Codex-Spark":{
+				"allowed":true,
+				"limit_reached":false,
+				"primary":{"used_percent":3,"window_minutes":300,"reset_after_seconds":11794,"reset_at":1788023956},
+				"secondary":{"used_percent":2,"window_minutes":10080,"reset_after_seconds":520633,"reset_at":1788532795}
+			}
+		},
+		"credits":{"has_credits":false,"unlimited":false,"balance":"0"},
+		"promo":null
+	}`)
+	update, ok := sampleCodexPassiveUsageEvent(payload, sampledAt)
+	if !ok {
+		t.Fatal("Codex rate-limit event should produce a passive usage update")
+	}
+	if len(update.Windows) != 3 {
+		t.Fatalf("passive usage windows = %d, want 3: %#v", len(update.Windows), update.Windows)
+	}
+	want := map[string]struct {
+		windowSeconds int64
+		usedPercent   float64
+	}{
+		"codex|primary":                 {604800, 16},
+		"gpt-5.3-codex-spark|primary":   {18000, 3},
+		"gpt-5.3-codex-spark|secondary": {604800, 2},
+	}
+	for _, window := range update.Windows {
+		key := strings.ToLower(strings.TrimSpace(window.LimitName)) + "|" + strings.ToLower(strings.TrimSpace(window.Kind))
+		expect, exists := want[key]
+		if !exists {
+			t.Fatalf("unexpected passive usage window: %#v", window)
+		}
+		if window.LimitWindowSeconds != expect.windowSeconds || window.UsedPercent != expect.usedPercent {
+			t.Fatalf("passive usage window %q = %#v, want %d seconds and %.1f%%", key, window, expect.windowSeconds, expect.usedPercent)
+		}
+		delete(want, key)
+	}
+	if len(want) != 0 {
+		t.Fatalf("passive usage windows missing identities: %#v", want)
+	}
+}
+
+func TestCodexPassiveUsageActiveLimitHeaderDropsDuplicateFields(t *testing.T) {
+	t.Parallel()
+	sampledAt := time.Date(2026, time.August, 29, 14, 5, 25, 0, time.UTC)
+	headers := http.Header{
+		"X-Codex-Active-Limit":                       []string{"codex_bengalfox"},
+		"X-Codex-Bengalfox-Limit-Name":               []string{"GPT-5.3-Codex-Spark"},
+		"X-Codex-Primary-Used-Percent":               []string{"3"},
+		"X-Codex-Primary-Window-Minutes":             []string{"300"},
+		"X-Codex-Primary-Reset-At":                   []string{"1788023956"},
+		"X-Codex-Secondary-Used-Percent":             []string{"2"},
+		"X-Codex-Secondary-Window-Minutes":           []string{"10080"},
+		"X-Codex-Secondary-Reset-At":                 []string{"1788532795"},
+		"X-Codex-Bengalfox-Primary-Used-Percent":     []string{"3"},
+		"X-Codex-Bengalfox-Primary-Window-Minutes":   []string{"300"},
+		"X-Codex-Bengalfox-Primary-Reset-At":         []string{"1788023956"},
+		"X-Codex-Bengalfox-Secondary-Used-Percent":   []string{"2"},
+		"X-Codex-Bengalfox-Secondary-Window-Minutes": []string{"10080"},
+		"X-Codex-Bengalfox-Secondary-Reset-At":       []string{"1788532795"},
+	}
+	update, ok := sampleCodexPassiveUsage(headers, sampledAt)
+	if !ok || len(update.Windows) != 2 {
+		t.Fatalf("header usage = (%#v, %t), want one Spark primary and one secondary window", update, ok)
+	}
+	for _, window := range update.Windows {
+		if window.LimitName != "GPT-5.3-Codex-Spark" {
+			t.Fatalf("header usage created phantom limit group: %#v", window)
+		}
+	}
+	if len(update.ReplaceScopes) != 1 || update.ReplaceScopes[0] != "bengalfox" {
+		t.Fatalf("header replacement scopes = %#v, want only bengalfox", update.ReplaceScopes)
+	}
+	current := &codexauth.PassiveUsage{
+		SampledAt: sampledAt.Add(-time.Minute).Format(time.RFC3339Nano),
+		Windows: []codexauth.PassiveUsageWindow{{
+			Scope: "codex", LimitName: "codex", Kind: "primary", UsedPercent: 21,
+			LimitWindowSeconds: 604800, ResetAt: 1788504406,
+			SampledAt: sampledAt.Add(-time.Minute).Format(time.RFC3339Nano),
+		}},
+	}
+	merged, changed := mergeCodexPassiveUsageWithScopes(current, update.Windows, sampledAt, update.ReplaceScopes)
+	if !changed || len(merged.Windows) != 3 {
+		t.Fatalf("Spark-only header removed main Codex window: (changed=%t, %#v)", changed, merged)
+	}
+	if merged.Windows[0].LimitName != "codex" || merged.Windows[0].Kind != "primary" {
+		t.Fatalf("main Codex window was not retained: %#v", merged.Windows)
+	}
+}
+
+func TestCodexPassiveUsagePremiumHeaderReplacesMissingSecondary(t *testing.T) {
+	t.Parallel()
+	sampledAt := time.Date(2026, time.August, 30, 5, 15, 28, 0, time.UTC)
+	headers := http.Header{
+		"X-Codex-Active-Limit":             []string{"premium"},
+		"X-Codex-Primary-Used-Percent":     []string{"3"},
+		"X-Codex-Primary-Window-Minutes":   []string{"10080"},
+		"X-Codex-Primary-Reset-At":         []string{"1788647017"},
+		"X-Codex-Secondary-Used-Percent":   []string{"0"},
+		"X-Codex-Secondary-Window-Minutes": []string{"0"},
+		"X-Codex-Secondary-Reset-At":       []string{""},
+	}
+	update, ok := sampleCodexPassiveUsage(headers, sampledAt)
+	if !ok || len(update.Windows) != 1 || oauthcost.Key(update.Windows[0].LimitName, update.Windows[0].Kind) != "codex|primary" {
+		t.Fatalf("premium Pro header usage = (%#v, %t), want only codex primary", update, ok)
+	}
+	if len(update.ReplaceScopes) != 1 || update.ReplaceScopes[0] != "codex" {
+		t.Fatalf("premium Pro replacement scopes = %#v, want codex", update.ReplaceScopes)
+	}
+
+	oldSampledAt := sampledAt.Add(-time.Minute)
+	current := &codexauth.PassiveUsage{
+		SampledAt: oldSampledAt.Format(time.RFC3339Nano),
+		Windows: []codexauth.PassiveUsageWindow{
+			{Scope: "codex", LimitName: "codex", Kind: "primary", UsedPercent: 2, LimitWindowSeconds: 604800, ResetAt: 1788647017, SampledAt: oldSampledAt.Format(time.RFC3339Nano)},
+			{Scope: "codex", LimitName: "codex", Kind: "secondary", UsedPercent: 1, LimitWindowSeconds: 604800, ResetAt: 1788646885, SampledAt: oldSampledAt.Format(time.RFC3339Nano)},
+		},
+	}
+	merged, changed := mergeCodexPassiveUsageWithScopes(current, update.Windows, sampledAt, update.ReplaceScopes)
+	if !changed || len(merged.Windows) != 1 || oauthcost.Key(merged.Windows[0].LimitName, merged.Windows[0].Kind) != "codex|primary" {
+		t.Fatalf("premium Pro stale secondary merge = (changed=%t, %#v), want secondary removed", changed, merged)
+	}
+}
+
+func TestCodexPassiveUsagePremiumTeamHeaderKeepsBothMainWindows(t *testing.T) {
+	t.Parallel()
+	sampledAt := time.Date(2026, time.August, 30, 5, 16, 43, 0, time.UTC)
+	headers := http.Header{
+		"X-Codex-Active-Limit":             []string{"premium"},
+		"X-Codex-Plan-Type":                []string{"team"},
+		"X-Codex-Primary-Used-Percent":     []string{"0"},
+		"X-Codex-Primary-Window-Minutes":   []string{"300"},
+		"X-Codex-Primary-Reset-At":         []string{"1788085003"},
+		"X-Codex-Secondary-Used-Percent":   []string{"0"},
+		"X-Codex-Secondary-Window-Minutes": []string{"10080"},
+		"X-Codex-Secondary-Reset-At":       []string{"1788671803"},
+	}
+	update, ok := sampleCodexPassiveUsage(headers, sampledAt)
+	if !ok || len(update.Windows) != 2 {
+		t.Fatalf("premium Team header usage = (%#v, %t), want two main windows", update, ok)
+	}
+	if len(update.ReplaceScopes) != 1 || update.ReplaceScopes[0] != "codex" {
+		t.Fatalf("premium Team replacement scopes = %#v, want codex", update.ReplaceScopes)
+	}
+	windows := make(map[string]codexauth.PassiveUsageWindow, len(update.Windows))
+	for _, window := range update.Windows {
+		windows[oauthcost.Key(window.LimitName, window.Kind)] = window
+	}
+	if windows["codex|primary"].LimitWindowSeconds != 18_000 || windows["codex|secondary"].LimitWindowSeconds != 604800 {
+		t.Fatalf("premium Team main windows = %#v, want 5h primary and 7d secondary", windows)
+	}
+}
+
+func TestCodexPassiveUsageCompleteEventRemovesMissingWindow(t *testing.T) {
+	t.Parallel()
+	oldSampledAt := time.Date(2026, time.August, 29, 14, 0, 0, 0, time.UTC)
+	newSampledAt := oldSampledAt.Add(5 * time.Minute)
+	current := &codexauth.PassiveUsage{
+		SampledAt: oldSampledAt.Format(time.RFC3339Nano),
+		Windows: []codexauth.PassiveUsageWindow{
+			{Scope: "codex", LimitName: "codex", Kind: "primary", UsedPercent: 15, LimitWindowSeconds: 604800, ResetAt: 1788504406, SampledAt: oldSampledAt.Format(time.RFC3339Nano)},
+			{Scope: "codex", LimitName: "codex", Kind: "secondary", UsedPercent: 2, LimitWindowSeconds: 604800, ResetAt: 1788532795, SampledAt: oldSampledAt.Format(time.RFC3339Nano)},
+			{Scope: "gpt-5.3-codex-spark", LimitName: "GPT-5.3-Codex-Spark", Kind: "primary", UsedPercent: 2, LimitWindowSeconds: 18000, ResetAt: 1788023956, SampledAt: oldSampledAt.Format(time.RFC3339Nano)},
+			{Scope: "gpt-5.3-codex-spark", LimitName: "GPT-5.3-Codex-Spark", Kind: "secondary", UsedPercent: 1, LimitWindowSeconds: 604800, ResetAt: 1788532795, SampledAt: oldSampledAt.Format(time.RFC3339Nano)},
+		},
+	}
+	update, ok := sampleCodexPassiveUsageEvent([]byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":16,"window_minutes":10080,"reset_at":1788504406},"secondary":null},"additional_rate_limits":{"GPT-5.3-Codex-Spark":{"primary":{"used_percent":3,"window_minutes":300,"reset_at":1788023956},"secondary":{"used_percent":2,"window_minutes":10080,"reset_at":1788532795}}}}`), newSampledAt)
+	if !ok {
+		t.Fatal("complete Codex event should produce an update")
+	}
+	merged, changed := mergeCodexPassiveUsageWithScopes(current, update.Windows, newSampledAt, update.ReplaceScopes)
+	if !changed || len(merged.Windows) != 3 {
+		t.Fatalf("merged passive usage = (changed=%t, %#v), want stale secondary removed", changed, merged)
+	}
+	for _, window := range merged.Windows {
+		if oauthcost.Key(window.LimitName, window.Kind) == "codex|secondary" {
+			t.Fatalf("stale codex secondary window survived complete event: %#v", merged.Windows)
+		}
+	}
+}
+
+func TestLatestCodexOAuthUsageIgnoresPassiveOnlyWindows(t *testing.T) {
+	t.Parallel()
+	activeSampledAt := time.Date(2026, time.August, 29, 13, 40, 0, 0, time.UTC)
+	passiveSampledAt := activeSampledAt.Add(time.Minute)
+	active := &oauthUsageSummary{
+		Provider: codexauth.ChannelType,
+		PlanType: "pro",
+		Windows: []oauthUsageWindow{
+			{LimitName: "codex", Kind: "primary", UsedPercent: 14, RemainingPercent: 86, LimitWindowSeconds: 604800, ResetAt: 1788504406},
+			{LimitName: "GPT-5.3-Codex-Spark", Kind: "primary", UsedPercent: 0, RemainingPercent: 100, LimitWindowSeconds: 18000, ResetAt: 1788023956},
+			{LimitName: "GPT-5.3-Codex-Spark", Kind: "secondary", UsedPercent: 1, RemainingPercent: 99, LimitWindowSeconds: 604800, ResetAt: 1788532795},
+		},
+	}
+	passive := &oauthUsageSummary{
+		Provider: codexauth.ChannelType,
+		Windows: []oauthUsageWindow{
+			{LimitName: "codex", Kind: "primary", UsedPercent: 15, RemainingPercent: 85, LimitWindowSeconds: 3600, ResetAt: 99},
+			{LimitName: "GPT-5.3-Codex-Spark", Kind: "primary", UsedPercent: 3, RemainingPercent: 97, LimitWindowSeconds: 18000, ResetAt: 1788023956},
+			{LimitName: "GPT-5.3-Codex-Spark", Kind: "secondary", UsedPercent: 2, RemainingPercent: 98, LimitWindowSeconds: 604800, ResetAt: 1788532795},
+			{LimitName: "codex", Kind: "secondary", UsedPercent: 2, RemainingPercent: 98, LimitWindowSeconds: 604800, ResetAt: 1788532795},
+		},
+	}
+	merged := latestOAuthUsage(active, activeSampledAt, passive, passiveSampledAt.Format(time.RFC3339Nano))
+	if merged == nil || len(merged.Windows) != 3 {
+		t.Fatalf("merged Codex windows = %#v, want the 3 official windows only", merged)
+	}
+	weekly := 0
+	want := map[string]float64{
+		"codex|primary":                 14,
+		"gpt-5.3-codex-spark|primary":   3,
+		"gpt-5.3-codex-spark|secondary": 2,
+	}
+	for _, window := range merged.Windows {
+		if window.LimitWindowSeconds == 7*24*60*60 {
+			weekly++
+		}
+		key := oauthcost.Key(window.LimitName, window.Kind)
+		if used, ok := want[key]; !ok || window.UsedPercent != used {
+			t.Fatalf("merged Codex window %q = %#v", key, window)
+		}
+		if key == "codex|primary" && (window.LimitWindowSeconds != 604800 || window.ResetAt != 1788504406) {
+			t.Fatalf("passive sample changed official Codex window boundary: %#v", window)
+		}
+		delete(want, key)
+	}
+	if weekly != 2 || len(want) != 0 {
+		t.Fatalf("merged Codex weekly windows=%d missing=%#v", weekly, want)
+	}
+}
+
+func TestLatestCodexOAuthUsageRequiresSameQuotaPeriod(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, time.September, 5, 0, 0, 0, 0, time.UTC)
+	resetAt := base.Add(24 * time.Hour).Unix()
+	for _, tc := range []struct {
+		name     string
+		seconds  int64
+		resetAt  int64
+		wantUsed float64
+	}{
+		{name: "same period with reset jitter", seconds: 604800, resetAt: resetAt + 60, wantUsed: 80},
+		{name: "five-hour usage cannot replace weekly", seconds: 18000, resetAt: resetAt, wantUsed: 20},
+		{name: "next weekly period", seconds: 604800, resetAt: resetAt + 604800, wantUsed: 20},
+		{name: "unknown reset", seconds: 604800, resetAt: 0, wantUsed: 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			active := &oauthUsageSummary{Provider: "codex", Windows: []oauthUsageWindow{{
+				LimitName: "codex", Kind: "primary", LimitWindowSeconds: 604800,
+				ResetAt: resetAt, UsedPercent: 20, RemainingPercent: 80,
+			}}}
+			passive := &oauthUsageSummary{Provider: "codex", Windows: []oauthUsageWindow{{
+				LimitName: "codex", Kind: "primary", LimitWindowSeconds: tc.seconds,
+				ResetAt: tc.resetAt, UsedPercent: 80, RemainingPercent: 20,
+			}}}
+			got := latestOAuthUsage(active, base, passive, base.Add(time.Minute).Format(time.RFC3339Nano))
+			if len(got.Windows) != 1 || got.Windows[0].UsedPercent != tc.wantUsed ||
+				got.Windows[0].RemainingPercent != 100-tc.wantUsed || got.Windows[0].ResetAt != resetAt ||
+				got.Windows[0].LimitWindowSeconds != 604800 {
+				t.Fatalf("merged quota period = %+v", got.Windows)
+			}
+		})
+	}
+}
+
+func TestHandleChannelsCodexQuotaUsesCurrentPassivePeriod(t *testing.T) {
+	base := time.Date(2026, time.September, 5, 8, 49, 40, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		kind     string
+		duration time.Duration
+		stale    bool
+		cost     int64
+	}{
+		{name: "five-hour rollover", kind: "primary", duration: 5 * time.Hour, cost: 5_697_691},
+		{name: "weekly rollover", kind: "secondary", duration: 7 * 24 * time.Hour, cost: 53_408_956},
+		{name: "new sibling cannot promote an old sample", kind: "primary", duration: 5 * time.Hour, stale: true, cost: 5_697_691},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, store, cleanup := setupAdminTestServer(t)
+			defer cleanup()
+			activeAt := base.Add(-2 * time.Hour)
+			oldReset := base.Add(-40 * time.Minute)
+			newReset := oldReset.Add(tc.duration + 30*time.Minute)
+			passiveAt := base
+			wantUsed := float64(46)
+			wantReset := newReset
+			if tc.stale {
+				oldReset = base.Add(time.Hour)
+				newReset = oldReset
+				passiveAt = activeAt.Add(-time.Minute)
+				wantUsed = 100
+				wantReset = oldReset
+			}
+			seconds := int64(tc.duration / time.Second)
+			snapshot, err := json.Marshal(persistedOAuthUsageSnapshot{
+				RequestedAt: activeAt.Format(time.RFC3339Nano), SampledAt: activeAt.Format(time.RFC3339Nano),
+				Summary: oauthUsageSummary{
+					Provider: "codex", PlanType: "plus",
+					Windows: []oauthUsageWindow{{
+						LimitName: "codex", Kind: tc.kind, LimitWindowSeconds: seconds,
+						ResetAt: oldReset.Unix(), UsedPercent: 100, RemainingPercent: 0,
+					}},
+					RateLimitResetCredits: &codexQuotaResetCredits{AvailableCount: 2},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			credential := &codexauth.Credential{
+				Type: "codex", AccessToken: "quota-test", PlanType: "plus", OAuthUsage: snapshot,
+				RefreshToken: "quota-refresh-test", Expired: base.Add(24 * time.Hour).Format(time.RFC3339),
+				PassiveUsage: &codexauth.PassiveUsage{
+					SampledAt: base.Format(time.RFC3339Nano),
+					Windows: []codexauth.PassiveUsageWindow{
+						{Scope: "codex", LimitName: "codex", Kind: tc.kind, LimitWindowSeconds: seconds,
+							ResetAt: newReset.Unix(), UsedPercent: 46, SampledAt: passiveAt.Format(time.RFC3339Nano)},
+						{Scope: "gpt-reserve", LimitName: "gpt-reserve", Kind: "primary", LimitWindowSeconds: 604800,
+							ResetAt: base.Add(7 * 24 * time.Hour).Unix(), SampledAt: base.Format(time.RFC3339Nano)},
+					},
+				},
+				QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
+					Key: oauthcost.Key("codex", tc.kind), Family: oauthcost.FamilyCodex, WindowSeconds: seconds,
+					StartedAt: newReset.Add(-tc.duration - 3*time.Minute).Unix(), ResetAt: newReset.Add(-3 * time.Minute).Unix(),
+					StandardCostMicroUSD: tc.cost,
+				}}},
+			}
+			raw, err := credential.JSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			channel, err := store.CreateConfig(context.Background(), &model.Config{
+				Name: "Codex quota rollover", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: raw,
+				URLs: model.ChannelURLs{{URL: "https://example.test"}}, Enabled: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+			server.HandleChannels(c)
+			list := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
+			if w.Code != http.StatusOK || len(list.Data) != 1 || list.Data[0].OAuthUsage == nil {
+				t.Fatalf("channel list status=%d response=%#v", w.Code, list)
+			}
+			usage := list.Data[0].OAuthUsage
+			if len(usage.Windows) != 1 || usage.RateLimitResetCredits == nil || usage.RateLimitResetCredits.AvailableCount != 2 {
+				t.Fatalf("official windows and reset credits changed: %#v", usage)
+			}
+			window := usage.Windows[0]
+			if window.Kind != tc.kind || window.LimitWindowSeconds != seconds || window.UsedPercent != wantUsed ||
+				window.RemainingPercent != 100-wantUsed || window.ResetAt != wantReset.Unix() ||
+				window.StandardCostMicroUSD == nil || *window.StandardCostMicroUSD != tc.cost {
+				t.Fatalf("wrong quota period or accumulated cost: %#v", window)
+			}
+			persisted, err := store.GetConfig(context.Background(), channel.ID)
+			if err != nil || persisted.OAuthCredential != raw {
+				t.Fatalf("listing changed persisted quota history: %v", err)
+			}
+		})
+	}
+}
+
+func TestAttachOAuthQuotaCostUsageMatchesResetJitter(t *testing.T) {
+	t.Parallel()
+	displayResetAt := time.Date(2026, time.August, 31, 13, 28, 7, 0, time.UTC).Unix()
+	summary := &oauthUsageSummary{
+		Provider: codexauth.ChannelType,
+		Windows: []oauthUsageWindow{{
+			LimitName: "codex", Kind: "primary", UsedPercent: 40, RemainingPercent: 60,
+			LimitWindowSeconds: 5 * 60 * 60, ResetAt: displayResetAt,
+		}},
+	}
+	attached := attachOAuthQuotaCostUsage(summary, &oauthcost.Usage{Windows: []*oauthcost.Window{{
+		Key: "codex|primary", WindowSeconds: 5 * 60 * 60,
+		StartedAt: displayResetAt - 5*60*60, ResetAt: displayResetAt + 3*60,
+		StandardCostMicroUSD: 2_000_000,
+	}}})
+	if attached == nil || attached.Windows[0].StandardCostMicroUSD == nil ||
+		*attached.Windows[0].StandardCostMicroUSD != 2_000_000 {
+		t.Fatalf("cost was hidden inside half-window jitter: %#v", attached)
+	}
+}
+
 func TestRequestCodexUsageSamplesBeforeResetCreditLookupCompletes(t *testing.T) {
 	t.Parallel()
 	creditsStarted := make(chan struct{})
@@ -5604,6 +6170,57 @@ func TestHandleOAuthUsageDoesNotOverwriteNewerSnapshotAfterCASConflict(t *testin
 	}
 }
 
+func TestPersistOAuthUsageKeepsNewerPassiveQuotaAfterCASConflict(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := newCodexAuthTestStore(t)
+	base := time.Date(2026, time.September, 5, 0, 0, 0, 0, time.UTC)
+	quotaAt, passiveAt, completedAt := base.Add(time.Minute), base.Add(2*time.Minute), base.Add(3*time.Minute)
+	active := &oauthUsageSummary{Provider: "codex", Windows: []oauthUsageWindow{{
+		LimitName: "codex", Kind: "primary", LimitWindowSeconds: 604800,
+		ResetAt: base.Add(24 * time.Hour).Unix(), UsedPercent: 20, RemainingPercent: 80, SampledAt: quotaAt,
+	}}}
+	credential := &codexauth.Credential{
+		Type: "codex", AccessToken: "quota-access", RefreshToken: "quota-refresh",
+		Expired: base.Add(time.Hour).Format(time.RFC3339), AccountID: "quota-cas-account",
+		QuotaCostUsage: reconcileOAuthQuotaCostUsage(nil, active, quotaAt),
+	}
+	channel, _, err := createOrUpdateCodexChannel(ctx, store, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner := *credential
+	used := 30.0
+	winner.QuotaCostUsage = oauthcost.ReconcilePartial(credential.QuotaCostUsage, []oauthcost.Sample{{
+		Key: "codex-spark|primary", Family: oauthcost.FamilySpark, WindowSeconds: 18000,
+		ResetAt: base.Add(time.Hour), UsedPercent: &used, SampledAt: passiveAt,
+	}}, passiveAt)
+	if _, err := oauthcost.AddStandardCost(winner.QuotaCostUsage, passiveAt, "gpt-5.3-codex-spark", 2_000_000); err != nil {
+		t.Fatal(err)
+	}
+	winnerJSON, err := winner.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raceStore := &concurrentOAuthWinnerStore{Store: store, authType: model.AuthTypeCodexOAuth, winnerJSON: winnerJSON}
+	server := &Server{store: raceStore}
+	if _, err := server.persistOAuthUsage(ctx, channel, active, base, completedAt); err != nil {
+		t.Fatal(err)
+	}
+	gotCfg, err := store.GetConfig(ctx, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := codexauth.ParseCredential([]byte(gotCfg.OAuthCredential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spark := oauthcost.Find(got.QuotaCostUsage, "codex-spark|primary"); spark == nil ||
+		spark.StandardCostMicroUSD != 2_000_000 || spark.SampledUpstreamAtUnixNano != passiveAt.UnixNano() {
+		t.Fatalf("active CAS retry deleted newer passive Spark cost: %+v", spark)
+	}
+}
+
 func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -5901,9 +6518,14 @@ func TestHandleOAuthUsageReturnsRawCredentialRefreshResponse(t *testing.T) {
 func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
+	sonnetResetAt := time.Now().UTC().Add(7 * 24 * time.Hour).Unix()
 	credential := &anthropicauth.Credential{
 		Type: anthropicauth.ChannelType, AccessToken: "passive-access", RefreshToken: "passive-refresh",
 		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), AccountUUID: "passive-account", PlanType: "Max 20x",
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
+			Key: "claude sonnet|seven_day_sonnet", Family: oauthcost.FamilySonnet, WindowSeconds: 604800,
+			StartedAt: sonnetResetAt - 604800, ResetAt: sonnetResetAt, StandardCostMicroUSD: 2_000_000,
+		}}},
 	}
 	olderTime := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
 	activeSnapshot, err := json.Marshal(persistedOAuthUsageSnapshot{
@@ -5951,6 +6573,9 @@ func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t 
 		t.Fatalf("parse persisted credential: %v", err)
 	}
 	usage := persistedCredential.PassiveUsage
+	if sonnet := oauthcost.Find(persistedCredential.QuotaCostUsage, "claude sonnet|seven_day_sonnet"); sonnet == nil || sonnet.StandardCostMicroUSD != 2_000_000 {
+		t.Fatalf("passive headers deleted the independent Sonnet weekly counter: %+v", sonnet)
+	}
 	if usage == nil || usage.FiveHour == nil || usage.FiveHour.Utilization == nil || *usage.FiveHour.Utilization != 0.25 ||
 		usage.FiveHour.ResetAt == nil || *usage.FiveHour.ResetAt != reset5h || usage.FiveHour.SampledAt == "" || usage.SevenDay == nil ||
 		usage.SevenDay.SampledAt == "" ||
@@ -5991,6 +6616,12 @@ func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t 
 	nextWindow.Header.Set(anthropicRateLimit5hUtilization, "0.1")
 	nextWindow.Header.Set(anthropicRateLimit5hReset, strconv.FormatInt(time.Now().UTC().Add(5*time.Hour).Unix(), 10))
 	server.persistAnthropicPassiveUsage(context.Background(), channel, nextWindow)
+	if err := store.AddLog(context.Background(), &model.LogEntry{
+		Time: model.JSONTime{Time: time.Now().UTC()}, ChannelID: channel.ID,
+		Model: "claude-sonnet-4-6", StatusCode: http.StatusOK, Cost: 0.25,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	persisted, err = store.GetConfig(context.Background(), channel.ID)
 	if err != nil {
 		t.Fatalf("get reset passive usage: %v", err)
@@ -6004,6 +6635,9 @@ func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t 
 		persistedCredential.PassiveUsage.SevenDayOverageIncluded.SampledAt != usage.SevenDayOverageIncluded.SampledAt ||
 		oauthcost.Find(persistedCredential.QuotaCostUsage, oauthcost.Key("", "seven_day")) == nil {
 		t.Fatalf("passive usage after 5h window reset = %#v, %v", persistedCredential.PassiveUsage, err)
+	}
+	if sonnet := oauthcost.Find(persistedCredential.QuotaCostUsage, "claude sonnet|seven_day_sonnet"); sonnet == nil || sonnet.StandardCostMicroUSD != 2_250_000 || sonnet.ResetAt != sonnetResetAt {
+		t.Fatalf("Sonnet weekly cost did not continue after a five-hour-only update: %+v", sonnet)
 	}
 }
 
@@ -6224,7 +6858,8 @@ func TestAnthropicOAuthManagerValidatesCombinedCodeStateAndCreatesChannel(t *tes
 				t.Fatalf("status=%+v exchanged state=%q", status, exchangedState)
 			}
 			channel, getErr := store.GetConfig(context.Background(), status.ChannelID)
-			if getErr != nil || !channel.UsesAnthropicOAuth() || len(channel.ModelEntries) != len(anthropicOAuthDefaultModels) {
+			if getErr != nil || !channel.UsesAnthropicOAuth() || !channel.SupportsModel("claude-fable-5-1") ||
+				len(channel.ModelEntries) != len(anthropicOAuthDefaultModels) {
 				t.Fatalf("created channel=%+v err=%v", channel, getErr)
 			}
 			break
@@ -6637,7 +7272,7 @@ func TestMergeCodexPassiveUsageIgnoresResetJitterWithinSamePeriod(t *testing.T) 
 	}
 }
 
-func TestTrackedOAuthProvidersResetAllCostWindowsOnUsageRollback(t *testing.T) {
+func TestTrackedOAuthProvidersResetOnlyRolledBackCostWindows(t *testing.T) {
 	t.Parallel()
 	providers := []string{
 		codexauth.ChannelType,
@@ -6672,11 +7307,13 @@ func TestTrackedOAuthProvidersResetAllCostWindowsOnUsageRollback(t *testing.T) {
 					LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAt: weeklyResetAt.Add(24 * time.Hour).Unix(), SampledAt: resetSampledAt},
 			}}
 			usage = reconcileOAuthQuotaCostUsage(usage, reset, resetSampledAt)
-			for _, kind := range []string{"five_hour", "weekly"} {
-				window := oauthcost.Find(usage, oauthcost.Key("account", kind))
-				if window == nil || window.StandardCostMicroUSD != 0 || window.CountFromAt != resetSampledAt.Unix() {
-					t.Fatalf("window %q did not follow provider reset: %#v", kind, window)
-				}
+			fiveHour := oauthcost.Find(usage, oauthcost.Key("account", "five_hour"))
+			weekly := oauthcost.Find(usage, oauthcost.Key("account", "weekly"))
+			if fiveHour == nil || fiveHour.StandardCostMicroUSD != 1_000_000 || fiveHour.CountFromAt != 0 {
+				t.Fatalf("unrolled 5-hour window followed weekly reset: %#v", fiveHour)
+			}
+			if weekly == nil || weekly.StandardCostMicroUSD != 0 || weekly.CountFromAt != resetSampledAt.Unix() {
+				t.Fatalf("weekly window did not reset: %#v", weekly)
 			}
 		})
 	}
@@ -6704,15 +7341,17 @@ func TestXAIAccountingFallbackDetectsUsageRollback(t *testing.T) {
 	summary.XAIBilling.WeeklyUsagePercent = &weeklyUsed
 	resetSampledAt := now.Add(time.Hour)
 	usage = reconcileOAuthQuotaCostUsage(usage, summary, resetSampledAt)
-	for _, kind := range []string{"weekly", "monthly"} {
-		window := oauthcost.Find(usage, oauthcost.Key("xai", kind))
-		if window == nil || window.StandardCostMicroUSD != 0 || window.CountFromAt != resetSampledAt.Unix() {
-			t.Fatalf("xAI %s fallback did not follow provider reset: %#v", kind, window)
-		}
+	weekly := oauthcost.Find(usage, oauthcost.Key("xai", "weekly"))
+	monthly := oauthcost.Find(usage, oauthcost.Key("xai", "monthly"))
+	if weekly == nil || weekly.StandardCostMicroUSD != 0 || weekly.CountFromAt != resetSampledAt.Unix() {
+		t.Fatalf("xAI weekly fallback did not reset: %#v", weekly)
+	}
+	if monthly == nil || monthly.StandardCostMicroUSD != 1_000_000 || monthly.CountFromAt != 0 {
+		t.Fatalf("xAI monthly was reset with weekly: %#v", monthly)
 	}
 }
 
-func TestAnthropicPassiveUsageKeepsSiblingSampleTimesAcrossAccountReset(t *testing.T) {
+func TestAnthropicPassiveUsageKeepsSiblingCostAcrossWeeklyRollback(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.August, 24, 2, 0, 0, 0, time.UTC)
 	fiveHourResetAt := now.Add(4 * time.Hour).Unix()
@@ -6731,25 +7370,32 @@ func TestAnthropicPassiveUsageKeepsSiblingSampleTimesAcrossAccountReset(t *testi
 		t.Fatalf("seed cost = (%t, %v)", changed, err)
 	}
 
-	accountResetAt := now.Add(time.Hour)
-	credential.PassiveUsage.SevenDay = window(0.05, accountResetAt.Add(7*24*time.Hour).Unix(), accountResetAt)
-	usage = reconcileOAuthQuotaCostUsage(usage, anthropicPassiveUsageSummary(credential), accountResetAt)
+	weeklyRolledAt := now.Add(time.Hour)
+	credential.PassiveUsage.SevenDay = window(0.05, weeklyRolledAt.Add(7*24*time.Hour).Unix(), weeklyRolledAt)
+	usage = reconcileOAuthQuotaCostUsage(usage, anthropicPassiveUsageSummary(credential), weeklyRolledAt)
 	fiveHour := oauthcost.Find(usage, oauthcost.Key("", "five_hour"))
-	if fiveHour == nil || fiveHour.SampledUpstreamUsedPercent != nil ||
-		fiveHour.SampledUpstreamAtUnixNano != accountResetAt.UnixNano() {
-		t.Fatalf("stale Anthropic sibling established an old baseline: %#v", fiveHour)
+	weekly := oauthcost.Find(usage, oauthcost.Key("", "seven_day"))
+	if fiveHour == nil || fiveHour.StandardCostMicroUSD != 1_000_000 ||
+		fiveHour.SampledUpstreamUsedPercent == nil || *fiveHour.SampledUpstreamUsedPercent != 80 {
+		t.Fatalf("unrolled Anthropic 5-hour window followed weekly reset: %#v", fiveHour)
 	}
-	if changed, err := oauthcost.AddStandardCost(usage, accountResetAt.Add(time.Second), "claude-opus-4-6", 500_000); err != nil || !changed {
+	if weekly == nil || weekly.StandardCostMicroUSD != 0 || weekly.CountFromAt != weeklyRolledAt.Unix() {
+		t.Fatalf("Anthropic weekly rollback did not reset weekly: %#v", weekly)
+	}
+	if changed, err := oauthcost.AddStandardCost(usage, weeklyRolledAt.Add(time.Second), "claude-opus-4-6", 500_000); err != nil || !changed {
 		t.Fatalf("post-reset cost = (%t, %v)", changed, err)
 	}
 
-	credential.PassiveUsage.FiveHour = window(0.05, accountResetAt.Add(5*time.Hour).Unix(), accountResetAt.Add(time.Minute))
-	usage = reconcileOAuthQuotaCostUsage(usage, anthropicPassiveUsageSummary(credential), accountResetAt.Add(time.Minute))
-	for _, kind := range []string{"five_hour", "seven_day"} {
-		window := oauthcost.Find(usage, oauthcost.Key("", kind))
-		if window == nil || window.StandardCostMicroUSD != 500_000 {
-			t.Fatalf("fresh Anthropic %s sample triggered a second reset: %#v", kind, window)
-		}
+	credential.PassiveUsage.FiveHour = window(0.05, weeklyRolledAt.Add(5*time.Hour).Unix(), weeklyRolledAt.Add(time.Minute))
+	usage = reconcileOAuthQuotaCostUsage(usage, anthropicPassiveUsageSummary(credential), weeklyRolledAt.Add(time.Minute))
+	fiveHour = oauthcost.Find(usage, oauthcost.Key("", "five_hour"))
+	weekly = oauthcost.Find(usage, oauthcost.Key("", "seven_day"))
+	if fiveHour == nil || fiveHour.StandardCostMicroUSD != 0 ||
+		fiveHour.CountFromAt != weeklyRolledAt.Add(time.Minute).Unix() {
+		t.Fatalf("fresh Anthropic 5-hour rollback was not isolated: %#v", fiveHour)
+	}
+	if weekly == nil || weekly.StandardCostMicroUSD != 500_000 {
+		t.Fatalf("fresh Anthropic 5-hour sample reset weekly again: %#v", weekly)
 	}
 }
 

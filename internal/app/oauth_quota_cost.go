@@ -145,6 +145,9 @@ func reconcileOAuthQuotaCostUsage(
 	summary *oauthUsageSummary,
 	observedAt time.Time,
 ) *oauthcost.Usage {
+	if summary != nil && summary.Partial {
+		return oauthcost.ReconcilePartial(current, oauthQuotaSamples(summary), observedAt)
+	}
 	return oauthcost.Reconcile(current, oauthQuotaSamples(summary), observedAt)
 }
 
@@ -156,6 +159,93 @@ func oauthQuotaSamples(summary *oauthUsageSummary) []oauthcost.Sample {
 	}
 	snapshot := oauthQuotaSnapshotSummary(summary)
 	return snapshot.Samples()
+}
+
+// pruneCodexPassiveQuotaCostUsage mirrors ReplaceScopes for cost windows.
+// ReconcilePartial intentionally retains omitted siblings; a marked passive
+// scope is the one exception where omitted keys in that scope are stale and
+// must be retired. Scope and limit-name matching cover both current records
+// and legacy records whose scope metadata is incomplete.
+func pruneCodexPassiveQuotaCostUsage(
+	usage *oauthcost.Usage,
+	current *codexauth.PassiveUsage,
+	update codexPassiveUsageUpdate,
+) *oauthcost.Usage {
+	if usage == nil || len(update.ReplaceScopes) == 0 {
+		return usage
+	}
+	scopes := make(map[string]struct{}, len(update.ReplaceScopes))
+	for _, scope := range update.ReplaceScopes {
+		scope = strings.ToLower(strings.TrimSpace(scope))
+		if scope != "" {
+			scopes[scope] = struct{}{}
+		}
+	}
+	if len(scopes) == 0 {
+		return usage
+	}
+	incomingKeys := make(map[string]struct{}, len(update.Windows))
+	incomingLimitNames := make(map[string]struct{}, len(update.Windows))
+	for _, window := range update.Windows {
+		key := oauthcost.Key(window.LimitName, window.Kind)
+		if key == "" {
+			continue
+		}
+		incomingKeys[key] = struct{}{}
+		if scope := codexPassiveWindowScope(window); scope != "" {
+			if _, replace := scopes[scope]; replace {
+				if limitName := strings.ToLower(strings.TrimSpace(window.LimitName)); limitName != "" {
+					incomingLimitNames[limitName] = struct{}{}
+				}
+			}
+		}
+	}
+	currentScopes := make(map[string]string)
+	if current != nil {
+		for _, window := range current.Windows {
+			key := oauthcost.Key(window.LimitName, window.Kind)
+			if key != "" {
+				currentScopes[key] = codexPassiveWindowScope(window)
+			}
+		}
+	}
+	// ReconcilePartial can reject an old layout using a newer active sample.
+	// Its scope must then survive this pruning step as well.
+	if sampledAt, err := time.Parse(time.RFC3339Nano, update.SampledAt); err == nil {
+		for _, window := range usage.Windows {
+			if window != nil && window.SampledUpstreamAtUnixNano > sampledAt.UnixNano() {
+				delete(scopes, currentScopes[window.Key])
+				limitName := strings.ToLower(strings.TrimSpace(strings.SplitN(window.Key, "|", 2)[0]))
+				delete(incomingLimitNames, limitName)
+			}
+		}
+	}
+	retained := usage.Windows[:0]
+	for _, window := range usage.Windows {
+		if window == nil {
+			retained = append(retained, window)
+			continue
+		}
+		limitName := strings.ToLower(strings.TrimSpace(strings.SplitN(window.Key, "|", 2)[0]))
+		_, replaceByScope := scopes[currentScopes[window.Key]]
+		_, replaceByLimit := incomingLimitNames[limitName]
+		if replaceByScope || replaceByLimit {
+			if _, incoming := incomingKeys[window.Key]; !incoming {
+				continue
+			}
+		}
+		retained = append(retained, window)
+	}
+	usage.Windows = retained
+	return usage
+}
+
+func codexPassiveWindowScope(window codexauth.PassiveUsageWindow) string {
+	scope := strings.ToLower(strings.TrimSpace(window.Scope))
+	if scope == "" {
+		scope = strings.ToLower(strings.TrimSpace(window.LimitName))
+	}
+	return scope
 }
 
 // oauthQuotaSnapshotSummary 把内存里的采样摘要投影成 oauthcost 的快照形状，
@@ -206,7 +296,8 @@ func attachOAuthQuotaCostUsage(summary *oauthUsageSummary, usage *oauthcost.Usag
 		copy(windows, summary.Windows)
 		for i := range windows {
 			windows[i].StandardCostMicroUSD = nil
-			if window := oauthcost.Find(usage, oauthcost.Key(windows[i].LimitName, windows[i].Kind)); window != nil {
+			if window := oauthcost.Find(usage, oauthcost.Key(windows[i].LimitName, windows[i].Kind)); window != nil &&
+				oauthQuotaCostMatchesSampledWindow(windows[i], window) {
 				cost := window.StandardCostMicroUSD
 				windows[i].StandardCostMicroUSD = &cost
 			}
@@ -214,6 +305,19 @@ func attachOAuthQuotaCostUsage(summary *oauthUsageSummary, usage *oauthcost.Usag
 		clone.Windows = windows
 	}
 	return &clone
+}
+
+func oauthQuotaCostMatchesSampledWindow(sample oauthUsageWindow, cost *oauthcost.Window) bool {
+	if cost == nil || cost.WindowSeconds <= 0 || cost.ResetAt <= 0 || sample.ResetAt <= 0 {
+		return false
+	}
+	var delta uint64
+	if cost.ResetAt >= sample.ResetAt {
+		delta = uint64(cost.ResetAt) - uint64(sample.ResetAt)
+	} else {
+		delta = uint64(sample.ResetAt) - uint64(cost.ResetAt)
+	}
+	return delta <= uint64(cost.WindowSeconds-1)/2
 }
 
 func (s *Server) resetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error {

@@ -279,6 +279,16 @@ func (s *Server) forwardCursorAgent(
 		}
 		flush()
 	}
+	writePing := func() {
+		if !streaming || responseTransformErr != nil {
+			return
+		}
+		ensureStream()
+		// Responses translation swallows SSE comments; write the keepalive
+		// directly so clients still see traffic before the first token.
+		_, _ = w.Write(cursorStreamPing(format))
+		flush()
+	}
 
 	var runErr error
 	var usage *cursorauth.Usage
@@ -331,6 +341,10 @@ func (s *Server) forwardCursorAgent(
 		replayed = replayed || event.Replayed
 		if event.ToolCall != nil {
 			calls = append(calls, *event.ToolCall)
+		}
+		if event.Ping {
+			timeoutCtx.stopFirstByteTimer()
+			writePing()
 		}
 		if streaming && event.Delta != "" {
 			writeStream(event.Delta)
@@ -589,16 +603,28 @@ func cursorAnthropicDelta(text string) []byte {
 	return []byte("event: content_block_delta\ndata: " + string(payload) + "\n\n")
 }
 
+func cursorStreamPing(format string) []byte {
+	if format == "anthropic" {
+		return []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
+	}
+	return []byte(": ping\n\n")
+}
+
+func normalizedCursorToolArguments(raw json.RawMessage) json.RawMessage {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || !json.Valid(raw) {
+		return json.RawMessage(`{}`)
+	}
+	return json.RawMessage(bytes.Clone(raw))
+}
+
 func cursorAnthropicStreamFinish(calls []cursorauth.ToolCall, usage *cursorauth.Usage) []byte {
 	var b bytes.Buffer
 	stop, _ := json.Marshal(map[string]any{"type": "content_block_stop", "index": 0})
 	b.WriteString("event: content_block_stop\ndata: " + string(stop) + "\n\n")
 	for i, call := range calls {
 		blockIndex := i + 1
-		input := json.RawMessage(`{}`)
-		if len(call.Arguments) > 0 {
-			input = call.Arguments
-		}
+		input := normalizedCursorToolArguments(call.Arguments)
 		start, _ := json.Marshal(map[string]any{
 			"type": "content_block_start", "index": blockIndex,
 			"content_block": map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": map[string]any{}},
@@ -633,10 +659,7 @@ func cursorAnthropicMessage(id, modelID, text string, calls []cursorauth.ToolCal
 		content = append(content, map[string]any{"type": "text", "text": text})
 	}
 	for _, call := range calls {
-		var input any
-		if len(call.Arguments) == 0 || json.Unmarshal(call.Arguments, &input) != nil {
-			input = map[string]any{}
-		}
+		input := normalizedCursorToolArguments(call.Arguments)
 		content = append(content, map[string]any{
 			"type": "tool_use", "id": call.ID, "name": call.Name, "input": input,
 		})

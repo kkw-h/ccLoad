@@ -90,7 +90,6 @@ func modelsForProvider(provider string) [][]*ModelInfo {
 
 func cloneModelInfo(model *ModelInfo) *ModelInfo {
 	clone := *model
-	clone.SupportedParameters = append([]string(nil), model.SupportedParameters...)
 	if model.Thinking != nil {
 		thinking := *model.Thinking
 		thinking.Levels = append([]string(nil), model.Thinking.Levels...)

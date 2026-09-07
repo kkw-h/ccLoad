@@ -1,12 +1,12 @@
 module ccLoad
 
-go 1.26.0
+go 1.27.0
 
 require (
 	connectrpc.com/connect v1.20.0
 	github.com/alicebob/miniredis/v2 v2.38.0
-	github.com/andybalholm/brotli v1.2.2
-	github.com/bytedance/sonic v1.15.2
+	github.com/andybalholm/brotli v1.2.3
+	github.com/bytedance/sonic v1.15.3
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/goccy/go-yaml v1.19.2
@@ -16,10 +16,10 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/klauspost/compress v1.19.2
 	github.com/pierrec/xxHash v0.1.5
-	github.com/redis/go-redis/v9 v9.21.0
 	github.com/refraction-networking/utls v1.8.2
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
+	github.com/yuin/gopher-lua v1.1.1
 	golang.org/x/crypto v0.55.0
 	golang.org/x/mod v0.40.0
 	golang.org/x/net v0.58.0
@@ -33,7 +33,6 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
 	github.com/bytedance/sonic/loader v0.5.2 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.7 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.15 // indirect
@@ -60,13 +59,12 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.2 // indirect
-	github.com/yuin/gopher-lua v1.1.1 // indirect
-	go.mongodb.org/mongo-driver/v2 v2.8.1 // indirect
+	go.mongodb.org/mongo-driver/v2 v2.8.2 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/arch v0.30.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	modernc.org/libc v1.75.5 // indirect
+	modernc.org/libc v1.75.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )

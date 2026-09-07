@@ -1190,9 +1190,9 @@ func TestHandleChannelTest(t *testing.T) {
 	}
 }
 
-func TestChannelTestCodexStopsAfterResponseCompleted(t *testing.T) {
-	streamBody := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"created_at\":1784768634,\"model\":\"gpt-5.6-sol\"}}\n\n" +
-		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" +
+func TestChannelTestCodexRepairsMalformedFramesAndStopsAfterResponseCompleted(t *testing.T) {
+	streamBody := []byte("\xef\xbb\xbf : ping\nevent: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"created_at\":1784768634,\"model\":\"gpt-5.6-sol\"}}\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"created_at\":1784768634,\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n")
 
 	tests := []struct {
@@ -2858,8 +2858,8 @@ func TestHandleChannelTest_CodexOAuthTransformsOpenAIWithoutSSEContentType(t *te
 		if err != nil {
 			t.Errorf("read upstream body: %v", err)
 		}
-		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n")
-		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"translated answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"translated answer\"}\n")
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
 	}))
 
@@ -3239,7 +3239,7 @@ func TestHandleChannelTest_UsesSelectedCodexProtocolWithBasePathPrefix(t *testin
 	}
 	if gotHeaders.Get("User-Agent") != codexUserAgent ||
 		gotHeaders.Get("Originator") != codexOriginator ||
-		gotHeaders.Get("Version") != codexVersion {
+		gotHeaders.Get("Version") != "" {
 		t.Fatalf("Codex identity headers=%v", gotHeaders)
 	}
 	if got := gotHeaders.Get("X-Codex-Turn-State"); got != "turn-state" {
@@ -5533,8 +5533,8 @@ func TestHandleChannelImageGeneration_XAIOAuthGrok46UsesResponsesImageTool(t *te
 			t.Errorf("decode xAI Responses request: %v", err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"created_at":1770000000,"output":[],"tool_usage":{"image_gen":{"total_tokens":9}}}}`+"\n\n")
-		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"aW1hZ2U=","output_format":"png"}}`+"\n\n")
+		_, _ = io.WriteString(w, `event: response.completed`+"\n"+`data: {"type":"response.completed","response":{"created_at":1770000000,"output":[],"tool_usage":{"image_gen":{"total_tokens":9}}}}`+"\n")
+		_, _ = io.WriteString(w, `event: response.output_item.done`+"\n"+`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"aW1hZ2U=","output_format":"png"}}`+"\n\n")
 	}))
 	defer upstream.Close()
 
@@ -5954,6 +5954,100 @@ func TestBuildTestUpstreamRequestPlanKeepsThinkingSuffixAcrossCodexTransform(t *
 	}
 	if effort := gjson.GetBytes(plan.requestBody, "reasoning.effort").String(); effort != "high" {
 		t.Fatalf("reasoning.effort=%q, want high. body=%s", effort, plan.requestBody)
+	}
+}
+
+func TestBuildTestUpstreamRequestPlanZedHaikuDoesNotInheritCodexThinkingBudget(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1485, Name: "zed-haiku", AuthType: model.AuthTypeZedOAuth,
+		URLs:                  model.ChannelURLs{{URL: "https://cloud.zed.dev/completions#", Exact: true, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "claude-haiku-4-5"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-haiku-4-5", Content: "2025 年 1 月 20 日发生了什么大事？不允许联网", ClientProtocol: util.ProtocolOpenAI,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "zed-jwt", testReq, testReq.Model,
+		util.ProtocolOpenAI, util.ProtocolCodex, "https://cloud.zed.dev/completions#",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	provider := gjson.GetBytes(plan.requestBody, "provider_request")
+	if gjson.GetBytes(plan.requestBody, "provider").String() != "anthropic" {
+		t.Fatalf("provider=%s body=%s", gjson.GetBytes(plan.requestBody, "provider").Raw, plan.requestBody)
+	}
+	system := provider.Get("system").Raw
+	if strings.Contains(system, "You are Codex") {
+		t.Fatalf("Zed Anthropic test inherited Codex tester instructions: %s", plan.requestBody)
+	}
+	if thinking := provider.Get("thinking"); thinking.Exists() {
+		t.Fatalf("openai client test must not inherit Codex template thinking: %s", provider.Raw)
+	}
+}
+
+func TestBuildTestUpstreamRequestPlanZedPreservesThinkingBodyRule(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1487, Name: "zed-haiku-body-rule", AuthType: model.AuthTypeZedOAuth,
+		URLs:                  model.ChannelURLs{{URL: "https://cloud.zed.dev/completions#", Exact: true, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "claude-haiku-4-5"}},
+		CustomRequestRules: &model.CustomRequestRules{Body: []model.CustomBodyRule{{
+			Action: model.RuleActionOverride, Path: "reasoning.effort", Value: json.RawMessage(`"high"`),
+		}}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-haiku-4-5", Content: "hello", ClientProtocol: util.ProtocolOpenAI,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "zed-jwt", testReq, testReq.Model,
+		util.ProtocolOpenAI, util.ProtocolCodex, "https://cloud.zed.dev/completions#",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	thinking := gjson.GetBytes(plan.requestBody, "provider_request.thinking")
+	if thinking.Get("type").String() != "enabled" || thinking.Get("budget_tokens").Int() <= 0 {
+		t.Fatalf("body rule thinking was dropped: %s", plan.requestBody)
+	}
+}
+
+func TestBuildTestUpstreamRequestPlanZedHaikuKeepsExplicitThinkingSuffix(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1486, Name: "zed-haiku-suffix", AuthType: model.AuthTypeZedOAuth,
+		URLs:                  model.ChannelURLs{{URL: "https://cloud.zed.dev/completions#", Exact: true, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "claude-haiku-4-5"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-haiku-4-5", Content: "hello", ClientProtocol: util.ProtocolOpenAI,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "zed-jwt", testReq, "claude-haiku-4-5(medium)",
+		util.ProtocolOpenAI, util.ProtocolCodex, "https://cloud.zed.dev/completions#",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	provider := gjson.GetBytes(plan.requestBody, "provider_request")
+	budget := provider.Get("thinking.budget_tokens").Int()
+	maxTokens := provider.Get("max_tokens").Int()
+	if provider.Get("thinking.type").String() != "enabled" || budget <= 0 {
+		t.Fatalf("explicit thinking suffix missing: %s", provider.Raw)
+	}
+	if maxTokens <= budget {
+		t.Fatalf("max_tokens=%d must be greater than thinking.budget_tokens=%d; body=%s", maxTokens, budget, provider.Raw)
+	}
+	// budget+1 曾经满足 > 检查但只留 1 token 可见输出——收紧到有意义的预算。
+	if visible := maxTokens - budget; visible < 1024 {
+		t.Fatalf("visible output budget=%d is too small (max_tokens=%d budget=%d)", visible, maxTokens, budget)
 	}
 }
 

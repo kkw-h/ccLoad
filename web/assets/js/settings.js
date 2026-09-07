@@ -243,7 +243,8 @@ const runtimeMetricDomains = [
       { key: 'heap_sys_bytes', labelKey: 'settings.runtimeMetrics.metric.heapSysBytes', format: 'bytes' },
       { key: 'gc_count', labelKey: 'settings.runtimeMetrics.metric.gcCount' },
       { key: 'gc_pause_total_ns', labelKey: 'settings.runtimeMetrics.metric.gcPauseTotal', format: 'durationNs' },
-      { key: 'gc_cpu_percent', labelKey: 'settings.runtimeMetrics.metric.gcCpuPercent', format: 'percent' }
+      { key: 'gc_cpu_percent', labelKey: 'settings.runtimeMetrics.metric.gcCpuPercent', format: 'percent' },
+      { key: 'sse_framing_repairs', labelKey: 'settings.runtimeMetrics.metric.sseFramingRepairs' }
     ]
   },
   {
@@ -756,6 +757,10 @@ function closeMultimodalFallbackModal() {
 }
 
 function addMultimodalFallbackRow() {
+  // 现有行的选择值由 DOM 持有；追加后会全量重绘，先把用户编辑同步回草稿，
+  // 否则重绘会用打开弹窗时的旧值覆盖现有行。
+  const container = document.getElementById('multimodalFallbackRows');
+  if (container) multimodalFallbackDraft = collectMultimodalFallbackDraft();
   if (multimodalFallbackDraft.length >= maxMultimodalFallbackMappings) {
     showMultimodalFallbackError(t('settings.multimodalFallback.errorLimit', { max: maxMultimodalFallbackMappings }));
     return;
@@ -765,6 +770,8 @@ function addMultimodalFallbackRow() {
 }
 
 function removeMultimodalFallbackRow(row) {
+  const container = document.getElementById('multimodalFallbackRows');
+  if (container) multimodalFallbackDraft = collectMultimodalFallbackDraft();
   const index = Array.from(row.parentNode?.children || []).indexOf(row);
   if (index >= 0) multimodalFallbackDraft.splice(index, 1);
   row.remove();
@@ -1185,7 +1192,7 @@ function getSettingGroupInfo(key) {
   const defs = [
     { id: 'advanced', nameKey: 'settings.group.advanced', order: 70, match: () => advancedSettingKeys.has(k) },
     { id: 'channel', nameKey: 'settings.group.channel', order: 10, match: () => k.startsWith('channel_') || k === 'max_key_retries' },
-    { id: 'model', nameKey: 'settings.group.model', order: 15, match: () => k.startsWith('model_') },
+
     { id: 'upstream-connection', nameKey: 'settings.group.upstreamConnection', order: 19, match: () => k === 'upstream_connection_reuse_limit_seconds' || oauthBaseURLSettingKeys.has(k) },
     { id: 'websocket', nameKey: 'settings.group.websocket', order: 25, match: () => k.startsWith('responses_ws_') },
     { id: 'stream-timeout', nameKey: 'settings.group.streamTimeout', order: 20, match: () => k === 'stream_timeout' || k.endsWith('_first_byte_timeout') },
@@ -1201,7 +1208,7 @@ function getSettingGroupInfo(key) {
   for (const d of defs) {
     if (d.match()) return { ...d, name: t(d.nameKey) };
   }
-  return { id: 'other', nameKey: 'settings.group.other', name: t('settings.group.other'), order: 999 };
+  return { id: 'advanced', nameKey: 'settings.group.advanced', name: t('settings.group.advanced'), order: 70 };
 }
 
 function getSettingOrder(key) {

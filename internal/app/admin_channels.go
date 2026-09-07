@@ -348,6 +348,43 @@ type channelEnrichmentContext struct {
 
 // enrichChannel 把单个 cfg 拼装为 ChannelWithCooldown：
 // 渠道冷却剩余时间、健康度模式下的有效优先级与成功率、Key 策略、Key 与模型冷却详情。
+// channelCostMultiplierRange 返回渠道成本倍率区间。
+// api_key 渠道取未禁用 Key 的 min/max（无启用 Key 时回退渠道列）；OAuth 渠道即渠道列。
+func channelCostMultiplierRange(cfg *model.Config, apiKeys []*model.APIKey) (float64, float64) {
+	if cfg.AuthType == model.AuthTypeAPIKey {
+		var minValue, maxValue float64
+		hasEnabled := false
+		for _, key := range apiKeys {
+			if key.Disabled {
+				continue
+			}
+			v := key.CostMultiplier
+			if v < 0 {
+				v = 1
+			}
+			if !hasEnabled {
+				minValue, maxValue = v, v
+				hasEnabled = true
+				continue
+			}
+			if v < minValue {
+				minValue = v
+			}
+			if v > maxValue {
+				maxValue = v
+			}
+		}
+		if hasEnabled {
+			return minValue, maxValue
+		}
+	}
+	m := cfg.CostMultiplier
+	if m < 0 {
+		m = 1
+	}
+	return m, m
+}
+
 func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWithCooldown {
 	metadata := channelOAuthMetadataFromCredential(cfg)
 	oc := ChannelWithCooldown{
@@ -383,6 +420,14 @@ func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWi
 
 	// Key 策略属于渠道行为，详情和列表都必须返回同一语义。
 	oc.KeyStrategy = channelKeyStrategy(apiKeys)
+
+	// 成本倍率区间角标：api_key 渠道按启用 Key 计算，OAuth 渠道即渠道倍率。
+	multiplierMin, multiplierMax := channelCostMultiplierRange(cfg, apiKeys)
+	if multiplierMin != 1 || multiplierMax != 1 {
+		minValue, maxValue := multiplierMin, multiplierMax
+		oc.CostMultiplierMin = &minValue
+		oc.CostMultiplierMax = &maxValue
+	}
 
 	keyCooldowns := make([]KeyCooldownInfo, 0, len(apiKeys))
 	channelKeyCooldowns := ectx.keyCooldownsMap[cfg.ID]
@@ -665,22 +710,18 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "OAuth channels must be created by login or credential import")
 		return
 	}
-	managementRaw, err := prepareChannelManagementCreate(&req)
-	if err != nil {
-		RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
-		return
-	}
-
 	// 创建渠道（不包含API Key）
 	created, err := s.store.CreateConfig(c.Request.Context(), req.ToConfig())
 	if err != nil {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
-	if err := s.saveCreatedChannelManagement(c.Request.Context(), created, managementRaw); err != nil {
-		s.rollbackCreatedChannel(c.Request.Context(), created.ID)
-		RespondErrorMsg(c, http.StatusInternalServerError, "failed to save management account")
-		return
+	if req.managementAccountSet {
+		if _, err := s.channelManagement.SaveSettings(c.Request.Context(), created, req.ManagementAccount); err != nil {
+			s.rollbackCreatedChannel(c.Request.Context(), created.ID)
+			respondChannelManagementError(c, err)
+			return
+		}
 	}
 
 	keyStrategy := strings.TrimSpace(req.KeyStrategy)
@@ -701,6 +742,7 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 			ModelScopeEmpty: entry.ModelScopeEmpty,
 			KeyStrategy:     keyStrategy,
 			Disabled:        entry.ModelScopeEmpty,
+			CostMultiplier:  apiKeyCostMultiplier(entry),
 			CreatedAt:       model.JSONTime{Time: now},
 			UpdatedAt:       model.JSONTime{Time: now},
 		})
@@ -826,59 +868,68 @@ func channelKeysForAdmin(cfg *model.Config, storedKeys []*model.APIKey) ([]*mode
 		return storedKeys, nil
 	}
 
-	var accessToken, note string
+	accessToken, note, err := oauthSyntheticKeyFields(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return []*model.APIKey{{
+		ChannelID:      cfg.ID,
+		KeyIndex:       0,
+		APIKey:         util.MaskAPIKey(accessToken),
+		Note:           note,
+		KeyStrategy:    model.KeyStrategySequential,
+		CostMultiplier: cfg.CostMultiplier,
+	}}, nil
+}
+
+// oauthSyntheticKeyFields 解析 OAuth 渠道凭证，返回合成 Key 行所需的原始凭证值与备注。
+func oauthSyntheticKeyFields(cfg *model.Config) (accessToken, note string, err error) {
 	switch {
 	case cfg.UsesCodexOAuth():
 		credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
-			return nil, err
+			return "", "", err
 		}
-		accessToken, note = credential.AccessToken, codexCredentialKeyNote(credential)
+		return credential.AccessToken, codexCredentialKeyNote(credential), nil
 	case cfg.UsesAntigravityOAuth():
 		credential, err := antigravityauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
-			return nil, err
+			return "", "", err
 		}
-		accessToken, note = credential.AccessToken, "Antigravity OAuth AT"
+		return credential.AccessToken, "Antigravity OAuth AT", nil
 	case cfg.UsesXAIOAuth():
 		credential, err := xaiauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
-			return nil, err
+			return "", "", err
 		}
-		accessToken, note = credential.AccessToken, "xAI OAuth AT"
+		return credential.AccessToken, "xAI OAuth AT", nil
 	case cfg.UsesAnthropicOAuth():
 		credential, err := anthropicauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
-			return nil, err
+			return "", "", err
 		}
-		accessToken, note = credential.AccessToken, "Anthropic OAuth AT"
+		return credential.AccessToken, "Anthropic OAuth AT", nil
 	case cfg.UsesZAIOAuth():
 		credential, err := zaiauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
-			return nil, err
+			return "", "", err
 		}
-		accessToken, note = credential.APIKey, "Z.ai Coding Plan Key"
+		return credential.APIKey, "Z.ai Coding Plan Key", nil
 	case cfg.UsesCursorOAuth():
 		credential, err := cursorauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
-			return nil, err
+			return "", "", err
 		}
-		accessToken, note = credential.AccessToken, "Cursor session"
+		return credential.AccessToken, "Cursor session", nil
 	case cfg.UsesZedOAuth():
 		credential, err := zedauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
-			return nil, err
+			return "", "", err
 		}
-		accessToken, note = credential.AccessToken, "Zed LLM JWT"
+		return credential.AccessToken, "Zed LLM JWT", nil
 	}
-
-	return []*model.APIKey{{
-		ChannelID:   cfg.ID,
-		KeyIndex:    0,
-		APIKey:      util.MaskAPIKey(accessToken),
-		Note:        note,
-		KeyStrategy: model.KeyStrategySequential,
-	}}, nil
+	return "", "", nil
 }
 
 func codexCredentialKeyNote(credential *codexauth.Credential) string {
@@ -1060,12 +1111,36 @@ func (s *Server) handleAPIKeyToggle(c *gin.Context, disable bool) {
 		RespondErrorMsg(c, http.StatusNotFound, "api key not found")
 		return
 	}
-	if !disable && key.ModelScopeEmpty {
-		RespondErrorMsg(c, http.StatusConflict, "configure at least one model or allow all models before enabling this key")
-		return
-	}
 
-	if err := s.store.SetAPIKeyDisabled(c.Request.Context(), id, keyIndex, disable); err != nil {
+	ctx := c.Request.Context()
+	if key.ModelScopeEmpty && disable {
+		// Once an operator explicitly disables an automatically emptied key,
+		// the disabled state is manual. Clear the automatic marker so model
+		// discovery will not treat this key as a usable fallback later.
+		scope := model.APIKeyModelScope{
+			AllowedModels:   append([]string(nil), key.AllowedModels...),
+			ModelScopeEmpty: false,
+			Disabled:        true,
+		}
+		if err := s.store.UpdateAPIKeyModelScopes(ctx, id, map[int]model.APIKeyModelScope{keyIndex: scope}); err != nil {
+			RespondErrorMsg(c, http.StatusInternalServerError, "persist key model scope state failed")
+			return
+		}
+	} else if !disable && key.ModelScopeEmpty {
+		// An empty model scope is an automatic safety disable caused by a
+		// channel model-list change. An explicit enable clears that automatic
+		// marker atomically with the disabled flag. Keep any persisted allowlist
+		// if one exists (the normal empty-scope state has none).
+		scope := model.APIKeyModelScope{
+			AllowedModels:   append([]string(nil), key.AllowedModels...),
+			ModelScopeEmpty: false,
+			Disabled:        false,
+		}
+		if err := s.store.UpdateAPIKeyModelScopes(ctx, id, map[int]model.APIKeyModelScope{keyIndex: scope}); err != nil {
+			RespondErrorMsg(c, http.StatusInternalServerError, "persist key model scope state failed")
+			return
+		}
+	} else if err := s.store.SetAPIKeyDisabled(ctx, id, keyIndex, disable); err != nil {
 		RespondErrorMsg(c, http.StatusInternalServerError, "persist key disabled state failed")
 		return
 	}
@@ -1204,19 +1279,29 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
 			return
 		}
-		if _, _, err := mergeChannelManagementSettings(existing.OAuthCredential, req.ManagementAccount); err != nil {
-			RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
-			return
-		}
 	}
 	if existing.UsesOAuth() {
 		if req.AuthType != existing.GetAuthType() {
 			RespondErrorMsg(c, http.StatusConflict, "OAuth channel auth_type is read-only")
 			return
 		}
-		if len(req.normalizeAPIKeys()) != 0 {
-			RespondErrorMsg(c, http.StatusConflict, "OAuth channel API keys are read-only")
+		// 合成 Key 行最多一条，只用于回传倍率，永不落库；
+		// 其 api_key 必须是当前凭证掩码值，防止借合成行改写凭证，其余 Key 变更一律 409。
+		submittedKeys := req.normalizeAPIKeys()
+		if len(submittedKeys) > 1 {
+			RespondErrorMsg(c, http.StatusConflict, "OAuth channel accepts at most one synthetic API key row")
 			return
+		}
+		if len(submittedKeys) == 1 {
+			accessToken, _, parseErr := oauthSyntheticKeyFields(existing)
+			if parseErr != nil {
+				RespondError(c, http.StatusInternalServerError, parseErr)
+				return
+			}
+			if submittedKeys[0].APIKey != util.MaskAPIKey(accessToken) {
+				RespondErrorMsg(c, http.StatusConflict, "OAuth channel API keys are read-only")
+				return
+			}
 		}
 		if _, submitted := rawReq["key_strategy"]; submitted {
 			RespondErrorMsg(c, http.StatusConflict, "OAuth channel key strategy is read-only")
@@ -1264,6 +1349,26 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.managementAccountSet {
+		// Sub2API login creates a real upstream session. Run it only after every
+		// local channel field has passed validation, so rejected edits have no
+		// remote side effects.
+		candidate := req.ToConfig()
+		candidate.ID = existing.ID
+		candidate.OAuthCredential = existing.OAuthCredential
+		resolvedManagement, resolveErr := s.channelManagement.resolveChannelManagementInput(
+			c.Request.Context(), candidate, req.ManagementAccount,
+		)
+		if resolveErr != nil {
+			respondChannelManagementError(c, resolveErr)
+			return
+		}
+		if _, _, mergeErr := mergeChannelManagementSettings(existing.OAuthCredential, resolvedManagement); mergeErr != nil {
+			RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
+			return
+		}
+		req.ManagementAccount = resolvedManagement
+	}
 
 	// 检测api_key是否变化（需要重建API Keys）
 	if existing.UsesOAuth() {
@@ -1290,10 +1395,14 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 
 	notesByIndex := make(map[int]string)
 	scopesByIndex := make(map[int]model.APIKeyModelScope)
+	multipliersByIndex := make(map[int]float64)
 	if !keyChanged {
 		for i, oldKey := range oldKeys {
 			if oldKey.Note != newKeys[i].Note {
 				notesByIndex[oldKey.KeyIndex] = newKeys[i].Note
+			}
+			if newKeys[i].CostMultiplier != nil && *newKeys[i].CostMultiplier != oldKey.CostMultiplier {
+				multipliersByIndex[oldKey.KeyIndex] = *newKeys[i].CostMultiplier
 			}
 			if !slices.Equal(oldKey.AllowedModels, newKeys[i].AllowedModels) || oldKey.ModelScopeEmpty != newKeys[i].ModelScopeEmpty {
 				scopesByIndex[oldKey.KeyIndex] = model.APIKeyModelScope{
@@ -1309,6 +1418,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	}
 	noteChanged := len(notesByIndex) > 0
 	modelsChanged := len(scopesByIndex) > 0
+	multiplierChanged := len(multipliersByIndex) > 0
 
 	// [INFO] 修复 (2025-10-11): 检测策略变化
 	strategyChanged := false
@@ -1319,6 +1429,20 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			oldStrategy = model.KeyStrategySequential
 		}
 		strategyChanged = oldStrategy != keyStrategy
+	}
+
+	// OAuth 渠道倍率经合成 Key 行回传；未提交时保留现值，避免 UpdateConfig 无条件覆盖成 0。
+	if existing.UsesOAuth() {
+		submitted := req.normalizeAPIKeys()
+		if len(submitted) == 0 || submitted[0].CostMultiplier == nil {
+			multiplier := existing.CostMultiplier
+			if len(submitted) == 0 {
+				req.APIKeys = []ChannelAPIKeyRequest{{CostMultiplier: &multiplier}}
+			} else {
+				submitted[0].CostMultiplier = &multiplier
+				req.APIKeys = submitted
+			}
+		}
 	}
 
 	upd, err := s.store.UpdateConfig(c.Request.Context(), id, req.ToConfig())
@@ -1367,6 +1491,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 				ModelScopeEmpty: key.ModelScopeEmpty,
 				KeyStrategy:     keyStrategy,
 				Disabled:        wasDisabled || key.ModelScopeEmpty,
+				CostMultiplier:  apiKeyCostMultiplier(key),
 				CreatedAt:       model.JSONTime{Time: now},
 				UpdatedAt:       model.JSONTime{Time: now},
 			})
@@ -1387,6 +1512,12 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 				log.Printf("[WARN] 批量更新API Key备注失败 (channel=%d): %v", id, err)
 			}
 		}
+		if multiplierChanged {
+			if err := s.store.UpdateAPIKeyCostMultipliers(c.Request.Context(), id, multipliersByIndex); err != nil {
+				RespondError(c, http.StatusInternalServerError, fmt.Errorf("update API key cost multipliers: %w", err))
+				return
+			}
+		}
 		if modelsChanged {
 			if err := s.store.UpdateAPIKeyModelScopes(c.Request.Context(), id, scopesByIndex); err != nil {
 				RespondError(c, http.StatusInternalServerError, fmt.Errorf("update API key model scopes: %w", err))
@@ -1396,7 +1527,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	}
 	if req.managementAccountSet {
 		if _, err := s.channelManagement.SaveSettings(c.Request.Context(), upd, req.ManagementAccount); err != nil {
-			RespondErrorMsg(c, http.StatusInternalServerError, "failed to save management account")
+			respondChannelManagementError(c, err)
 			return
 		}
 	}
@@ -1932,7 +2063,7 @@ func (s *Server) HandleBatchPatchChannels(c *gin.Context) {
 		return
 	}
 	if result.Updated > 0 {
-		if patch.ModelImportMode != "" {
+		if patch.ModelImportMode != "" || patch.CostMultiplier != nil {
 			for _, channelID := range channelIDs {
 				s.InvalidateAPIKeysCache(channelID)
 			}

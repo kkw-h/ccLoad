@@ -24,6 +24,10 @@ import (
 
 var fetchModelsHTTPStatusPattern = regexp.MustCompile(`HTTP\s+(\d{3})`)
 
+// Bound the whole batch's upstream probing; per-key discovery remains sequential
+// but cannot hold an admin request indefinitely when keys or endpoints hang.
+const batchModelRefreshTimeout = 30 * time.Second
+
 // ============================================================
 // Admin API: 获取渠道可用模型列表
 // ============================================================
@@ -78,6 +82,7 @@ type BatchRefreshModelsItem struct {
 	ChannelName string `json:"channel_name,omitempty"`
 	Status      string `json:"status"` // updated / unchanged / failed
 	Error       string `json:"error,omitempty"`
+	Warning     string `json:"warning,omitempty"`
 	Fetched     int    `json:"fetched"`
 	Added       int    `json:"added,omitempty"`   // merge模式
 	Removed     int    `json:"removed,omitempty"` // replace模式
@@ -212,6 +217,8 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 		stripModelSourcePrefix: req.StripModelSourcePrefix,
 	}
 	ctx := c.Request.Context()
+	fetchCtx, cancelFetch := context.WithTimeout(ctx, batchModelRefreshTimeout)
+	defer cancelFetch()
 
 	results := make([]BatchRefreshModelsItem, 0, len(channelIDs))
 	updated := 0
@@ -233,13 +240,17 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 		}
 		item.ChannelName = cfg.Name
 
-		resp, err := s.fetchModelsForChannel(ctx, cfg, overrideProtocol, false)
+		resp, err := s.fetchModelsForChannel(fetchCtx, cfg, overrideProtocol, true)
 		if err != nil {
 			item.Status = "failed"
 			item.Error = err.Error()
 			failed++
 			results = append(results, item)
 			continue
+		}
+		partialKeyFailure := mode == "replace" && fetchModelsResponseHasKeyErrors(resp)
+		for i := range resp.KeyModels {
+			resp.KeyModels[i].Models = normalizeModelEntriesForSave(resp.KeyModels[i].Models, normalization)
 		}
 
 		fetched := normalizeModelEntriesForSave(resp.Models, normalization)
@@ -261,6 +272,9 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 
 		switch mode {
 		case "replace":
+			if partialKeyFailure {
+				item.Warning = "部分 API Key 模型探测失败，已使用成功 Key 的模型结果覆盖"
+			}
 			removed, hasChange := replaceModelEntries(cfg, fetched, normalization)
 			item.Removed = removed
 			item.Total = len(cfg.ModelEntries)
@@ -273,19 +287,48 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 		}
 
 		scheduledCheckChanged := reconcileScheduledCheckModel(cfg, normalization)
-		if !modelEntriesChanged && !scheduledCheckChanged {
+		var scopeUpdates map[int]model.APIKeyModelScope
+		if mode == "replace" && cfg.GetAuthType() == model.AuthTypeAPIKey {
+			keys, keyErr := s.store.GetAPIKeys(ctx, channelID)
+			if keyErr != nil {
+				item.Status = "failed"
+				item.Error = "读取 API Key 失败: " + keyErr.Error()
+				failed++
+				results = append(results, item)
+				continue
+			}
+			scopeUpdates = buildFetchedAPIKeyModelScopes(keys, cfg.ModelEntries, resp.KeyModels)
+		}
+		scopeChanged := len(scopeUpdates) > 0
+		configChanged := modelEntriesChanged || scheduledCheckChanged
+		if !configChanged && !scopeChanged {
 			item.Status = "unchanged"
 			unchanged++
 			results = append(results, item)
 			continue
 		}
 
-		if _, err := s.store.UpdateConfig(ctx, channelID, cfg); err != nil {
-			item.Status = "failed"
-			item.Error = "保存模型失败: " + err.Error()
-			failed++
-			results = append(results, item)
-			continue
+		if configChanged {
+			if _, err := s.store.UpdateConfig(ctx, channelID, cfg); err != nil {
+				item.Status = "failed"
+				item.Error = "保存模型失败: " + err.Error()
+				failed++
+				results = append(results, item)
+				continue
+			}
+		}
+		if scopeChanged {
+			if err := s.store.UpdateAPIKeyModelScopes(ctx, channelID, scopeUpdates); err != nil {
+				item.Status = "failed"
+				item.Error = "保存 API Key 模型范围失败: " + err.Error()
+				failed++
+				if configChanged {
+					changed = true
+					changedChannelIDs = append(changedChannelIDs, channelID)
+				}
+				results = append(results, item)
+				continue
+			}
 		}
 
 		item.Status = "updated"
@@ -312,11 +355,146 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 	})
 }
 
+func fetchModelsResponseHasKeyErrors(response *FetchModelsResponse) bool {
+	if response == nil {
+		return true
+	}
+	for _, item := range response.KeyModels {
+		if strings.TrimSpace(item.Error) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildFetchedAPIKeyModelScopes converts per-Key discovery results into the
+// persisted scope state. A successful Key with no configured-model match is
+// explicitly marked empty; an empty allowlist without ModelScopeEmpty means
+// unrestricted and would silently route that Key to every model.
+func buildFetchedAPIKeyModelScopes(
+	keys []*model.APIKey,
+	modelEntries []model.ModelEntry,
+	keyModels []FetchKeyModelsItem,
+) map[int]model.APIKeyModelScope {
+	keysByIndex := make(map[int]*model.APIKey, len(keys))
+	for _, key := range keys {
+		if key != nil {
+			keysByIndex[key.KeyIndex] = key
+		}
+	}
+
+	updates := make(map[int]model.APIKeyModelScope)
+	for _, result := range keyModels {
+		key := keysByIndex[result.KeyIndex]
+		if key == nil {
+			continue
+		}
+
+		allowedModels := []string(nil)
+		scopeEmpty := strings.TrimSpace(result.Error) != "" || len(result.Models) == 0
+		if !scopeEmpty {
+			allowedModels = detectedChannelModelNames(modelEntries, result.Models)
+			scopeEmpty = len(allowedModels) == 0
+		}
+		if scopeEmpty {
+			allowedModels = nil
+		}
+		scope := model.APIKeyModelScope{
+			AllowedModels:   allowedModels,
+			ModelScopeEmpty: scopeEmpty,
+			// A manually disabled Key is never probed, but preserve that
+			// state if a caller supplies one in a future fetch path.
+			Disabled: (key.Disabled && !key.ModelScopeEmpty) || scopeEmpty,
+		}
+		if apiKeyModelScopeEqual(key, scope) {
+			continue
+		}
+		updates[result.KeyIndex] = scope
+	}
+	return updates
+}
+
+func apiKeyModelScopeEqual(key *model.APIKey, scope model.APIKeyModelScope) bool {
+	if key == nil || key.ModelScopeEmpty != scope.ModelScopeEmpty || key.Disabled != scope.Disabled ||
+		len(key.AllowedModels) != len(scope.AllowedModels) {
+		return false
+	}
+	for i := range key.AllowedModels {
+		if key.AllowedModels[i] != scope.AllowedModels[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func detectedChannelModelNames(modelRows, fetched []model.ModelEntry) []string {
+	detectedNames := make([]string, 0, len(fetched)*2)
+	detected := make(map[string]struct{}, len(fetched)*2)
+	for _, entry := range fetched {
+		for _, value := range []string{entry.Model, entry.RedirectModel} {
+			name := strings.TrimSpace(value)
+			key := strings.ToLower(name)
+			if name == "" {
+				continue
+			}
+			if _, exists := detected[key]; exists {
+				continue
+			}
+			detected[key] = struct{}{}
+			detectedNames = append(detectedNames, name)
+		}
+	}
+
+	matched := make([]string, 0, len(modelRows))
+	seen := make(map[string]struct{}, len(modelRows))
+	for _, row := range modelRows {
+		logicalModel := strings.TrimSpace(row.Model)
+		if logicalModel == "" || logicalModel == "*" {
+			continue
+		}
+		upstreamModel := strings.TrimSpace(row.RedirectModel)
+		if upstreamModel == "" {
+			upstreamModel = logicalModel
+		}
+		if _, ok := detected[strings.ToLower(logicalModel)]; !ok {
+			if _, ok := detected[strings.ToLower(upstreamModel)]; !ok {
+				continue
+			}
+		}
+		key := strings.ToLower(logicalModel)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		matched = append(matched, logicalModel)
+	}
+	if len(matched) > 0 {
+		return matched
+	}
+	for _, row := range modelRows {
+		if strings.TrimSpace(row.Model) == "*" {
+			return detectedNames
+		}
+	}
+	return nil
+}
+
+// availableModelFetchAPIKeys 选出可用于只读模型探测的 Key。
+// 手动禁用的 Key 始终排除；作用域被裁剪空而自动禁用的 Key（model_scope_empty=true）
+// 凭据仍有效，降级参与探测，使其分组模型能回到并集。正常可用 Key 优先。
 func availableModelFetchAPIKeys(keys []*model.APIKey, now time.Time) []*model.APIKey {
 	available := make([]*model.APIKey, 0, len(keys))
+	scopeEmpty := make([]*model.APIKey, 0, len(keys))
 	var cooldownFallback *model.APIKey
 	for _, key := range keys {
-		if key == nil || key.Disabled || strings.TrimSpace(key.APIKey) == "" {
+		if key == nil || strings.TrimSpace(key.APIKey) == "" {
+			continue
+		}
+		if key.Disabled {
+			if !key.ModelScopeEmpty || key.IsCoolingDown(now) {
+				continue
+			}
+			scopeEmpty = append(scopeEmpty, key)
 			continue
 		}
 		if key.IsCoolingDown(now) {
@@ -330,12 +508,12 @@ func availableModelFetchAPIKeys(keys []*model.APIKey, now time.Time) []*model.AP
 		available = append(available, key)
 	}
 	if len(available) > 0 {
-		return available
+		return append(available, scopeEmpty...)
 	}
 	if cooldownFallback != nil {
-		return []*model.APIKey{cooldownFallback}
+		return append([]*model.APIKey{cooldownFallback}, scopeEmpty...)
 	}
-	return available
+	return scopeEmpty
 }
 
 func availableModelFetchKeys(keys []*model.APIKey, now time.Time) []string {
@@ -373,6 +551,7 @@ func (s *Server) fetchModelsForChannel(
 	if cfg == nil {
 		return nil, fmt.Errorf("渠道不存在")
 	}
+	cfg = withAntigravityDefaultFallbackURLs(cfg)
 	cfg = s.withOAuthBaseURLOverride(cfg)
 	if cfg.UsesXAIOAuth() {
 		return sortOAuthFetchModels(fetchXAIOAuthModels(cfg, overrideProtocol))
@@ -740,7 +919,7 @@ func (s *Server) fetchAntigravityModelsWithURLFallback(
 	for i := range cfg.URLs {
 		runtimeURLs[i] = cfg.URLs[i].RuntimeURL()
 	}
-	sortedURLs := orderURLsWithSelector(selector, cfg.ID, runtimeURLs)
+	sortedURLs := orderChannelAttemptURLs(selector, cfg, runtimeURLs)
 	sortedURLs = prioritizeDeclaredProtocolURLs(sortedURLs, cfg.URLs)
 
 	var lastErr error

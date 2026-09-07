@@ -69,7 +69,9 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			role := value.Get("role").String()
 			content := []byte(value.Raw)
 			if role != "user" && role != "model" {
-				if previousRole == "" || previousRole == "model" {
+				if translatorcommon.ContentHasGeminiFunctionResponse([]byte(value.Raw)) {
+					role = "user"
+				} else if previousRole == "" || previousRole == "model" {
 					role = "user"
 				} else {
 					role = "model"
@@ -371,9 +373,8 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 				if hasSignatureKey {
 					changed = true
 					contentChanged = true
-					deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "functionResponse parts cannot replay Claude thinking signatures", contentIndex, partIndex, rawSignature)
-					partBytes, _ := json.Marshal(part)
+					partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					rewrittenParts = append(rewrittenParts, partBytes)
 				} else {
 					rewrittenParts = append(rewrittenParts, []byte(partResult.Raw))
@@ -385,9 +386,8 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 				if hasSignatureKey {
 					changed = true
 					contentChanged = true
-					deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "non-model parts cannot replay Claude thinking signatures", contentIndex, partIndex, rawSignature)
-					partBytes, _ := json.Marshal(part)
+					partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					rewrittenParts = append(rewrittenParts, partBytes)
 				} else {
 					rewrittenParts = append(rewrittenParts, []byte(partResult.Raw))
@@ -400,14 +400,17 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 				firstFunctionCallSeen = true
 				changed = true
 				contentChanged = true
-				deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
+				partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 				if isFirstFunctionCall {
-					part["thoughtSignature"] = signature.GeminiSkipThoughtSignatureValidator
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "replace_signature", "first functionCall requires Antigravity bypass signature", contentIndex, partIndex, rawSignature)
+					var setErr error
+					partBytes, setErr = sjson.SetBytes(partBytes, "thoughtSignature", signature.GeminiSkipThoughtSignatureValidator)
+					if setErr != nil {
+						return rawJSON
+					}
 				} else {
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "parallel sibling functionCalls remain unsigned", contentIndex, partIndex, rawSignature)
 				}
-				partBytes, _ := json.Marshal(part)
 				rewrittenParts = append(rewrittenParts, partBytes)
 				continue
 			}
@@ -432,9 +435,12 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 					contentChanged = true
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "normalize_signature", "compatible_claude_signature", contentIndex, partIndex, rawSignature)
 				}
-				deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
-				part["thoughtSignature"] = normalized
-				partBytes, _ := json.Marshal(part)
+				partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
+				var setErr error
+				partBytes, setErr = sjson.SetBytes(partBytes, "thoughtSignature", normalized)
+				if setErr != nil {
+					return rawJSON
+				}
 				rewrittenParts = append(rewrittenParts, partBytes)
 				continue
 			}
@@ -442,9 +448,8 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 			if hasSignatureKey {
 				changed = true
 				contentChanged = true
-				deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 				logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "non-thinking parts should not carry Claude thinking signatures", contentIndex, partIndex, rawSignature)
-				partBytes, _ := json.Marshal(part)
+				partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 				rewrittenParts = append(rewrittenParts, partBytes)
 			} else {
 				rewrittenParts = append(rewrittenParts, []byte(partResult.Raw))
@@ -457,7 +462,11 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 		}
 		if contentChanged || len(rewrittenParts) != len(partsArray) {
 			contentBytes := []byte(content.Raw)
-			contentBytes, _ = sjson.SetRawBytes(contentBytes, "parts", translatorcommon.JoinRawArray(rewrittenParts))
+			var setErr error
+			contentBytes, setErr = sjson.SetRawBytes(contentBytes, "parts", translatorcommon.JoinRawArray(rewrittenParts))
+			if setErr != nil {
+				return rawJSON
+			}
 			rewrittenContents = append(rewrittenContents, contentBytes)
 		} else {
 			rewrittenContents = append(rewrittenContents, []byte(content.Raw))
@@ -583,7 +592,7 @@ func antigravityClaudeGeminiPartThoughtSignature(part map[string]any) (string, b
 	return "", false
 }
 
-func deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part map[string]any) {
+func deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part map[string]any) []byte {
 	for _, path := range [][]string{
 		{"thoughtSignature"},
 		{"thought_signature"},
@@ -593,8 +602,21 @@ func deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part map[string]any
 		{"functionResponse", "thought_signature"},
 		{"extra_content", "google", "thought_signature"},
 	} {
-		deleteAtPath(part, path...)
+		current := part
+		for _, key := range path[:len(path)-1] {
+			next, ok := current[key].(map[string]any)
+			if !ok {
+				current = nil
+				break
+			}
+			current = next
+		}
+		delete(current, path[len(path)-1])
 	}
+	// Reuse the UseNumber-decoded object: duplicate parent/signature keys collapse
+	// before filtering, and large numeric tool arguments retain their JSON value.
+	cleaned, _ := json.Marshal(part)
+	return cleaned
 }
 
 func hasFunctionResponsePart(part map[string]any) bool {
@@ -627,21 +649,6 @@ func stringAtPath(value map[string]any, path ...string) (string, bool) {
 	}
 	s, ok := current.(string)
 	return s, ok
-}
-
-func deleteAtPath(value map[string]any, path ...string) {
-	if len(path) == 0 {
-		return
-	}
-	current := value
-	for _, key := range path[:len(path)-1] {
-		next, ok := current[key].(map[string]any)
-		if !ok {
-			return
-		}
-		current = next
-	}
-	delete(current, path[len(path)-1])
 }
 
 func logAntigravityClaudeGeminiSignatureSanitize(modelName, action, reason string, contentIndex, partIndex int, rawSignature string) {

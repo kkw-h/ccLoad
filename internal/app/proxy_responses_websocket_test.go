@@ -396,6 +396,65 @@ func newBridgeWriterTestConn(t *testing.T) *websocket.Conn {
 	return conn
 }
 
+// TestResponsesWebsocketBridgeWriterRejectsInvalidJSON ensures truncated or
+// otherwise invalid upstream SSE payloads are not forwarded as websocket
+// TextMessage frames and do not mark the bridge as successfully completed.
+func TestResponsesWebsocketBridgeWriterRejectsInvalidJSON(t *testing.T) {
+	t.Parallel()
+
+	truncated := []byte(`{"type":"response.completed"`)
+	if json.Valid(truncated) {
+		t.Fatal("test fixture must be invalid JSON for encoding/json")
+	}
+	if gjson.ValidBytes(truncated) {
+		t.Fatal("test fixture must be invalid JSON for gjson.ValidBytes")
+	}
+	if got := strings.TrimSpace(gjson.GetBytes(truncated, "type").String()); got != "response.completed" {
+		t.Fatalf("gjson still reads type from truncated payload: %q", got)
+	}
+
+	var received [][]byte
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		for {
+			_, message, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			received = append(received, bytes.Clone(message))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial bridge writer test websocket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	writer := newResponsesWebsocketBridgeWriter(conn, 0)
+	_, writeErr := writer.Write([]byte("data: " + string(truncated) + "\n\n"))
+	if writeErr == nil {
+		t.Fatal("truncated response.completed SSE must fail Write")
+	}
+	if !strings.Contains(writeErr.Error(), "invalid JSON in upstream SSE event") {
+		t.Fatalf("unexpected Write error: %v", writeErr)
+	}
+	if writer.completed {
+		t.Fatal("invalid upstream SSE must not mark bridge as completed")
+	}
+	if len(received) != 0 {
+		t.Fatalf("invalid upstream SSE must not send TextMessage, got %d frame(s)", len(received))
+	}
+}
+
 // TestResponsesWebsocketBridgeWriterCapsCollectedOutputBytes locks down the
 // cumulative output item ceiling: the per-event pending limit clears after
 // every parsed event, so a stream of many small response.output_item.done
@@ -585,6 +644,9 @@ func TestResponsesWebsocketAcceptsV1CodexPath(t *testing.T) {
 // /v1/responses path, not the alias.
 func TestCodexResponsePathsHTTPSSEFallback(t *testing.T) {
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("upstream method = %q, want POST", r.Method)
+		}
 		if r.URL.Path != "/v1/responses" {
 			t.Errorf("upstream path = %q, want /v1/responses", r.URL.Path)
 		}
@@ -608,6 +670,33 @@ func TestCodexResponsePathsHTTPSSEFallback(t *testing.T) {
 			if !strings.Contains(body, `"type":"response.completed"`) ||
 				!strings.Contains(body, `"id":"resp-sse-codex"`) {
 				t.Fatalf("SSE fallback body=%s", body)
+			}
+		})
+	}
+}
+
+func TestResponsesGetWithoutWebsocketUpgradeDoesNotReachUpstream(t *testing.T) {
+	for _, path := range responsesWebsocketUpgradePaths {
+		t.Run(path, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "codex-plain-get", upstreamProtocol: "codex", models: "*", priority: 100,
+			}}, map[int]string{0: upstream.URL})
+
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer test-api-key")
+			response := httptest.NewRecorder()
+			env.engine.ServeHTTP(response, req)
+
+			if response.Code != http.StatusUpgradeRequired {
+				t.Fatalf("plain GET status=%d body=%s, want %d", response.Code, response.Body.String(), http.StatusUpgradeRequired)
+			}
+			if upstreamCalls.Load() != 0 {
+				t.Fatalf("plain GET reached upstream %d time(s)", upstreamCalls.Load())
 			}
 		})
 	}
@@ -2552,6 +2641,7 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T) {
+	const clientUserAgent = "codex-tui/0.153.4 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (codex-tui; 0.153.4)"
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	requestBody := make(chan map[string]any, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2564,8 +2654,14 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
 			t.Errorf("X-OpenAI-FedRAMP = %q", got)
 		}
-		if r.Header.Get("User-Agent") != codexUserAgent || r.Header.Get("Originator") != "codex-tui" {
+		if r.Header.Get("User-Agent") != clientUserAgent || r.Header.Get("Originator") != "codex-tui" {
 			t.Errorf("Codex identity headers = %v", r.Header)
+		}
+		if got := r.Header.Get("Version"); got != "" {
+			t.Errorf("Version = %q, want absent for official client without Version", got)
+		}
+		if got := r.Header.Get("X-Codex-Window-Id"); got != "" {
+			t.Errorf("X-Codex-Window-Id = %q, want omitted from native WebSocket", got)
 		}
 		if r.Header.Get("Session_id") == "" {
 			t.Errorf("Codex Session_id header is missing: %v", r.Header)
@@ -2605,7 +2701,11 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 		models: "gpt-test", authType: model.AuthTypeCodexOAuth,
 		oauthCredential: codexProxyTestCredential(t, "at-ws", "rt-ws", "account-ws", true), priority: 100,
 	}}, map[int]string{0: upstream.URL})
-	downstream := dialResponsesWebsocket(t, env.engine)
+	downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
+		"User-Agent":        {clientUserAgent},
+		"Originator":        {"codex-tui"},
+		"X-Codex-Window-Id": {"client-thread:0"},
+	})
 	if err := downstream.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-test",
 		"input": []any{map[string]any{"role": "user", "content": "hello"}},
@@ -2634,6 +2734,70 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 	if err != nil || persistedCredential.PassiveUsage == nil || len(persistedCredential.PassiveUsage.Windows) != 1 ||
 		persistedCredential.PassiveUsage.Windows[0].UsedPercent != 25 {
 		t.Fatalf("persisted Codex WebSocket quota = (%#v, %v)", persistedCredential, err)
+	}
+}
+
+func TestNativeCodexWebsocketWindowHeaderRules(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action string
+		want   []string
+	}{
+		{name: "default"},
+		{name: "override", action: model.RuleActionOverride, want: []string{"configured-window:0"}},
+		{name: "append", action: model.RuleActionAppend, want: []string{"configured-window:0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := make(chan http.Header, 1)
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				captured <- r.Header.Clone()
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				var request map[string]any
+				if err := conn.ReadJSON(&request); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := conn.WriteJSON(map[string]any{
+					"type":     "response.completed",
+					"response": map[string]any{"id": "resp-window", "output": []any{}},
+				}); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer upstream.Close()
+			rules := []model.CustomHeaderRule{{Action: model.RuleActionAppend, Name: "X-Configured", Value: "once"}}
+			if tc.action != "" {
+				rules = append(rules, model.CustomHeaderRule{
+					Action: tc.action, Name: "x-codex-window-id", Value: "configured-window:0",
+				})
+			}
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "window-headers", upstreamProtocol: "codex", websockets: true, models: "gpt-test",
+				customRequestRules: &model.CustomRequestRules{Headers: rules},
+			}}, map[int]string{0: upstream.URL})
+			downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
+				"X-Codex-Window-Id": {"client-thread:0"},
+			})
+			if err := downstream.WriteJSON(map[string]any{
+				"type": "response.create", "model": "gpt-test", "input": []any{},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			readWebsocketUntilType(t, downstream, "response.completed")
+			got := <-captured
+			if !slices.Equal(got.Values("X-Codex-Window-Id"), tc.want) {
+				t.Errorf("X-Codex-Window-Id = %v, want %v", got.Values("X-Codex-Window-Id"), tc.want)
+			}
+			if !slices.Equal(got.Values("X-Configured"), []string{"once"}) {
+				t.Errorf("unrelated header rules applied more than once: %v", got.Values("X-Configured"))
+			}
+		})
 	}
 }
 
@@ -3329,6 +3493,9 @@ func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.
 	var responses atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Codex-Window-Id"); got != "" {
+			t.Errorf("unapproved window header reached upstream: %q", got)
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("upgrade header-fingerprint websocket: %v", err)
@@ -3362,6 +3529,7 @@ func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.
 	first := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
 		"Session-Id":          []string{"header-fingerprint"},
 		"OpenAI-Organization": []string{"org-a"},
+		"X-Codex-Window-Id":   []string{"window-a:0"},
 	})
 	if err := first.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-test",
@@ -3378,6 +3546,7 @@ func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.
 	second := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
 		"Session-Id":          []string{"header-fingerprint"},
 		"OpenAI-Organization": []string{"org-b"},
+		"X-Codex-Window-Id":   []string{"window-b:0"},
 	})
 	if err := second.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-test", "previous_response_id": "resp-header-1",
@@ -5756,6 +5925,106 @@ func TestNativeCodexWebsocketMissingStoredInputItemReconnectsWithStrippedReplay(
 	}
 }
 
+func TestNativeCodexWebsocketInvalidEncryptedContentReconnectsWithStrippedReplay(t *testing.T) {
+	requests := make(chan []byte, 2)
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection := handshakes.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade invalid-encrypted-content websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read invalid-encrypted-content request: %v", err)
+			return
+		}
+		requests <- bytes.Clone(payload)
+		if connection == 1 {
+			_ = conn.WriteJSON(map[string]any{"type": "codex.rate_limits", "plan_type": "team"})
+			_ = conn.WriteJSON(map[string]any{
+				"type": "codex.response.metadata",
+				"headers": map[string]any{
+					"x-models-etag": `W/"invalid-encrypted-content"`,
+				},
+			})
+			_ = conn.WriteJSON(map[string]any{
+				"type": "error", "status": http.StatusBadRequest,
+				"error": map[string]any{
+					"type": "invalid_request_error", "code": "invalid_encrypted_content",
+					"message": "The encrypted content could not be verified.",
+				},
+			})
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id": "resp-encrypted-content-stripped", "output": []any{},
+				"usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "invalid-encrypted-content-replay", upstreamProtocol: "codex", websockets: true,
+		models: "gpt-test", priority: 100, authType: model.AuthTypeCodexOAuth,
+		oauthCredential: codexProxyTestCredential(t, "at-invalid-encrypted", "rt-invalid-encrypted", "account-invalid-encrypted"),
+	}}, map[int]string{0: upstream.URL})
+	downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
+		"Session-Id": {"invalid-encrypted-content"},
+		"User-Agent": {"codex-tui/0.148.0"},
+	})
+	if err := downstream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set invalid-encrypted-content deadline: %v", err)
+	}
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test", "store": false,
+		"input": []any{
+			map[string]any{
+				"type": "reasoning", "id": "rs_rejected",
+				"encrypted_content": "opaque", "summary": []any{},
+			},
+			map[string]any{"type": "compaction", "encrypted_content": "opaque-compaction"},
+			map[string]any{"type": "message", "role": "user", "content": "keep going"},
+		},
+		"tools": []any{map[string]any{
+			"type": "namespace", "name": "collaboration",
+			"tools": []any{map[string]any{
+				"type": "function", "name": "spawn_agent", "description": "Spawns an agent.",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
+			}},
+		}},
+	}); err != nil {
+		t.Fatalf("write invalid-encrypted-content request: %v", err)
+	}
+	completed := readWebsocketUntilType(t, downstream, "response.completed")
+	completedJSON, _ := json.Marshal(completed)
+	if gjson.GetBytes(completedJSON, "response.id").String() != "resp-encrypted-content-stripped" {
+		t.Fatalf("unexpected stripped replay completion: %#v", completed)
+	}
+
+	first := <-requests
+	replay := <-requests
+	if gjson.GetBytes(first, "tools.0.name").String() != codexOptimizedCollaboration {
+		t.Fatalf("first request did not enter Codex multi-agent response path: %s", first)
+	}
+	if !bytes.Contains(first, []byte(`"encrypted_content"`)) {
+		t.Fatalf("first upstream request dropped encrypted content too early: %s", first)
+	}
+	if bytes.Contains(replay, []byte(`"encrypted_content"`)) {
+		t.Fatalf("replay retained rejected encrypted content: %s", replay)
+	}
+	items := gjson.GetBytes(replay, "input").Array()
+	if len(items) != 1 || items[0].Get("type").String() != "message" || handshakes.Load() != 2 {
+		t.Fatalf("replay input=%s handshakes=%d, want only the message and two handshakes", replay, handshakes.Load())
+	}
+}
+
 func TestNativeCodexWebsocketFailsOverToAnotherWebsocketAfterReconnectExhausted(t *testing.T) {
 	var primaryHandshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -6031,6 +6300,9 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
 			websocketCalls.Add(1)
+			if got := r.Header.Get("X-Codex-Window-Id"); got != "" {
+				t.Errorf("HTTP-only window header reached WebSocket: %q", got)
+			}
 			if r.Header.Get("X-Codex-Turn-State") != "turn-state" || r.Header.Get("X-ResponsesAPI-Include-Timing-Metrics") != "true" {
 				t.Errorf("websocket-only headers missing from handshake: %v", r.Header)
 			}
@@ -6050,6 +6322,9 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 		}
 		if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state" {
 			t.Errorf("HTTP fallback X-Codex-Turn-State=%q, want %q; headers=%v", got, "turn-state", r.Header)
+		}
+		if got := r.Header.Get("X-Codex-Window-Id"); got != "client-thread:0" {
+			t.Errorf("HTTP fallback X-Codex-Window-Id=%q, want client-thread:0", got)
 		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil || !json.Valid(body) {
@@ -6120,6 +6395,7 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 		http.Header{
 			"OpenAI-Beta":                           []string{"other-feature"},
 			"X-Codex-Turn-State":                    []string{"turn-state"},
+			"X-Codex-Window-Id":                     []string{"client-thread:0"},
 			"X-ResponsesAPI-Include-Timing-Metrics": []string{"true"},
 		},
 	)
@@ -7199,5 +7475,80 @@ func TestResponsesWebsocketBridgesToGeminiHTTPChannel(t *testing.T) {
 	}
 	if !bytes.Contains(attempts[3].body, []byte(`"contents"`)) {
 		t.Fatalf("unexpected Gemini bridge request body=%s", attempts[3].body)
+	}
+}
+
+// HTTP 渠道切换到原生 WS 渠道时重放的完整 transcript 会带 input item status，而官方
+// Codex 后端在 WebSocket 上同样以 unknown_parameter 拒绝它（线上表现为 HTTP 101 之后
+// 的 SSE error `[input[N].status]`）。发送边界必须在首帧就剥离，而不是撞 400 再靠重试
+// 自愈——自愈多一个 RTT，且在响应已提交时根本不可用。
+func TestNativeCodexWebsocketStripsInputItemStatusBeforeFirstSend(t *testing.T) {
+	requests := make(chan []byte, 1)
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handshakes.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade status-strip websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read status-strip request: %v", err)
+			return
+		}
+		requests <- bytes.Clone(payload)
+		_ = conn.WriteJSON(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id": "resp-status-stripped", "output": []any{},
+				"usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "ws-status-strip", upstreamProtocol: "codex", websockets: true,
+		models: "gpt-test", priority: 100, authType: model.AuthTypeCodexOAuth,
+		oauthCredential: codexProxyTestCredential(t, "at-status-strip", "rt-status-strip", "account-status-strip"),
+	}}, map[int]string{0: upstream.URL})
+	downstream := dialResponsesWebsocketWithSessionID(t, env.engine, "ws-status-strip")
+	if err := downstream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set status-strip deadline: %v", err)
+	}
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test", "store": false,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "keep going"},
+			map[string]any{
+				"type": "function_call", "id": "fc_item_1", "call_id": "call_status_strip",
+				"name": "shell", "arguments": "{}", "status": "completed",
+			},
+			map[string]any{
+				"type": "function_call_output", "call_id": "call_status_strip",
+				"output": "done", "status": "completed",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("write status-strip request: %v", err)
+	}
+	completed := readWebsocketUntilType(t, downstream, "response.completed")
+	completedJSON, _ := json.Marshal(completed)
+	if gjson.GetBytes(completedJSON, "response.id").String() != "resp-status-stripped" {
+		t.Fatalf("unexpected status-strip completion: %#v", completed)
+	}
+
+	sent := <-requests
+	if statuses := gjson.GetBytes(sent, "input.#.status").Array(); len(statuses) != 0 {
+		t.Fatalf("first websocket send kept %d input item status fields: %s", len(statuses), sent)
+	}
+	if gjson.GetBytes(sent, "input.1.call_id").String() != "call_status_strip" {
+		t.Fatalf("status strip damaged the input transcript: %s", sent)
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Fatalf("status strip must succeed on the first send, handshakes=%d", got)
 	}
 }
