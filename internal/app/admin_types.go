@@ -633,26 +633,6 @@ type ChannelWithCooldown struct {
 	EffectivePriority             *float64                 `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
 	SuccessRate                   *float64                 `json:"success_rate,omitempty"`       // 成功率(0-1)
 	ManagementAccount             *channelManagementView   `json:"management_account,omitempty"`
-	CodexPlanType                 string                   `json:"codex_plan_type,omitempty"`
-	CodexSubscriptionActiveUntil  *time.Time               `json:"codex_subscription_active_until,omitempty"`
-	AnthropicPlanType             string                   `json:"anthropic_plan_type,omitempty"`
-	OAuthUsage                    *oauthUsageSummary       `json:"oauth_usage,omitempty"`
-	AntigravityPaidTier           string                   `json:"antigravity_paid_tier,omitempty"`
-	XAIEmail                      string                   `json:"xai_email,omitempty"`
-	XAISubscriptionTier           string                   `json:"xai_subscription_tier,omitempty"`
-	XAIEntitlementStatus          string                   `json:"xai_entitlement_status,omitempty"`
-	KeyStrategy                   string                   `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
-	CooldownUntil                 *time.Time               `json:"cooldown_until,omitempty"`
-	CooldownRemainingMS           int64                    `json:"cooldown_remaining_ms,omitempty"`
-	KeyCooldowns                  []KeyCooldownInfo        `json:"key_cooldowns,omitempty"`
-	ModelCooldowns                []ModelCooldownInfo      `json:"model_cooldowns,omitempty"`
-	ProtocolProbeRetryCount       int                      `json:"protocol_probe_retry_count,omitempty"`
-	ProtocolProbeRetryAt          *time.Time               `json:"protocol_probe_retry_at,omitempty"`
-	ProtocolProbeRetryRemainingMS int64                    `json:"protocol_probe_retry_remaining_ms,omitempty"`
-	EffectivePriority             *float64                 `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
-	SuccessRate                   *float64                 `json:"success_rate,omitempty"`       // 成功率(0-1)
-	ManagementAccount             *channelManagementView   `json:"management_account,omitempty"`
-
 	// 成本倍率区间（角标展示）：api_key 渠道按启用 Key 计算，OAuth 渠道即渠道倍率；
 	// min 与 max 都为 1 时不下发。
 	CostMultiplierMin *float64 `json:"cost_multiplier_min,omitempty"`

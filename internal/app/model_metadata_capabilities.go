@@ -363,14 +363,6 @@ func cloneStringPointer(value *string) *string {
 	return &cloned
 }
 
-func cloneInt64Pointer(value *int64) *int64 {
-	if value == nil {
-		return nil
-	}
-	cloned := *value
-	return &cloned
-}
-
 func cloneStringSlicePointer(value *[]string) *[]string {
 	if value == nil {
 		return nil
