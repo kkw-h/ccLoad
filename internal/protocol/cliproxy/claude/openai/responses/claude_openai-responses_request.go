@@ -586,8 +586,8 @@ func defaultClaudeResponsesMaxTokensForModel(modelName string) int {
 	if strings.Contains(strings.ToLower(strings.TrimSpace(modelName)), "fable") {
 		maxTokens = defaultFableResponsesMaxTokens
 	}
-	if info := registry.LookupModelInfo(modelName, "claude"); info != nil && info.MaxCompletionTokens > 0 && info.MaxCompletionTokens < maxTokens {
-		return info.MaxCompletionTokens
+	if info := registry.LookupModelInfo(modelName, "claude"); info != nil && info.MaxCompletionTokens > 0 && int(info.MaxCompletionTokens) < maxTokens {
+		return int(info.MaxCompletionTokens)
 	}
 	return maxTokens
 }
