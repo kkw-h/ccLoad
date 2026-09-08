@@ -16,6 +16,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/klauspost/compress v1.19.2
 	github.com/pierrec/xxHash v0.1.5
+	github.com/redis/go-redis/v9 v9.22.0
 	github.com/refraction-networking/utls v1.8.2
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
