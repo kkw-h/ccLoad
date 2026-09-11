@@ -152,12 +152,21 @@ func serveHTMLWithVersionFrom(c *gin.Context, fileSystem fs.FS, filePath string)
 	}
 
 	// 替换版本号占位符
-	html := strings.ReplaceAll(string(content), "__VERSION__", version.Version)
+	// Include the commit in asset URLs so a rebuild with the same release label
+	// cannot leave browsers pinned to an older immutable JS or locale bundle.
+	html := strings.ReplaceAll(string(content), "__VERSION__", staticAssetVersion())
 
 	// HTML 不缓存，确保用户总能获取最新版本号引用
 	c.Header("Cache-Control", "no-cache, must-revalidate")
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(http.StatusOK, html)
+}
+
+func staticAssetVersion() string {
+	if version.Commit == "" || version.Commit == "unknown" {
+		return version.Version
+	}
+	return version.Version + "-" + version.Commit
 }
 
 // serveStaticWithCacheFrom 处理静态资源，设置缓存策略（从指定的文件系统）
