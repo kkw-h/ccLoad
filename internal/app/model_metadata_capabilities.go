@@ -25,10 +25,12 @@ var builtInModelInputTypes = map[string][]string{
 }
 
 type modelMetadata struct {
-	Provider      *string
-	ContextWindow *int64
-	MaxTokens     *int64
-	InputTypes    *[]string
+	Provider                     *string
+	ContextWindow                *int64
+	MaxTokens                    *int64
+	InputTypes                   *[]string
+	ThinkingRequestFormat        *string
+	SystemTextReasoningAllowance *int64
 }
 
 type modelMetadataResolver struct {
@@ -75,6 +77,12 @@ func (r *modelMetadataResolver) Resolve(originalModel string) modelMetadata {
 	if override.MaxTokens != nil {
 		result.MaxTokens = cloneInt64Pointer(override.MaxTokens)
 	}
+	if override.ThinkingRequestFormat != nil {
+		result.ThinkingRequestFormat = cloneStringPointer(override.ThinkingRequestFormat)
+	}
+	if override.SystemTextReasoningAllowance != nil {
+		result.SystemTextReasoningAllowance = cloneInt64Pointer(override.SystemTextReasoningAllowance)
+	}
 	if override.InputTypes != nil {
 		result.InputTypes = cloneStringSlicePointer(override.InputTypes)
 	}
@@ -115,6 +123,26 @@ func (r *modelMetadataResolver) ResolveAll(originalModels []string) modelMetadat
 			minimum = min(minimum, *value.MaxTokens)
 		}
 		result.MaxTokens = &minimum
+	}
+	if allMetadataStringsKnown(resolved, func(value modelMetadata) *string { return value.ThinkingRequestFormat }) {
+		format := *resolved[0].ThinkingRequestFormat
+		same := true
+		for _, value := range resolved[1:] {
+			if *value.ThinkingRequestFormat != format {
+				same = false
+				break
+			}
+		}
+		if same {
+			result.ThinkingRequestFormat = &format
+		}
+	}
+	if allMetadataIntsKnown(resolved, func(value modelMetadata) *int64 { return value.SystemTextReasoningAllowance }) {
+		allowance := *resolved[0].SystemTextReasoningAllowance
+		for _, value := range resolved[1:] {
+			allowance = max(allowance, *value.SystemTextReasoningAllowance)
+		}
+		result.SystemTextReasoningAllowance = &allowance
 	}
 	if allMetadataStringSlicesKnown(resolved, func(value modelMetadata) *[]string { return value.InputTypes }) {
 		intersection := slices.Clone(*resolved[0].InputTypes)
@@ -287,6 +315,18 @@ func parseModelMetadataValue(modelName string, raw json.RawMessage) (modelMetada
 				return modelMetadata{}, err
 			}
 			result.MaxTokens = &value
+		case "thinkingRequestFormat":
+			var value string
+			if err := json.Unmarshal(encoded, &value); err != nil || (value != "anthropic-adaptive" && value != "none") {
+				return modelMetadata{}, fmt.Errorf("thinkingRequestFormat for %s must be anthropic-adaptive or none", modelName)
+			}
+			result.ThinkingRequestFormat = &value
+		case "systemTextReasoningAllowance":
+			var value int64
+			if bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) || json.Unmarshal(encoded, &value) != nil || value < 0 || value > 9007199254740991 {
+				return modelMetadata{}, fmt.Errorf("systemTextReasoningAllowance for %s must be a non-negative safe integer", modelName)
+			}
+			result.SystemTextReasoningAllowance = &value
 		case "inputTypes":
 			if bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
 				return modelMetadata{}, fmt.Errorf("inputTypes for %s must be an array of strings", modelName)

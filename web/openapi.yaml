@@ -1036,6 +1036,16 @@ components:
           readOnly: true
         contextWindow: {type: integer, format: int64, minimum: 1, readOnly: true}
         maxTokens: {type: integer, format: int64, minimum: 1, readOnly: true}
+        thinkingRequestFormat:
+          type: string
+          enum: [anthropic-adaptive, none]
+          description: 已验证的网关 Anthropic 入口格式。adaptive 使用 thinking.type=adaptive；none 不发送思考参数。能力未知时省略，不从模型名称推断。
+        systemTextReasoningAllowance:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+          description: 系统辅助文本请求的额外输出预算，0 必须显式声明。adaptive 的系统请求显式发送 thinking.type=disabled，总预算仍受 maxTokens 上限约束。
         inputTypes:
           allOf: [{$ref: '#/components/schemas/InputTypes'}]
           readOnly: true
@@ -1135,6 +1145,16 @@ components:
         provider: {type: string, minLength: 1}
         contextWindow: {type: integer, format: int64, minimum: 1}
         maxTokens: {type: integer, format: int64, minimum: 1}
+        thinkingRequestFormat:
+          type: string
+          enum: [anthropic-adaptive, none]
+          description: 已验证的网关 Anthropic 入口格式。adaptive 使用 thinking.type=adaptive；none 不发送思考参数。能力未知时省略，不从模型名称推断。
+        systemTextReasoningAllowance:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+          description: 系统辅助文本请求的额外输出预算，0 必须显式声明。adaptive 的系统请求显式发送 thinking.type=disabled，总预算仍受 maxTokens 上限约束。
         inputTypes:
           type: array
           uniqueItems: true
@@ -1142,7 +1162,7 @@ components:
     ModelMetadataOverrides:
       type: object
       maxProperties: 500
-      description: 键为规范化后的原模型名称；每个对象仅覆盖明确提供的字段，空 inputTypes 表示明确不支持任何输入类型。
+      description: 键为规范化后的原模型名称；每个对象仅覆盖明确提供的字段，空 inputTypes 表示明确不支持任何输入类型。thinkingRequestFormat 与 systemTextReasoningAllowance 必须来自已验证的实际网关链路；缺省不补值。多个上游聚合时格式必须全部已知且相同，额外预算全部已知时取最大值。
       additionalProperties: {$ref: '#/components/schemas/ModelMetadataOverride'}
       example:
         gpt-5.6-sol:
@@ -1196,6 +1216,16 @@ components:
         thinkingLevels: {$ref: '#/components/schemas/ThinkingLevels'}
         contextWindow: {type: integer, format: int64, minimum: 1}
         maxTokens: {type: integer, format: int64, minimum: 1}
+        thinkingRequestFormat:
+          type: string
+          enum: [anthropic-adaptive, none]
+          description: 已验证的网关 Anthropic 入口格式。adaptive 使用 thinking.type=adaptive；none 不发送思考参数。能力未知时省略，不从模型名称推断。
+        systemTextReasoningAllowance:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+          description: 系统辅助文本请求的额外输出预算，0 必须显式声明。adaptive 的系统请求显式发送 thinking.type=disabled，总预算仍受 maxTokens 上限约束。
         inputTypes: {$ref: '#/components/schemas/InputTypes'}
     OpenAIModelList:
       type: object
@@ -1217,6 +1247,16 @@ components:
         thinkingLevels: {$ref: '#/components/schemas/ThinkingLevels'}
         contextWindow: {type: integer, format: int64, minimum: 1}
         maxTokens: {type: integer, format: int64, minimum: 1}
+        thinkingRequestFormat:
+          type: string
+          enum: [anthropic-adaptive, none]
+          description: 已验证的网关 Anthropic 入口格式。adaptive 使用 thinking.type=adaptive；none 不发送思考参数。能力未知时省略，不从模型名称推断。
+        systemTextReasoningAllowance:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+          description: 系统辅助文本请求的额外输出预算，0 必须显式声明。adaptive 的系统请求显式发送 thinking.type=disabled，总预算仍受 maxTokens 上限约束。
         inputTypes: {$ref: '#/components/schemas/InputTypes'}
     AnthropicModelList:
       type: object

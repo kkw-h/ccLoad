@@ -1,6 +1,8 @@
 package app
 
 import (
+	"ccLoad/internal/model"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -149,5 +151,70 @@ func assertMetadataStrings(t testing.TB, field string, got *[]string, want []str
 	t.Helper()
 	if got == nil || strings.Join(*got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("%s=%v, want %v", field, got, want)
+	}
+}
+
+func TestModelMetadataRuntimeContractSurvivesAliasProjection(t *testing.T) {
+	resolver, err := newModelMetadataResolver(`{"physical-a":{"contextWindow":128000,"maxTokens":64000,"inputTypes":["text"],"thinkingRequestFormat":"anthropic-adaptive","systemTextReasoningAllowance":1024},"physical-b":{"thinkingRequestFormat":"none","systemTextReasoningAllowance":0}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{modelMetadataCapabilities: resolver}
+	entries := server.adminChannelModelEntries([]model.ModelEntry{{Model: "public-a", RedirectModel: "physical-a"}, {Model: "public-b", RedirectModel: "physical-b"}, {Model: "legacy"}})
+	encoded, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(encoded, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows[0]["model"] != "public-a" || rows[0]["thinkingRequestFormat"] != "anthropic-adaptive" || rows[0]["systemTextReasoningAllowance"] != float64(1024) {
+		t.Fatalf("public alias must carry target capabilities without renaming: %s", encoded)
+	}
+	if rows[1]["thinkingRequestFormat"] != "none" || rows[1]["systemTextReasoningAllowance"] != float64(0) {
+		t.Fatalf("explicit zero must survive: %s", encoded)
+	}
+	if _, ok := rows[2]["thinkingRequestFormat"]; ok {
+		t.Fatal("unknown capability must remain absent")
+	}
+}
+
+func TestModelMetadataRuntimeCapabilitiesAggregationAndIsolation(t *testing.T) {
+	resolver, err := newModelMetadataResolver(`{"a":{"thinkingRequestFormat":"anthropic-adaptive","systemTextReasoningAllowance":0},"b":{"thinkingRequestFormat":"anthropic-adaptive","systemTextReasoningAllowance":1024},"c":{"thinkingRequestFormat":"none","systemTextReasoningAllowance":10}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	both := resolver.ResolveAll([]string{"a", "b"})
+	assertMetadataString(t, "format", both.ThinkingRequestFormat, "anthropic-adaptive")
+	assertMetadataInt64(t, "allowance", both.SystemTextReasoningAllowance, 1024)
+	conflict := resolver.ResolveAll([]string{"a", "c"})
+	if conflict.ThinkingRequestFormat != nil {
+		t.Fatal("mixed formats must remain unknown")
+	}
+	unknown := resolver.ResolveAll([]string{"a", "unknown"})
+	if unknown.ThinkingRequestFormat != nil || unknown.SystemTextReasoningAllowance != nil {
+		t.Fatal("unknown route cannot borrow another route's capabilities")
+	}
+	copy := resolver.Resolve("a")
+	*copy.ThinkingRequestFormat = "mutated"
+	*copy.SystemTextReasoningAllowance = 999
+	again := resolver.Resolve("a")
+	assertMetadataString(t, "format", again.ThinkingRequestFormat, "anthropic-adaptive")
+	assertMetadataInt64(t, "allowance", again.SystemTextReasoningAllowance, 0)
+}
+
+func TestModelMetadataRuntimeCapabilitiesRejectInvalidValues(t *testing.T) {
+	for _, raw := range []string{
+		`{"a":{"thinkingRequestFormat":"anthropic-budget"}}`,
+		`{"a":{"thinkingRequestFormat":null}}`,
+		`{"a":{"systemTextReasoningAllowance":null}}`,
+		`{"a":{"systemTextReasoningAllowance":-1}}`,
+		`{"a":{"systemTextReasoningAllowance":1.5}}`,
+		`{"a":{"systemTextReasoningAllowance":9007199254740992}}`,
+	} {
+		if _, err := newModelMetadataResolver(raw); err == nil {
+			t.Fatalf("invalid runtime capability accepted: %s", raw)
+		}
 	}
 }
