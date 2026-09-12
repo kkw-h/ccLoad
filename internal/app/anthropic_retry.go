@@ -35,6 +35,11 @@ func anthropicRetryBodyFor400(
 		if body, ok := downgradeAnthropicThinkingBlocks(plan.TranslatedBody); ok {
 			return body, "downgrade_anthropic_thinking", true
 		}
+		if anthropicThinkingExplicitlyDisabled(plan.TranslatedBody) && !isAnthropicToolBlockError(errorText) {
+			// The requested mode cannot be repaired; retain the upstream error
+			// instead of retrying unrelated tool changes for a thinking-only error.
+			return nil, "", false
+		}
 	}
 	if isAnthropicToolBlockError(errorText) || isAnthropicThinkingBlockError(errorText) {
 		if body, ok := downgradeAnthropicToolBlocks(plan.TranslatedBody); ok {
@@ -104,6 +109,15 @@ func isAnthropicToolBlockError(errorText string) bool {
 		strings.Contains(errorText, "tool choice") || strings.Contains(errorText, "tool_choice")
 }
 
+func anthropicThinkingExplicitlyDisabled(body []byte) bool {
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())) {
+	case "disabled", "off", "none":
+		return true
+	default:
+		return false
+	}
+}
+
 func downgradeAnthropicThinkingBlocks(body []byte) ([]byte, bool) {
 	if !isMutableJSONObject(body) {
 		return nil, false
@@ -111,6 +125,11 @@ func downgradeAnthropicThinkingBlocks(body []byte) ([]byte, bool) {
 	changed := false
 	updated := body
 	for _, key := range []string{"thinking", "context_management", "output_config.effort"} {
+		// Removing explicit disable would let a thinking-by-default upstream
+		// re-enable it. Other incompatible controls/history can still be repaired.
+		if key == "thinking" && anthropicThinkingExplicitlyDisabled(body) {
+			continue
+		}
 		if !gjson.GetBytes(updated, key).Exists() {
 			continue
 		}
@@ -311,7 +330,7 @@ func anthropicToolResultText(block gjson.Result) string {
 }
 
 func rectifyAnthropicThinkingBudget(body []byte) ([]byte, bool) {
-	if !isMutableJSONObject(body) {
+	if !isMutableJSONObject(body) || anthropicThinkingExplicitlyDisabled(body) {
 		return nil, false
 	}
 	thinking := gjson.GetBytes(body, "thinking")
