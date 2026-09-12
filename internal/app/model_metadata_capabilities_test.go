@@ -1,11 +1,12 @@
 package app
 
 import (
-	"ccLoad/internal/model"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+
+	"ccLoad/internal/model"
 )
 
 func TestModelMetadataResolverMergesOverridesWithBuiltInCatalog(t *testing.T) {
