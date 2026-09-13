@@ -850,7 +850,7 @@ func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 	}
 }
 
-func TestProxy_NativeAnthropic400RepairsToolAndBudget(t *testing.T) {
+func TestProxy_NativeAnthropic400RepairsBudget(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -859,34 +859,6 @@ func TestProxy_NativeAnthropic400RepairsToolAndBudget(t *testing.T) {
 		request       map[string]any
 		assertRetry   func(testing.TB, []byte)
 	}{
-		{
-			name:          "tool blocks",
-			upstreamError: `{"type":"error","error":{"type":"invalid_request_error","message":"tool_use blocks are not supported"}}`,
-			request: map[string]any{
-				"model": "claude-sonnet-4-6", "max_tokens": 4096,
-				"messages": []any{
-					map[string]any{"role": "user", "content": "call a tool"},
-					map[string]any{"role": "assistant", "content": []any{map[string]any{
-						"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": map[string]any{"q": "x"},
-					}}},
-					map[string]any{"role": "user", "content": []any{map[string]any{
-						"type": "tool_result", "tool_use_id": "toolu_1", "content": "result",
-					}}},
-				},
-				"tools":       []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}},
-				"tool_choice": map[string]any{"type": "auto"},
-			},
-			assertRetry: func(t testing.TB, body []byte) {
-				t.Helper()
-				if gjson.GetBytes(body, "tools").Exists() || gjson.GetBytes(body, "tool_choice").Exists() ||
-					strings.Contains(string(body), `"type":"tool_use"`) || strings.Contains(string(body), `"type":"tool_result"`) {
-					t.Fatalf("tool blocks survived retry: %s", body)
-				}
-				if !strings.Contains(string(body), "[Tool call: lookup]") || !strings.Contains(string(body), "[Tool result: toolu_1]") {
-					t.Fatalf("tool semantics were not preserved as text: %s", body)
-				}
-			},
-		},
 		{
 			name:          "thinking budget",
 			upstreamError: `{"type":"error","error":{"type":"invalid_request_error","message":"thinking budget_tokens must be less than max_tokens"}}`,
@@ -997,14 +969,19 @@ func TestProxy_NativeAnthropicRepairFailureUsesNormalChannelRouting(t *testing.T
 		},
 	}, map[int]string{0: "https://first-anthropic.example.com", 1: "https://fallback-anthropic.example.com"})
 	env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if !gjson.GetBytes(body, "tools").IsArray() || gjson.GetBytes(body, "messages.1.content.0.type").String() != "tool_use" {
+			t.Error("channel routing lost executable tools")
+		}
 		if r.URL.Host == "first-anthropic.example.com" {
-			firstAttempts.Add(1)
+			message := "tool_use blocks are not supported"
+			if firstAttempts.Add(1) == 1 {
+				message = "thinking blocks are not supported"
+			}
 			return &http.Response{
 				StatusCode: http.StatusBadRequest,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body: io.NopCloser(strings.NewReader(
-					`{"type":"error","error":{"type":"invalid_request_error","message":"tool_use blocks are not supported"}}`,
-				)),
+				Body:       io.NopCloser(bytes.NewReader(anthropicRetryError(message))),
 			}, nil
 		}
 		fallbackAttempts.Add(1)
@@ -1018,7 +995,8 @@ func TestProxy_NativeAnthropicRepairFailureUsesNormalChannelRouting(t *testing.T
 	})}
 
 	response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
-		"model": "claude-sonnet-4-6", "max_tokens": 1024,
+		"model": "claude-sonnet-4-6", "max_tokens": 4096,
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": 1024},
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hello"},
 			map[string]any{"role": "assistant", "content": []any{map[string]any{

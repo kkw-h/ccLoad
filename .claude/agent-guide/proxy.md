@@ -31,6 +31,9 @@
 
 ## 自定义状态码(改相关代码前先读语义)
 
+- **Anthropic HTTP 400 恢复**(`anthropic_retry.go`):只修复思考预算或不兼容的思考控制/历史,必须保留 `tools`、`tool_choice` 及结构化 `tool_use`/`tool_result` 的内容、顺序与配对。禁止把工具消息改成文字或删除工具能力后重试;无可修复字段时保留上游拒绝,按现有协议/渠道规则处理,候选耗尽后返回错误。重试不能删除或重新启用显式 `thinking.type=disabled/off/none`。
+- **Anthropic 恢复证据**(`proxy_forward.go:forwardAttempt`):每次实际恢复重试前单独记录被拒绝的尝试,普通日志只写 `request repair retry [策略]` 与状态等元数据;原始上游错误及该次 wire 请求仅通过已开启的 Debug 日志保存,沿用请求头脱敏、正文大小上限和保留期。这些条目会计入基于代理日志的尝试数/失败数,不单独触发冷却或 Token 计费;最终成功、错误、取消均保留已用策略。管理测试等 `skipProxyLog` 路径仍由外层统一落日志。
+
 - **499** 客户端取消:不计失败、不冷却;上游直接返回 499:模型级冷却
 - **管理员手动中断**(`admin_active_requests.go`,`POST /admin/active-requests/:request_id/abort`):日志页中止在途请求时注入的 cancel cause(`errOperatorAbort`)**刻意写成 connection reset by peer 形态**——分类器只认错误文本,让手动中断按「上游断链」冒泡,走正常故障切换;改成 `context.Canceled` 或不含该文案会被误判成 499 客户端取消(不计失败、不冷却)。改这两处文案前先读 `proxy_forward.go` 与 `active_requests.go` 的集成测试
 - **596** 1308 配额超限 → Key 级冷却,不计健康度

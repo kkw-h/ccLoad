@@ -2715,6 +2715,18 @@ func (s *Server) forwardAttempt(
 			}
 			missingStoredItemRetries++
 		}
+		if upstreamProtocol == protocol.Anthropic {
+			// Persist the rejected wire attempt before the retry replaces its
+			// debug capture. Raw bodies stay behind the existing Debug switch;
+			// passing no result keeps echoed user content out of this marker.
+			if !reqCtx.skipProxyLog {
+				s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, res.Status, duration, nil,
+					"request repair retry ["+retryStrategy+"]")
+			}
+			reqCtx.attemptSeq++
+			reqCtx.attemptStartTime = time.Now()
+			reqCtx.debugData = nil
+		}
 		retryStrategies = append(retryStrategies, retryStrategy)
 		retryPlan := plan
 		retryPlan.TranslatedBody = retryBody
@@ -2741,6 +2753,10 @@ func (s *Server) forwardAttempt(
 		plan = retryPlan
 		if res != nil && res.DebugData != nil {
 			reqCtx.debugData = res.DebugData
+		}
+		if upstreamProtocol == protocol.Anthropic && res != nil {
+			// Failed or cancelled retries need the same recovery evidence as 200s.
+			res.RetryStrategy = strings.Join(retryStrategies, ",")
 		}
 		if err == nil && res != nil && res.Status >= 200 && res.Status < 300 {
 			res.RetryStrategy = strings.Join(retryStrategies, ",")
