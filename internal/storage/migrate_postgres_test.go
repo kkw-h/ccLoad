@@ -267,7 +267,7 @@ func TestPostgres(t *testing.T) {
 			t.Logf("列 %s.%s 存在", table, col)
 		}
 
-		for _, col := range []string{"auth_token_id", "client_protocol", "client_ip", "minute_bucket", "cache_read_input_tokens", "actual_model", "log_source", "upstream_websocket"} {
+		for _, col := range []string{"auth_token_id", "client_protocol", "client_ip", "minute_bucket", "cache_read_input_tokens", "actual_model", "response_model", "log_source", "upstream_websocket"} {
 			checkCol("logs", col)
 		}
 		for _, col := range []string{
@@ -276,6 +276,9 @@ func TestPostgres(t *testing.T) {
 			"cost_monthly_used_microusd", "cost_monthly_limit_microusd", "cost_monthly_period_start",
 		} {
 			checkCol("auth_tokens", col)
+		}
+		for _, col := range []string{"allowed_models", "model_scope_empty"} {
+			checkCol("api_keys", col)
 		}
 		for _, col := range []string{"daily_cost_limit", "scheduled_check_model", "cost_multiplier"} {
 			checkCol("channels", col)
@@ -433,6 +436,20 @@ func TestPostgres(t *testing.T) {
 		}
 		if len(settings) == 0 {
 			t.Fatal("期望默认 system_settings 非空")
+		}
+		reasoningSetting, err := store.GetSetting(ctx, "model_reasoning_effort_overrides")
+		if err != nil {
+			t.Fatalf("GetSetting model_reasoning_effort_overrides: %v", err)
+		}
+		if reasoningSetting.Value != "{}" || reasoningSetting.ValueType != "json" || reasoningSetting.DefaultValue != "{}" {
+			t.Fatalf("reasoning setting=%+v, want value/default {} and type json", reasoningSetting)
+		}
+		metadataSetting, err := store.GetSetting(ctx, "model_metadata_overrides")
+		if err != nil {
+			t.Fatalf("GetSetting model_metadata_overrides: %v", err)
+		}
+		if metadataSetting.Value != "{}" || metadataSetting.ValueType != "json" || metadataSetting.DefaultValue != "{}" {
+			t.Fatalf("metadata setting=%+v, want value/default {} and type json", metadataSetting)
 		}
 		if err := store.UpdateSetting(ctx, "log_retention_days", "14"); err != nil {
 			t.Fatalf("UpdateSetting: %v", err)
@@ -1067,7 +1084,7 @@ func TestPostgres(t *testing.T) {
 			if err := store.UpdateTokenLastUsed(ctx, tokenValue, time.Now()); err != nil {
 				t.Fatalf("UpdateTokenLastUsed: %v", err)
 			}
-			if err := store.UpdateTokenStats(ctx, tokenValue, true, 0.5, false, 0, 10, 20, 3, 4, 0.01, 0.02, time.Now()); err != nil {
+			if err := store.UpdateTokenStats(ctx, tokenValue, model.TokenStatSuccess(), 0.5, false, 0, 10, 20, 3, 4, 0.01, 0.02, time.Now()); err != nil {
 				t.Fatalf("UpdateTokenStats: %v", err)
 			}
 

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"slices"
@@ -14,10 +15,19 @@ import (
 
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
+
+type failAPIKeyAllowedModelsStore struct {
+	storage.Store
+}
+
+func (s *failAPIKeyAllowedModelsStore) UpdateAPIKeyModelScopes(context.Context, int64, map[int]model.APIKeyModelScope) error {
+	return errors.New("forced API key model scope update failure")
+}
 
 // setupAdminTestServer 创建测试服务器
 func setupAdminTestServer(t *testing.T) (*Server, storage.Store, func()) {
@@ -103,6 +113,136 @@ func TestHandleListChannels(t *testing.T) {
 	}
 }
 
+type adminChannelReasoningModelResponse struct {
+	Model                     string    `json:"model"`
+	RedirectModel             string    `json:"redirect_model"`
+	SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts"`
+	DisplayName               string    `json:"displayName"`
+	Provider                  *string   `json:"provider"`
+	ThinkingLevels            *[]string `json:"thinkingLevels"`
+	ContextWindow             *int64    `json:"contextWindow"`
+	MaxTokens                 *int64    `json:"maxTokens"`
+	InputTypes                *[]string `json:"inputTypes"`
+}
+
+type adminChannelReasoningResponse struct {
+	Models []adminChannelReasoningModelResponse `json:"models"`
+}
+
+func assertAdminChannelReasoningModels(t *testing.T, models []adminChannelReasoningModelResponse) {
+	t.Helper()
+	if len(models) != 3 {
+		t.Fatalf("models=%+v, want 3 entries", models)
+	}
+
+	byName := make(map[string]adminChannelReasoningModelResponse, len(models))
+	for _, entry := range models {
+		byName[entry.Model] = entry
+	}
+
+	sciland := byName["sciland-3.0"]
+	wantEfforts := []string{"low", "medium", "high", "xhigh"}
+	if sciland.RedirectModel != "gpt-5.6-sol" || sciland.SupportedReasoningEfforts == nil ||
+		!slices.Equal(*sciland.SupportedReasoningEfforts, wantEfforts) {
+		t.Fatalf("sciland-3.0=%+v, want redirect gpt-5.6-sol and efforts %v", sciland, wantEfforts)
+	}
+	wantInputTypes := []string{"image", "text"}
+	if sciland.DisplayName != "Sciland 3.0" || sciland.Provider == nil || *sciland.Provider != "Test OpenAI" ||
+		sciland.ThinkingLevels == nil || !slices.Equal(*sciland.ThinkingLevels, wantEfforts) ||
+		sciland.ContextWindow == nil || *sciland.ContextWindow != 300000 ||
+		sciland.MaxTokens == nil || *sciland.MaxTokens != 64000 ||
+		sciland.InputTypes == nil || !slices.Equal(*sciland.InputTypes, wantInputTypes) {
+		t.Fatalf("sciland-3.0 metadata=%+v, want mapped gpt-5.6-sol metadata", sciland)
+	}
+
+	unknown := byName["unknown-model"]
+	if unknown.RedirectModel != "unknown-model" || unknown.SupportedReasoningEfforts != nil {
+		t.Fatalf("unknown-model=%+v, want redirect fallback and omitted efforts", unknown)
+	}
+
+	noThinking := byName["no-thinking"]
+	if noThinking.RedirectModel != "disabled-thinking" || noThinking.SupportedReasoningEfforts == nil ||
+		len(*noThinking.SupportedReasoningEfforts) != 0 {
+		t.Fatalf("no-thinking=%+v, want explicit empty efforts", noThinking)
+	}
+}
+
+func TestAdminChannelResponsesIncludeReasoningEfforts(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	resolver, err := newModelReasoningCapabilityResolver(`{"disabled-thinking":[]}`)
+	if err != nil {
+		t.Fatalf("创建推理能力解析器失败: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+	metadataResolver, err := newModelMetadataResolver(`{
+		"gpt-5.6-sol": {
+			"provider": "Test OpenAI",
+			"contextWindow": 300000,
+			"maxTokens": 64000,
+			"inputTypes": ["text", "image"]
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("创建模型元数据解析器失败: %v", err)
+	}
+	server.modelMetadataCapabilities = metadataResolver
+
+	created, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "reasoning-capability-response",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+		ModelEntries: []model.ModelEntry{
+			{Model: "sciland-3.0", RedirectModel: "gpt-5.6-sol"},
+			{Model: "unknown-model"},
+			{Model: "no-thinking", RedirectModel: "disabled-thinking"},
+		},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("创建渠道失败: %v", err)
+	}
+
+	t.Run("list", func(t *testing.T) {
+		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+		server.HandleChannels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[[]adminChannelReasoningResponse](t, w.Body.Bytes())
+		if len(resp.Data) != 1 {
+			t.Fatalf("channels=%+v, want 1", resp.Data)
+		}
+		assertAdminChannelReasoningModels(t, resp.Data[0].Models)
+	})
+
+	t.Run("detail", func(t *testing.T) {
+		path := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+		c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+		server.HandleChannelByID(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[adminChannelReasoningResponse](t, w.Body.Bytes())
+		assertAdminChannelReasoningModels(t, resp.Data.Models)
+	})
+
+	t.Run("editor", func(t *testing.T) {
+		path := "/admin/channels/" + strconv.FormatInt(created.ID, 10) + "/editor"
+		c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+		server.HandleChannelEditor(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[struct {
+			Channel adminChannelReasoningResponse `json:"channel"`
+		}](t, w.Body.Bytes())
+		assertAdminChannelReasoningModels(t, resp.Data.Channel.Models)
+	})
+}
+
 func TestHandleListChannelsIncludesActiveModelCooldowns(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -158,6 +298,58 @@ func TestHandleListChannelsIncludesActiveModelCooldowns(t *testing.T) {
 	}
 	if got.CooldownRemainingMS <= 0 {
 		t.Fatalf("cooldown_remaining_ms=%d, want > 0", got.CooldownRemainingMS)
+	}
+}
+
+func TestHandleListChannelsIncludesProtocolProbeRetry(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	created, err := store.CreateConfig(context.Background(), &model.Config{
+		Name:         "protocol-probe-retry-list",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority:     100,
+		ModelEntries: []model.ModelEntry{{Model: "model-1"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+	server.protocolCapabilities.set(protocolCapabilityKey{
+		channelID:      created.ID,
+		baseURL:        "https://api.example.com",
+		clientProtocol: protocol.OpenAI,
+		requestFamily:  protocol.RequestFamilyChatCompletions,
+	}, protocolUnsupported)
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+	server.handleListChannels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			ID                            int64      `json:"id"`
+			ProtocolProbeRetryCount       int        `json:"protocol_probe_retry_count"`
+			ProtocolProbeRetryAt          *time.Time `json:"protocol_probe_retry_at"`
+			ProtocolProbeRetryRemainingMS int64      `json:"protocol_probe_retry_remaining_ms"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+	if !resp.Success || len(resp.Data) != 1 {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+	got := resp.Data[0]
+	if got.ID != created.ID || got.ProtocolProbeRetryCount != 1 {
+		t.Fatalf("protocol probe retry summary=%+v, want channel %d count 1", got, created.ID)
+	}
+	if got.ProtocolProbeRetryAt == nil || !got.ProtocolProbeRetryAt.After(time.Now()) {
+		t.Fatalf("protocol_probe_retry_at=%v, want a future time", got.ProtocolProbeRetryAt)
+	}
+	if got.ProtocolProbeRetryRemainingMS <= 0 || got.ProtocolProbeRetryRemainingMS > unsupportedProtocolCapabilityTTL.Milliseconds() {
+		t.Fatalf("protocol_probe_retry_remaining_ms=%d, want within (0, %d]", got.ProtocolProbeRetryRemainingMS, unsupportedProtocolCapabilityTTL.Milliseconds())
 	}
 }
 
@@ -613,6 +805,38 @@ func TestHandleCreateChannel(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandleCreateChannelDisablesEmptiedKeyScope(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	payload := map[string]any{
+		"name": "new-emptied-key-scope",
+		"urls": model.ChannelURLs{{URL: "https://api.example.com"}},
+		"api_keys": []map[string]any{
+			{"api_key": "sk-emptied", "allowed_models": []string{}, "model_scope_empty": true},
+			{"api_key": "sk-unrestricted", "allowed_models": []string{}},
+		},
+		"models":  []model.ModelEntry{{Model: "model-a"}},
+		"enabled": true,
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels", payload))
+	server.handleCreateChannel(c)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", w.Code, w.Body.String())
+	}
+	created := mustParseAPIResponse[*model.Config](t, w.Body.Bytes()).Data
+	if created == nil {
+		t.Fatal("create response missing channel")
+	}
+	keys, err := store.GetAPIKeys(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys: %v", err)
+	}
+	if len(keys) != 2 || !keys[0].Disabled || keys[1].Disabled {
+		t.Fatalf("created keys=%+v, want emptied scope disabled and unrestricted scope enabled", keys)
 	}
 }
 
@@ -1472,6 +1696,78 @@ func TestHandleUpdateChannel_EnableClearsAllCooldownsImmediately(t *testing.T) {
 	}
 }
 
+func TestHandleUpdateChannel_TogglesModelDisabledWithoutChangingChannel(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:     "model-toggle",
+		URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority: 10,
+		ModelEntries: []model.ModelEntry{
+			{Model: "keep-on", RedirectModel: "keep-on"},
+			{Model: "toggle-me", RedirectModel: "toggle-me"},
+		},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+
+	channelPath := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+	disableCtx, disableWriter := newTestContext(t, newJSONRequest(t, http.MethodPut, channelPath, map[string]any{
+		"model":    "toggle-me",
+		"disabled": true,
+	}))
+	server.handleUpdateChannel(disableCtx, created.ID)
+	if disableWriter.Code != http.StatusOK {
+		t.Fatalf("禁用模型失败: %d body=%s", disableWriter.Code, disableWriter.Body.String())
+	}
+
+	stored, err := store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("查询渠道失败: %v", err)
+	}
+	if !stored.Enabled {
+		t.Fatal("禁用模型不应关闭渠道")
+	}
+	disabledByName := map[string]bool{}
+	for _, entry := range stored.ModelEntries {
+		disabledByName[entry.Model] = entry.Disabled
+	}
+	if disabledByName["toggle-me"] != true || disabledByName["keep-on"] {
+		t.Fatalf("模型禁用状态=%v, want toggle-me=true keep-on=false", disabledByName)
+	}
+
+	enableCtx, enableWriter := newTestContext(t, newJSONRequest(t, http.MethodPut, channelPath, map[string]any{
+		"model":    "TOGGLE-ME",
+		"disabled": false,
+	}))
+	server.handleUpdateChannel(enableCtx, created.ID)
+	if enableWriter.Code != http.StatusOK {
+		t.Fatalf("启用模型失败: %d body=%s", enableWriter.Code, enableWriter.Body.String())
+	}
+	stored, err = store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("再次查询渠道失败: %v", err)
+	}
+	for _, entry := range stored.ModelEntries {
+		if entry.Disabled {
+			t.Fatalf("预期模型已全部启用，实际 %+v", stored.ModelEntries)
+		}
+	}
+
+	missingCtx, missingWriter := newTestContext(t, newJSONRequest(t, http.MethodPut, channelPath, map[string]any{
+		"model":    "not-on-channel",
+		"disabled": true,
+	}))
+	server.handleUpdateChannel(missingCtx, created.ID)
+	if missingWriter.Code != http.StatusNotFound {
+		t.Fatalf("缺失模型期望 404，实际 %d body=%s", missingWriter.Code, missingWriter.Body.String())
+	}
+}
+
 func TestHandleAPIKeyToggleRejectsMissingOrNegativeKeyIndex(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -1577,6 +1873,51 @@ func TestHandleAPIKeyToggleInvalidatesKeyCooldownCache(t *testing.T) {
 	}
 }
 
+func TestHandleAPIKeyDisableClearsAutomaticEmptyScope(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "manual-disable-empty-scope",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority:     10,
+		ModelEntries: []model.ModelEntry{{Model: "model-1"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID:       created.ID,
+		KeyIndex:        0,
+		APIKey:          "sk-auto-empty",
+		ModelScopeEmpty: true,
+		Disabled:        true,
+		KeyStrategy:     model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatalf("创建测试 key 失败: %v", err)
+	}
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/1/key-disable", map[string]any{"key_index": 0}))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.HandleAPIKeyDisable(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("手动禁用 key 失败: %d body=%s", w.Code, w.Body.String())
+	}
+
+	key, err := store.GetAPIKey(ctx, created.ID, 0)
+	if err != nil {
+		t.Fatalf("查询 key 失败: %v", err)
+	}
+	if !key.Disabled || key.ModelScopeEmpty {
+		t.Fatalf("手动禁用应清除自动空作用域标记: %+v", key)
+	}
+	if available := availableModelFetchAPIKeys([]*model.APIKey{key}, time.Now()); len(available) != 0 {
+		t.Fatalf("手动禁用 key 不应参与模型探测: %+v", available)
+	}
+}
+
 func TestHandleUpdateChannelPreservesDisabledKeysWhenRebuilding(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -1646,7 +1987,7 @@ func TestHandleChannelAPIKeyNotesCreateReadAndUpdate(t *testing.T) {
 		Name: "key-notes",
 		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 		APIKeys: []ChannelAPIKeyRequest{
-			{APIKey: "sk-primary", Note: "primary"},
+			{APIKey: "sk-primary", Note: "primary", AllowedModels: []string{"model-1"}},
 			{APIKey: "sk-backup", Note: "backup"},
 		},
 		Priority: 10,
@@ -1674,6 +2015,9 @@ func TestHandleChannelAPIKeyNotesCreateReadAndUpdate(t *testing.T) {
 	if len(readResp.Data) != 2 || readResp.Data[0].Note != "primary" || readResp.Data[1].Note != "backup" {
 		t.Fatalf("created key notes = %#v, want primary/backup", readResp.Data)
 	}
+	if !slices.Equal(readResp.Data[0].AllowedModels, []string{"model-1"}) || len(readResp.Data[1].AllowedModels) != 0 {
+		t.Fatalf("created key model scopes = %#v, want [model-1]/unrestricted", readResp.Data)
+	}
 
 	cooldownUntil := time.Now().Add(15 * time.Minute).Truncate(time.Second)
 	if err := store.SetKeyCooldown(ctx, channelID, 1, cooldownUntil); err != nil {
@@ -1685,7 +2029,7 @@ func TestHandleChannelAPIKeyNotesCreateReadAndUpdate(t *testing.T) {
 		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 		APIKeys: []ChannelAPIKeyRequest{
 			{APIKey: "sk-primary", Note: "primary-renamed"},
-			{APIKey: "sk-backup", Note: "backup-renamed"},
+			{APIKey: "sk-backup", Note: "backup-renamed", AllowedModels: []string{"model-1"}},
 		},
 		Priority: 10,
 		Models:   []model.ModelEntry{{Model: "model-1"}},
@@ -1711,8 +2055,196 @@ func TestHandleChannelAPIKeyNotesCreateReadAndUpdate(t *testing.T) {
 	if keys[1].APIKey != "sk-backup" || keys[1].Note != "backup-renamed" {
 		t.Fatalf("keys[1]=%+v, want sk-backup with updated note", keys[1])
 	}
+	if !slices.Equal(keys[0].AllowedModels, []string{"model-1"}) || !slices.Equal(keys[1].AllowedModels, []string{"model-1"}) {
+		t.Fatalf("key model scopes after omitted/explicit update = [%v, %v]", keys[0].AllowedModels, keys[1].AllowedModels)
+	}
 	if keys[1].CooldownUntil != cooldownUntil.Unix() {
 		t.Fatalf("key cooldown after note-only update=%d, want %d", keys[1].CooldownUntil, cooldownUntil.Unix())
+	}
+
+	legacyUpdate := ChannelRequest{
+		Name:     "key-notes",
+		APIKey:   "sk-primary,sk-backup",
+		URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority: 10,
+		Models:   []model.ModelEntry{{Model: "model-1"}},
+		Enabled:  true,
+	}
+	legacyCtx, legacyW := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/channels/"+strconv.FormatInt(channelID, 10), legacyUpdate))
+	legacyCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(channelID, 10)}}
+	server.handleUpdateChannel(legacyCtx, channelID)
+	if legacyW.Code != http.StatusOK {
+		t.Fatalf("legacy update status=%d body=%s", legacyW.Code, legacyW.Body.String())
+	}
+	keys, err = store.GetAPIKeys(ctx, channelID)
+	if err != nil {
+		t.Fatalf("get keys after legacy update: %v", err)
+	}
+	if !slices.Equal(keys[0].AllowedModels, []string{"model-1"}) || !slices.Equal(keys[1].AllowedModels, []string{"model-1"}) {
+		t.Fatalf("legacy update cleared model scopes: [%v, %v]", keys[0].AllowedModels, keys[1].AllowedModels)
+	}
+
+	clearPayload := map[string]any{
+		"name": "key-notes",
+		"api_keys": []map[string]any{
+			{"api_key": "sk-primary", "allowed_models": []string{}},
+			{"api_key": "sk-backup"},
+		},
+		"urls":     model.ChannelURLs{{URL: "https://api.example.com"}},
+		"priority": 10,
+		"models":   []model.ModelEntry{{Model: "model-1"}},
+		"enabled":  true,
+	}
+	clearCtx, clearW := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/channels/"+strconv.FormatInt(channelID, 10), clearPayload))
+	clearCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(channelID, 10)}}
+	server.handleUpdateChannel(clearCtx, channelID)
+	if clearW.Code != http.StatusOK {
+		t.Fatalf("explicit clear status=%d body=%s", clearW.Code, clearW.Body.String())
+	}
+	keys, err = store.GetAPIKeys(ctx, channelID)
+	if err != nil {
+		t.Fatalf("get keys after explicit clear: %v", err)
+	}
+	if len(keys[0].AllowedModels) != 0 || !slices.Equal(keys[1].AllowedModels, []string{"model-1"}) {
+		t.Fatalf("explicit clear result = [%v, %v]", keys[0].AllowedModels, keys[1].AllowedModels)
+	}
+}
+
+func TestHandleUpdateChannelDisablesEmptiedScopeWhenRebuildingKeys(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "scope-rebuild", URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "model-a"}, {Model: "model-b"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-scoped", AllowedModels: []string{"model-b"},
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+
+	payload := map[string]any{
+		"name": "scope-rebuild",
+		"urls": model.ChannelURLs{{URL: "https://api.example.com"}},
+		"api_keys": []map[string]any{
+			// The editor is stale and still submits the deleted model. The
+			// backend must prune it before rebuilding the key rows.
+			{"api_key": "sk-scoped", "allowed_models": []string{"model-b"}},
+			{"api_key": "sk-new", "allowed_models": []string{}},
+		},
+		"models":  []model.ModelEntry{{Model: "model-a"}},
+		"enabled": true,
+	}
+	requestPath := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, requestPath, payload))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.handleUpdateChannel(c, created.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	keys, err := store.GetAPIKeys(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys: %v", err)
+	}
+	if len(keys) != 2 || !keys[0].Disabled || keys[1].Disabled {
+		t.Fatalf("rebuilt keys=%+v, want emptied existing scope disabled and new unrestricted key enabled", keys)
+	}
+
+	// An automatically disabled empty-scope key can be explicitly enabled as
+	// unrestricted access without rebuilding the channel.
+	enableCtx, enableW := newTestContext(t, newJSONRequest(t, http.MethodPost,
+		"/admin/channels/"+strconv.FormatInt(created.ID, 10)+"/key-enable",
+		map[string]any{"key_index": 0}))
+	enableCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.HandleAPIKeyEnable(enableCtx)
+	if enableW.Code != http.StatusOK {
+		t.Fatalf("enable empty-scope key status=%d body=%s, want 200", enableW.Code, enableW.Body.String())
+	}
+	keys, err = store.GetAPIKeys(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys after direct enable: %v", err)
+	}
+	if len(keys) != 2 || keys[0].Disabled || keys[0].ModelScopeEmpty || len(keys[0].AllowedModels) != 0 || !keys[0].AllowsModel("model-a") {
+		t.Fatalf("direct enable result=%+v, want first key enabled and unrestricted", keys)
+	}
+
+	// Explicitly clearing the scope means unrestricted access and must restore
+	// a key that was disabled only by the automatic empty-scope transition.
+	allowAllPayload := map[string]any{
+		"name": "scope-rebuild",
+		"urls": model.ChannelURLs{{URL: "https://api.example.com"}},
+		"api_keys": []map[string]any{
+			{"api_key": "sk-scoped", "allowed_models": []string{}, "model_scope_empty": false},
+			{"api_key": "sk-new", "allowed_models": []string{}, "model_scope_empty": false},
+		},
+		"models":  []model.ModelEntry{{Model: "model-a"}},
+		"enabled": true,
+	}
+	allowAllCtx, allowAllW := newTestContext(t, newJSONRequest(t, http.MethodPut, requestPath, allowAllPayload))
+	allowAllCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.handleUpdateChannel(allowAllCtx, created.ID)
+	if allowAllW.Code != http.StatusOK {
+		t.Fatalf("allow-all update status=%d body=%s", allowAllW.Code, allowAllW.Body.String())
+	}
+	keys, err = store.GetAPIKeys(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys after allow-all: %v", err)
+	}
+	if len(keys) != 2 || keys[0].Disabled || keys[0].ModelScopeEmpty || !keys[0].AllowsModel("model-a") {
+		t.Fatalf("allow-all scope result=%+v, want first key enabled and unrestricted", keys)
+	}
+}
+
+func TestHandleUpdateChannel_APIKeyAllowedModelsFailureIsReturned(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "scope-update-failure",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority:     10,
+		ModelEntries: []model.ModelEntry{{Model: "model-1"}, {Model: "model-2"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("create config: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-primary", AllowedModels: []string{"model-1"},
+	}}); err != nil {
+		t.Fatalf("create API key: %v", err)
+	}
+	server.store = &failAPIKeyAllowedModelsStore{Store: store}
+
+	payload := map[string]any{
+		"name": "scope-update-failure",
+		"api_keys": []map[string]any{{
+			"api_key": "sk-primary", "allowed_models": []string{"model-2"},
+		}},
+		"urls":     model.ChannelURLs{{URL: "https://api.example.com"}},
+		"priority": 10,
+		"models":   []model.ModelEntry{{Model: "model-1"}, {Model: "model-2"}},
+		"enabled":  true,
+	}
+	updateCtx, updateW := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/channels/"+strconv.FormatInt(created.ID, 10), payload))
+	updateCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.handleUpdateChannel(updateCtx, created.ID)
+	if updateW.Code != http.StatusInternalServerError {
+		t.Fatalf("update status=%d body=%s, want 500", updateW.Code, updateW.Body.String())
+	}
+	keys, err := store.GetAPIKeys(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get keys: %v", err)
+	}
+	if len(keys) != 1 || !slices.Equal(keys[0].AllowedModels, []string{"model-1"}) {
+		t.Fatalf("persisted model scope after failed update=%v, want [model-1]", keys)
 	}
 }
 

@@ -80,7 +80,15 @@ func (wb *WhereBuilder) ApplyLogFilter(filter *model.LogFilter) *WhereBuilder {
 	if filter.StatusCode != nil {
 		wb.AddCondition("status_code = ?", *filter.StatusCode)
 	}
-	if filter.AuthTokenID != nil {
+	if len(filter.AuthTokenIDs) > 0 {
+		placeholders := make([]string, len(filter.AuthTokenIDs))
+		args := make([]any, len(filter.AuthTokenIDs))
+		for i, id := range filter.AuthTokenIDs {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		wb.AddCondition("auth_token_id IN ("+strings.Join(placeholders, ", ")+")", args...)
+	} else if filter.AuthTokenID != nil {
 		wb.AddCondition("auth_token_id = ?", *filter.AuthTokenID)
 	}
 	switch filter.LogSource {

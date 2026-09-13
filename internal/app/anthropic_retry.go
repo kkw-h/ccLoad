@@ -2,10 +2,16 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"ccLoad/internal/protocol"
+	cliproxycommon "ccLoad/internal/protocol/cliproxy/common"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func anthropicRetryBodyFor400(
@@ -30,11 +36,9 @@ func anthropicRetryBodyFor400(
 			return body, "downgrade_anthropic_thinking", true
 		}
 	}
-	if isAnthropicToolBlockError(errorText) || isAnthropicThinkingBlockError(errorText) {
-		if body, ok := downgradeAnthropicToolBlocks(plan.TranslatedBody); ok {
-			return body, "downgrade_anthropic_tools", true
-		}
-	}
+	// Tool definitions and structured history are the caller's executable
+	// contract. If thinking-only repairs cannot help, return the rejection;
+	// textualizing tools must never turn an unsupported request into success.
 	return nil, "", false
 }
 
@@ -93,173 +97,167 @@ func isAnthropicThinkingBlockError(errorText string) bool {
 	return strings.Contains(errorText, "thinking") || strings.Contains(errorText, "redacted_thinking")
 }
 
-func isAnthropicToolBlockError(errorText string) bool {
-	return strings.Contains(errorText, "tool_use") || strings.Contains(errorText, "tool_result") ||
-		strings.Contains(errorText, "tool choice") || strings.Contains(errorText, "tool_choice")
+func anthropicThinkingExplicitlyDisabled(body []byte) bool {
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())) {
+	case "disabled", "off", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 func downgradeAnthropicThinkingBlocks(body []byte) ([]byte, bool) {
-	request, err := decodeAnthropicRequest(body)
-	if err != nil {
+	if !isMutableJSONObject(body) {
 		return nil, false
 	}
 	changed := false
-	if _, exists := request["thinking"]; exists {
-		delete(request, "thinking")
-		deleteAnthropicOutputEffort(request)
-		changed = true
-	}
-	if _, exists := request["context_management"]; exists {
-		delete(request, "context_management")
-		changed = true
-	}
-	messages, _ := request["messages"].([]any)
-	filteredMessages := make([]any, 0, len(messages))
-	for _, rawMessage := range messages {
-		message, ok := rawMessage.(map[string]any)
-		if !ok {
-			filteredMessages = append(filteredMessages, rawMessage)
+	updated := body
+	for _, key := range []string{"thinking", "context_management", "output_config.effort"} {
+		// Absence may enable an upstream's default thinking mode. Keep an
+		// explicit disable while repairing incompatible controls/history.
+		if key == "thinking" && anthropicThinkingExplicitlyDisabled(body) {
 			continue
 		}
-		content, ok := message["content"].([]any)
-		if !ok {
-			filteredMessages = append(filteredMessages, message)
+		if !gjson.GetBytes(updated, key).Exists() {
 			continue
 		}
-		filteredContent := make([]any, 0, len(content))
-		for _, rawBlock := range content {
-			block, ok := rawBlock.(map[string]any)
-			if !ok {
-				filteredContent = append(filteredContent, rawBlock)
+		var err error
+		updated, err = sjson.DeleteBytes(updated, key)
+		if err != nil {
+			return nil, false
+		}
+		changed = true
+	}
+	if outputConfig := gjson.GetBytes(updated, "output_config"); outputConfig.IsObject() {
+		empty := true
+		outputConfig.ForEach(func(_, _ gjson.Result) bool {
+			empty = false
+			return false
+		})
+		if empty {
+			var err error
+			updated, err = sjson.DeleteBytes(updated, "output_config")
+			if err != nil {
+				return nil, false
+			}
+		}
+	}
+	messages := gjson.GetBytes(updated, "messages")
+	if !messages.IsArray() {
+		if !changed {
+			return nil, false
+		}
+		return updated, true
+	}
+	for messageIndex := len(messages.Array()) - 1; messageIndex >= 0; messageIndex-- {
+		message := gjson.GetBytes(updated, fmt.Sprintf("messages.%d", messageIndex))
+		content := message.Get("content")
+		if !message.IsObject() || !content.IsArray() {
+			continue
+		}
+		rendered := make([][]byte, 0, len(content.Array()))
+		messageChanged := false
+		for _, block := range content.Array() {
+			if !block.IsObject() {
+				rendered = append(rendered, []byte(block.Raw))
 				continue
 			}
-			switch stringValue(block["type"]) {
+			switch block.Get("type").String() {
 			case "thinking":
-				changed = true
-				if text := strings.TrimSpace(stringValue(block["thinking"])); text != "" {
-					replacement := map[string]any{"type": "text", "text": text}
-					if cache, exists := block["cache_control"]; exists {
-						replacement["cache_control"] = cache
+				messageChanged = true
+				textValue := block.Get("thinking")
+				if textValue.Type == gjson.String && strings.TrimSpace(textValue.String()) != "" {
+					text := strings.TrimSpace(textValue.String())
+					replacement, err := marshalAnthropicTextBlock(text, block.Get("cache_control"))
+					if err != nil {
+						return nil, false
 					}
-					filteredContent = append(filteredContent, replacement)
+					rendered = append(rendered, replacement)
 				}
 			case "redacted_thinking":
-				changed = true
+				messageChanged = true
 			default:
-				filteredContent = append(filteredContent, block)
+				rendered = append(rendered, []byte(block.Raw))
 			}
 		}
-		if len(filteredContent) == 0 {
-			changed = true
+		if !messageChanged {
 			continue
 		}
-		message["content"] = filteredContent
-		filteredMessages = append(filteredMessages, message)
-	}
-	request["messages"] = filteredMessages
-	if !changed {
-		return nil, false
-	}
-	encoded, err := json.Marshal(request)
-	return encoded, err == nil
-}
-
-func downgradeAnthropicToolBlocks(body []byte) ([]byte, bool) {
-	request, err := decodeAnthropicRequest(body)
-	if err != nil {
-		return nil, false
-	}
-	changed := false
-	if _, exists := request["tools"]; exists {
-		delete(request, "tools")
 		changed = true
-	}
-	if _, exists := request["tool_choice"]; exists {
-		delete(request, "tool_choice")
-		changed = true
-	}
-	messages, _ := request["messages"].([]any)
-	for _, rawMessage := range messages {
-		message, ok := rawMessage.(map[string]any)
-		if !ok {
-			continue
+		var err error
+		if len(rendered) == 0 {
+			updated, err = sjson.DeleteBytes(updated, fmt.Sprintf("messages.%d", messageIndex))
+		} else {
+			updated, err = sjson.SetRawBytes(updated, fmt.Sprintf("messages.%d.content", messageIndex), cliproxycommon.JoinRawArray(rendered))
 		}
-		content, ok := message["content"].([]any)
-		if !ok {
-			continue
-		}
-		for index, rawBlock := range content {
-			block, ok := rawBlock.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch stringValue(block["type"]) {
-			case "tool_use":
-				content[index] = map[string]any{"type": "text", "text": anthropicToolUseText(block)}
-				changed = true
-			case "tool_result":
-				content[index] = map[string]any{"type": "text", "text": anthropicToolResultText(block)}
-				changed = true
-			}
+		if err != nil {
+			return nil, false
 		}
 	}
 	if !changed {
 		return nil, false
 	}
-	encoded, err := json.Marshal(request)
-	return encoded, err == nil
+	return updated, true
 }
 
-func anthropicToolUseText(block map[string]any) string {
-	payload, _ := json.Marshal(block["input"])
-	return "[Tool call: " + stringValue(block["name"]) + "]\n" + string(payload)
-}
-
-func anthropicToolResultText(block map[string]any) string {
-	prefix := "[Tool result: " + stringValue(block["tool_use_id"]) + "]\n"
-	switch content := block["content"].(type) {
-	case string:
-		return prefix + content
-	case []any:
-		parts := make([]string, 0, len(content))
-		for _, raw := range content {
-			if nested, ok := raw.(map[string]any); ok && stringValue(nested["type"]) == "text" {
-				parts = append(parts, stringValue(nested["text"]))
-				continue
-			}
-			encoded, _ := json.Marshal(raw)
-			parts = append(parts, string(encoded))
-		}
-		return prefix + strings.Join(parts, "\n")
-	default:
-		encoded, _ := json.Marshal(content)
-		return prefix + string(encoded)
+func marshalAnthropicTextBlock(text string, cacheControl gjson.Result) ([]byte, error) {
+	block := struct {
+		Type         string          `json:"type"`
+		Text         string          `json:"text"`
+		CacheControl json.RawMessage `json:"cache_control,omitempty"`
+	}{Type: "text", Text: text}
+	if cacheControl.Exists() {
+		block.CacheControl = json.RawMessage(cacheControl.Raw)
 	}
+	return json.Marshal(block)
 }
 
 func rectifyAnthropicThinkingBudget(body []byte) ([]byte, bool) {
-	request, err := decodeAnthropicRequest(body)
-	if err != nil {
+	if !isMutableJSONObject(body) || anthropicThinkingExplicitlyDisabled(body) {
 		return nil, false
 	}
-	thinking, ok := request["thinking"].(map[string]any)
-	if !ok || strings.EqualFold(stringValue(thinking["type"]), "adaptive") {
+	thinking := gjson.GetBytes(body, "thinking")
+	if !thinking.IsObject() || strings.EqualFold(thinking.Get("type").String(), "adaptive") {
 		return nil, false
 	}
 	const repairedBudget int64 = 32000
-	changed := !strings.EqualFold(stringValue(thinking["type"]), "enabled")
-	thinking["type"] = "enabled"
-	if budget, ok := anthropicInteger(thinking["budget_tokens"]); !ok || budget != repairedBudget {
-		thinking["budget_tokens"] = repairedBudget
+	changed := !strings.EqualFold(thinking.Get("type").String(), "enabled")
+	budget := thinking.Get("budget_tokens")
+	budgetValue, budgetOK := anthropicRetryInteger(budget)
+	if !budgetOK || budgetValue != repairedBudget {
 		changed = true
 	}
-	if maxTokens, ok := anthropicInteger(request["max_tokens"]); !ok || maxTokens <= repairedBudget {
-		request["max_tokens"] = int64(64000)
+	maxTokens := gjson.GetBytes(body, "max_tokens")
+	maxTokensValue, maxTokensOK := anthropicRetryInteger(maxTokens)
+	if !maxTokensOK || maxTokensValue <= repairedBudget {
 		changed = true
 	}
 	if !changed {
 		return nil, false
 	}
-	encoded, err := json.Marshal(request)
-	return encoded, err == nil
+	updated, err := sjson.SetBytes(body, "thinking.type", "enabled")
+	if err != nil {
+		return nil, false
+	}
+	if !budgetOK || budgetValue != repairedBudget {
+		updated, err = sjson.SetBytes(updated, "thinking.budget_tokens", repairedBudget)
+		if err != nil {
+			return nil, false
+		}
+	}
+	if !maxTokensOK || maxTokensValue <= repairedBudget {
+		updated, err = sjson.SetBytes(updated, "max_tokens", int64(64000))
+		if err != nil {
+			return nil, false
+		}
+	}
+	return updated, true
+}
+
+func anthropicRetryInteger(value gjson.Result) (int64, bool) {
+	if value.Type != gjson.Number {
+		return 0, false
+	}
+	number, err := strconv.ParseInt(strings.TrimSpace(value.Raw), 10, 64)
+	return number, err == nil
 }

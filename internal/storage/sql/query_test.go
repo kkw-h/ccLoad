@@ -1,6 +1,7 @@
 package sql_test
 
 import (
+	"strings"
 	"testing"
 
 	"ccLoad/internal/model"
@@ -73,6 +74,13 @@ func TestWhereBuilder_ApplyLogFilter(t *testing.T) {
 			expectArgsLen: 2,
 		},
 		{
+			name: "multiple auth_token_id filter",
+			filter: &model.LogFilter{
+				AuthTokenIDs: []int64{7, 9},
+			},
+			expectArgsLen: 3,
+		},
+		{
 			name: "all filters combined",
 			filter: &model.LogFilter{
 				ChannelID:   &channelID,
@@ -86,6 +94,13 @@ func TestWhereBuilder_ApplyLogFilter(t *testing.T) {
 			name: "scheduled_check source",
 			filter: &model.LogFilter{
 				LogSource: model.LogSourceScheduledCheck,
+			},
+			expectArgsLen: 1,
+		},
+		{
+			name: "checkin source uses exact equality",
+			filter: &model.LogFilter{
+				LogSource: model.LogSourceCheckin,
 			},
 			expectArgsLen: 1,
 		},
@@ -118,6 +133,9 @@ func TestWhereBuilder_ApplyLogFilter(t *testing.T) {
 			if clause == "" {
 				t.Error("expected non-empty clause")
 			}
+			if tt.name == "multiple auth_token_id filter" && !strings.Contains(clause, "auth_token_id IN (?, ?)") {
+				t.Errorf("multiple auth token clause=%q, want IN (?, ?)", clause)
+			}
 			if tt.filter != nil && tt.filter.LogSource == model.LogSourceDetection && clause != "log_source IN (?, ?, ?)" {
 				t.Errorf("unexpected detection clause: %q", clause)
 			}
@@ -130,6 +148,11 @@ func TestWhereBuilder_ApplyLogFilter(t *testing.T) {
 					if args[i] != arg {
 						t.Fatalf("detection arg[%d]=%v, want %v; args=%v", i, args[i], arg, args)
 					}
+				}
+			}
+			if tt.filter != nil && tt.filter.LogSource == model.LogSourceCheckin {
+				if clause != "log_source = ?" || len(args) != 1 || args[0] != model.LogSourceCheckin {
+					t.Fatalf("checkin filter = (%q, %v), want exact equality", clause, args)
 				}
 			}
 			if tt.filter == nil && clause != "log_source = ?" {

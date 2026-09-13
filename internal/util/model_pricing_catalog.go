@@ -45,6 +45,10 @@ type TokenPricingTier struct {
 }
 
 var (
+	gpt6AstraTiers = []TokenPricingTier{
+		{MaxInputTokens: 272_000, InputPrice: 10.00, OutputPrice: 50.00, CacheReadPrice: 1.00, HasCacheReadPrice: true},
+		{InputPrice: 20.00, OutputPrice: 75.00, CacheReadPrice: 2.00, HasCacheReadPrice: true},
+	}
 	gpt56SolTiers = []TokenPricingTier{
 		{MaxInputTokens: 272_000, InputPrice: 5.00, OutputPrice: 30.00, CacheReadPrice: 0.50, HasCacheReadPrice: true},
 		{InputPrice: 10.00, OutputPrice: 45.00, CacheReadPrice: 1.00, HasCacheReadPrice: true},
@@ -110,6 +114,11 @@ var (
 		InputPriceHigh: 4.00, OutputPriceHigh: 12.00, CacheReadPriceHigh: 1.00,
 		CacheReadCountsTowardTier: true,
 	}
+	grok46Pricing = ModelPricing{
+		InputPrice: 2.00, OutputPrice: 6.00, CacheReadPrice: 0.50, HasCacheReadPrice: true,
+		InputPriceHigh: 4.00, OutputPriceHigh: 12.00, CacheReadPriceHigh: 1.00,
+		CacheReadCountsTowardTier: true,
+	}
 	grok420Pricing = ModelPricing{
 		InputPrice: 1.25, OutputPrice: 2.50, CacheReadPrice: 0.20, HasCacheReadPrice: true,
 		InputPriceHigh: 2.50, OutputPriceHigh: 5.00, CacheReadPriceHigh: 0.40,
@@ -139,12 +148,16 @@ var basePricing = map[string]ModelPricing{
 		InputPrice: 3.00, OutputPrice: 15.00,
 		InputPriceHigh: 6.00, OutputPriceHigh: 22.50, // >200k context
 	},
-	"claude-haiku-4-5":  {InputPrice: 1.00, OutputPrice: 5.00},
-	"claude-opus-4-1":   {InputPrice: 15.00, OutputPrice: 75.00},
-	"claude-opus-4-0":   {InputPrice: 15.00, OutputPrice: 75.00},
-	"claude-opus-4-6":   {InputPrice: 5.00, OutputPrice: 25.00},  // 全1M窗口统一价格
-	"claude-opus-4-7":   {InputPrice: 5.00, OutputPrice: 25.00},  // 全1M窗口统一价格
-	"claude-opus-4-8":   {InputPrice: 5.00, OutputPrice: 25.00},  // 全1M窗口统一价格
+	"claude-haiku-4-5": {InputPrice: 1.00, OutputPrice: 5.00},
+	"claude-opus-4-1":  {InputPrice: 15.00, OutputPrice: 75.00},
+	"claude-opus-4-0":  {InputPrice: 15.00, OutputPrice: 75.00},
+	"claude-opus-4-6":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-opus-4-7":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-opus-4-8":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-opus-5":    {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-fable-5-1": {
+		InputPrice: 10.00, OutputPrice: 50.00, CacheReadPrice: 0.25, HasCacheReadPrice: true,
+	},
 	"claude-fable-5":    {InputPrice: 10.00, OutputPrice: 50.00}, // claude-opus-4-8 两倍
 	"claude-opus-4-5":   {InputPrice: 5.00, OutputPrice: 25.00},
 	"claude-3-7-sonnet": {InputPrice: 3.00, OutputPrice: 15.00},
@@ -158,7 +171,11 @@ var basePricing = map[string]ModelPricing{
 	"claude-sonnet": {InputPrice: 3.00, OutputPrice: 15.00},
 	"claude-haiku":  {InputPrice: 1.00, OutputPrice: 5.00},
 
-	// ========== OpenAI GPT-5系列 ==========
+	// ========== OpenAI GPT 系列 ==========
+	"gpt-6-astra": {
+		InputPrice: 10.00, OutputPrice: 50.00, CacheReadPrice: 1.00, HasCacheReadPrice: true,
+		TokenPricingTiers: gpt6AstraTiers, CacheReadCountsTowardTier: true,
+	},
 	"gpt-5.6": {
 		InputPrice: 5.00, OutputPrice: 30.00, CacheReadPrice: 0.50, HasCacheReadPrice: true,
 		TokenPricingTiers: gpt56SolTiers, CacheReadCountsTowardTier: true,
@@ -544,6 +561,7 @@ var basePricing = map[string]ModelPricing{
 
 	// ========== xAI Grok 模型 ==========
 	// 来源: https://docs.x.ai/developers/pricing
+	"grok-4.6":                     grok46Pricing,
 	"grok-4.5":                     grok45Pricing,
 	"grok-4.3":                     grok420Pricing,
 	"grok-4.20":                    grok420Pricing,

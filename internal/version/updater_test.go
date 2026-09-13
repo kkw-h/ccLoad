@@ -21,6 +21,11 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func testReleaseChecksums(application []byte) string {
+	sum := sha256.Sum256(application)
+	return fmt.Sprintf("%s  ccload-linux-amd64\n", hex.EncodeToString(sum[:]))
+}
+
 func TestCompareSemanticVersions(t *testing.T) {
 	t.Parallel()
 
@@ -93,10 +98,10 @@ func TestUpdateManagerReleaseSourceConfiguration(t *testing.T) {
 		})
 	})
 
-	t.Run("preview reads published GitHub releases", func(t *testing.T) {
+	t.Run("preview reads the GitHub releases feed", func(t *testing.T) {
 		t.Setenv("CCLOAD_RELEASE_BASE_URL", "")
 		assertUpdateManagerReleaseRequests(t, ReleaseChannelPreview, []string{
-			"https://api.github.com/repos/caidaoli/ccLoad/releases?per_page=100",
+			"https://github.com/caidaoli/ccLoad/releases.atom",
 		})
 	})
 
@@ -200,27 +205,121 @@ func TestUpdateManagerCheckOnlyPublishesReleaseStateWithoutDownload(t *testing.T
 	}
 }
 
+func TestUpdateManagerCheckNowAppliesReleaseWhenScheduledChecksAreDisabled(t *testing.T) {
+	origVersion := Version
+	t.Cleanup(func() { Version = origVersion })
+	Version = "v1.0.0"
+
+	application := []byte("new application")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest":
+			http.Redirect(w, r, "/caidaoli/ccLoad/releases/tag/v1.1.0", http.StatusFound)
+		case "/caidaoli/ccLoad/releases/tag/v1.1.0":
+			_, _ = fmt.Fprint(w, "<html></html>")
+		case "/download/v1.1.0/checksums.txt":
+			_, _ = fmt.Fprint(w, testReleaseChecksums(application))
+		case "/download/v1.1.0/ccload-linux-amd64":
+			_, _ = w.Write(application)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	executablePath := filepath.Join(t.TempDir(), "ccload")
+	if err := os.WriteFile(executablePath, []byte("old application"), 0o755); err != nil {
+		t.Fatalf("write old executable: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	manager, err := NewUpdateManager(UpdateManagerOptions{
+		Interval:     0,
+		ApplyUpdates: true,
+		ReleaseSources: []ReleaseSource{{
+			Name:            "test",
+			LatestURL:       server.URL + "/latest",
+			DownloadBaseURL: server.URL + "/download",
+		}},
+		ExecutablePath:      executablePath,
+		GOOS:                "linux",
+		GOARCH:              "amd64",
+		Client:              server.Client(),
+		ActiveRequests:      func() int { return 1 },
+		RestartPollInterval: time.Hour,
+		Restart:             func() {},
+	})
+	if err != nil {
+		t.Fatalf("NewUpdateManager: %v", err)
+	}
+
+	if err := manager.CheckNow(ctx); err != nil {
+		t.Fatalf("CheckNow: %v", err)
+	}
+
+	state := manager.State()
+	if state.LatestVersion != "v1.1.0" || !state.HasUpdate || !state.PendingRestart || state.PendingVersion != "v1.1.0" {
+		t.Fatalf("update state = %+v", state)
+	}
+	got, err := os.ReadFile(executablePath)
+	if err != nil {
+		t.Fatalf("read executable: %v", err)
+	}
+	if string(got) != string(application) {
+		t.Fatalf("executable content = %q, want %q", got, application)
+	}
+}
+
+func TestUpdateManagerCheckNowRejectsDevelopmentVersion(t *testing.T) {
+	origVersion := Version
+	t.Cleanup(func() { Version = origVersion })
+	Version = "dev"
+
+	var requests atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, errors.New("release metadata must not be requested")
+	})}
+	manager, err := NewUpdateManager(UpdateManagerOptions{
+		Interval: 0,
+		Client:   client,
+		ReleaseSources: []ReleaseSource{{
+			Name:      "test",
+			LatestURL: "https://example.test/latest",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewUpdateManager: %v", err)
+	}
+
+	if err := manager.CheckNow(context.Background()); err == nil {
+		t.Fatal("CheckNow must reject development versions")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("release metadata requests = %d, want 0", requests.Load())
+	}
+}
+
 func TestUpdateManagerPreviewChannelSelectsHighestPublishedRelease(t *testing.T) {
 	origVersion := Version
 	t.Cleanup(func() { Version = origVersion })
 	Version = "v1.0.0"
 
 	binary := []byte("preview binary")
-	sum := sha256.Sum256(binary)
-	checksum := hex.EncodeToString(sum[:]) + "  ccload-linux-amd64\n"
+	checksum := testReleaseChecksums(binary)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/releases":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `[
-  {"tag_name":"not-semver","html_url":"https://example.test/releases/tag/not-semver","draft":false,"prerelease":true,"published_at":"2026-08-07T01:00:00Z"},
-  {"tag_name":"v9.0.0-beta.1","html_url":"https://example.test/releases/tag/v9.0.0-beta.1","draft":true,"prerelease":true,"published_at":"2026-08-07T01:00:00Z"},
-  {"tag_name":"v8.0.0-beta.1","html_url":"https://example.test/releases/tag/v8.0.0-beta.1","draft":false,"prerelease":true,"published_at":null},
-  {"tag_name":"v1.1.0-beta.1","html_url":"https://example.test/releases/tag/v1.1.0-beta.1","draft":false,"prerelease":true,"published_at":"2026-08-07T01:00:00Z"},
-  {"tag_name":"v1.1.0-beta.2","html_url":"https://example.test/releases/tag/v1.1.0-beta.2","draft":false,"prerelease":true,"published_at":"2026-08-07T02:00:00Z"},
-  {"tag_name":"v1.0.5","html_url":"https://example.test/releases/tag/v1.0.5","draft":false,"prerelease":false,"published_at":"2026-08-07T03:00:00Z"}
-]`)
+		case "/releases.atom":
+			w.Header().Set("Content-Type", "application/atom+xml")
+			_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><link rel="alternate" href="https://example.test/releases/tag/not-semver"/><title>Release not-semver</title></entry>
+  <entry><link rel="alternate" href="https://example.test/releases/tag/v1.1.0-beta.1"/><title>Release v1.1.0-beta.1</title></entry>
+  <entry><link rel="alternate" href="https://example.test/releases/tag/v1.1.0-beta.2"/><title>Release v1.1.0-beta.2</title></entry>
+  <entry><link rel="alternate" href="https://example.test/releases/tag/v1.0.5"/><title>Release v1.0.5</title></entry>
+</feed>`)
 		case "/download/v1.1.0-beta.2/checksums.txt":
 			_, _ = fmt.Fprint(w, checksum)
 		case "/download/v1.1.0-beta.2/ccload-linux-amd64":
@@ -242,7 +341,7 @@ func TestUpdateManagerPreviewChannelSelectsHighestPublishedRelease(t *testing.T)
 		ApplyUpdates: true,
 		ReleaseSources: []ReleaseSource{{
 			Name:            "test",
-			ReleasesURL:     server.URL + "/releases",
+			ReleasesURL:     server.URL + "/releases.atom",
 			DownloadBaseURL: server.URL + "/download",
 		}},
 		ExecutablePath: exePath,
@@ -283,21 +382,67 @@ func TestUpdateManagerPreviewChannelSelectsHighestPublishedRelease(t *testing.T)
 	}
 }
 
+func TestUpdateManagerChecksumFailureLeavesExecutableUntouched(t *testing.T) {
+	origVersion := Version
+	t.Cleanup(func() { Version = origVersion })
+	Version = "v1.0.0"
+	application := []byte("new app")
+	checksum := testReleaseChecksums(application)
+	applicationSum := sha256.Sum256(application)
+	checksum = strings.Replace(checksum, hex.EncodeToString(applicationSum[:]), strings.Repeat("0", 64), 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/latest":
+			http.Redirect(w, r, "/releases/tag/v1.1.0", http.StatusFound)
+		case r.URL.Path == "/releases/tag/v1.1.0":
+			_, _ = fmt.Fprint(w, "<html></html>")
+		case strings.HasSuffix(r.URL.Path, "/checksums.txt"):
+			_, _ = fmt.Fprint(w, checksum)
+		case strings.HasSuffix(r.URL.Path, "/ccload-linux-amd64"):
+			_, _ = w.Write(application)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "ccload")
+	if err := os.WriteFile(exePath, []byte("old app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updater, err := NewUpdateManager(UpdateManagerOptions{
+		Interval: time.Hour, ApplyUpdates: true,
+		ReleaseSources: []ReleaseSource{{Name: "test", LatestURL: server.URL + "/latest", DownloadBaseURL: server.URL + "/download"}},
+		ExecutablePath: exePath, Client: server.Client(), GOOS: "linux", GOARCH: "amd64", Restart: func() {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updater.updateOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("updateOnce() error = %v", err)
+	}
+	if app, _ := os.ReadFile(exePath); string(app) != "old app" {
+		t.Fatalf("application changed after checksum failure: %q", app)
+	}
+}
+
 func TestUpdateManagerRetriesReleaseAssetPropagationFailure(t *testing.T) {
 	origVersion := Version
 	t.Cleanup(func() { Version = origVersion })
 	Version = "v1.0.0"
 
 	binary := []byte("published binary")
-	sum := sha256.Sum256(binary)
-	checksum := hex.EncodeToString(sum[:]) + "  ccload-linux-amd64\n"
+	checksum := testReleaseChecksums(binary)
 	var checksumRequests atomic.Int64
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/releases":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `[{"tag_name":"v1.1.0-beta.1","html_url":"https://example.test/releases/tag/v1.1.0-beta.1","draft":false,"prerelease":true,"published_at":"2026-08-07T01:00:00Z"}]`)
+		case "/releases.atom":
+			w.Header().Set("Content-Type", "application/atom+xml")
+			_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><link rel="alternate" href="https://example.test/releases/tag/v1.1.0-beta.1"/><title>Release v1.1.0-beta.1</title></entry>
+</feed>`)
 		case "/broken/download/v1.1.0-beta.1/checksums.txt":
 			http.Error(w, "broken mirror", http.StatusBadRequest)
 		case "/download/v1.1.0-beta.1/checksums.txt":
@@ -331,7 +476,7 @@ func TestUpdateManagerRetriesReleaseAssetPropagationFailure(t *testing.T) {
 		ReleaseSources: []ReleaseSource{
 			{
 				Name:            "broken",
-				ReleasesURL:     server.URL + "/releases",
+				ReleasesURL:     server.URL + "/releases.atom",
 				DownloadBaseURL: server.URL + "/broken/download",
 			},
 			{
@@ -519,6 +664,21 @@ func assertUpdateManagerReleaseRequests(t *testing.T, channel ReleaseChannel, wa
 	}
 }
 
+func TestFetchPreviewReleaseRejectsOversizedResponse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/atom+xml")
+		_, _ = w.Write([]byte(strings.Repeat("a", releaseListMaxBodyBytes+1)))
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := fetchPreviewRelease(context.Background(), server.Client(), server.URL)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("exceeds %d bytes", releaseListMaxBodyBytes)) {
+		t.Fatalf("fetchPreviewRelease() error = %v", err)
+	}
+}
+
 func TestFetchLatestReleaseReadsUnfollowedRedirectLocation(t *testing.T) {
 	t.Parallel()
 
@@ -600,8 +760,7 @@ func TestUpdateOnceReplacesPendingVersionWithNewerDownloadedRelease(t *testing.T
 			_, _ = w.Write(binaries[tag])
 		case "/caidaoli/ccLoad/releases/download/v1.0.1/checksums.txt", "/caidaoli/ccLoad/releases/download/v1.0.2/checksums.txt":
 			tag := filepath.Base(filepath.Dir(r.URL.Path))
-			sum := sha256.Sum256(binaries[tag])
-			_, _ = fmt.Fprintf(w, "%s  ccload-linux-amd64\n", hex.EncodeToString(sum[:]))
+			_, _ = fmt.Fprint(w, testReleaseChecksums(binaries[tag]))
 		default:
 			http.NotFound(w, r)
 		}
@@ -669,8 +828,7 @@ func TestUpdateManagerFallsBackToNextReleaseSource(t *testing.T) {
 	for _, failStage := range []string{"latest", "checksums", "asset"} {
 		t.Run(failStage, func(t *testing.T) {
 			binary := []byte("fallback binary")
-			sum := sha256.Sum256(binary)
-			checksum := hex.EncodeToString(sum[:]) + "  ccload-linux-amd64\n"
+			checksum := testReleaseChecksums(binary)
 
 			var mu sync.Mutex
 			var requests []string

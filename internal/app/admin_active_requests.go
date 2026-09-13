@@ -34,6 +34,7 @@ type processRuntimeMetrics struct {
 	GCCount               uint32  `json:"gc_count"`
 	GCPauseTotalNs        uint64  `json:"gc_pause_total_ns"`
 	GCCPUPercent          float64 `json:"gc_cpu_percent"`
+	SSEFramingRepairs     uint64  `json:"sse_framing_repairs"`
 }
 
 func (s *Server) processRuntimeMetrics(now time.Time) processRuntimeMetrics {
@@ -55,6 +56,7 @@ func (s *Server) processRuntimeMetrics(now time.Time) processRuntimeMetrics {
 		GCCount:               memory.NumGC,
 		GCPauseTotalNs:        memory.PauseTotalNs,
 		GCCPUPercent:          memory.GCCPUFraction * 100,
+		SSEFramingRepairs:     sseFramingRepairs.Load(),
 	}
 	if user, system, maxRSS, ok := readProcessRusage(); ok {
 		metrics.CPUUserSeconds = user
@@ -104,6 +106,26 @@ func (s *Server) HandleRuntimeMetrics(c *gin.Context) {
 		data["logs"] = s.logService.runtimeMetrics()
 	}
 	RespondJSON(c, http.StatusOK, data)
+}
+
+// HandleAbortActiveRequest 中断运行中请求当前的上游尝试。
+// POST /admin/active-requests/:request_id/abort
+//
+// 中断按「上游连接被重置」处理，因此后续行为完全由既有的网络故障链路决定：
+// 上游尚未提交响应时切换到下一个渠道，已经在向客户端输出时按流中断收尾。
+func (s *Server) HandleAbortActiveRequest(c *gin.Context) {
+	requestID, err := strconv.ParseInt(c.Param("request_id"), 10, 64)
+	if err != nil || requestID <= 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "invalid request_id")
+		return
+	}
+
+	if s.activeRequests == nil || !s.activeRequests.Abort(requestID) {
+		RespondErrorMsg(c, http.StatusNotFound, "active request not found or not abortable")
+		return
+	}
+
+	RespondJSON(c, http.StatusOK, gin.H{"aborted": true})
 }
 
 // HandleGetActiveRequestDebugLog 返回运行中请求的调试日志快照。

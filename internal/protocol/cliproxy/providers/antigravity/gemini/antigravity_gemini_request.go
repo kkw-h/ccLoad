@@ -69,7 +69,9 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			role := value.Get("role").String()
 			content := []byte(value.Raw)
 			if role != "user" && role != "model" {
-				if previousRole == "" || previousRole == "model" {
+				if translatorcommon.ContentHasGeminiFunctionResponse([]byte(value.Raw)) {
+					role = "user"
+				} else if previousRole == "" || previousRole == "model" {
 					role = "user"
 				} else {
 					role = "model"
@@ -329,7 +331,9 @@ func rewriteGeminiFunctionNames(rawJSON []byte, functionNameMap map[string]strin
 	return rawJSON
 }
 
-// SanitizeAntigravityClaudeGeminiRequestSignatures removes signatures that cannot be replayed to a Claude target.
+// SanitizeAntigravityClaudeGeminiRequestSignatures preserves compatible Claude thinking signatures,
+// gives the first function call in each model turn Antigravity's validator bypass, and strips
+// signatures from parts that cannot own them. Parallel sibling calls remain unsigned.
 func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON []byte) []byte {
 	contents := util.GetGJSONBytesNoCopy(rawJSON, "request.contents")
 	if !contents.IsArray() {
@@ -348,6 +352,7 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 		}
 
 		isModelTurn := content.Get("role").String() == "model"
+		firstFunctionCallSeen := false
 		partsArray := parts.Array()
 		contentChanged := false
 		rewrittenParts := make([][]byte, 0, len(partsArray))
@@ -368,9 +373,8 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 				if hasSignatureKey {
 					changed = true
 					contentChanged = true
-					deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "functionResponse parts cannot replay Claude thinking signatures", contentIndex, partIndex, rawSignature)
-					partBytes, _ := json.Marshal(part)
+					partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					rewrittenParts = append(rewrittenParts, partBytes)
 				} else {
 					rewrittenParts = append(rewrittenParts, []byte(partResult.Raw))
@@ -382,13 +386,32 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 				if hasSignatureKey {
 					changed = true
 					contentChanged = true
-					deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "non-model parts cannot replay Claude thinking signatures", contentIndex, partIndex, rawSignature)
-					partBytes, _ := json.Marshal(part)
+					partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 					rewrittenParts = append(rewrittenParts, partBytes)
 				} else {
 					rewrittenParts = append(rewrittenParts, []byte(partResult.Raw))
 				}
+				continue
+			}
+
+			if hasFunctionCallPart(part) {
+				isFirstFunctionCall := !firstFunctionCallSeen
+				firstFunctionCallSeen = true
+				changed = true
+				contentChanged = true
+				partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
+				if isFirstFunctionCall {
+					logAntigravityClaudeGeminiSignatureSanitize(modelName, "replace_signature", "first functionCall requires Antigravity bypass signature", contentIndex, partIndex, rawSignature)
+					var setErr error
+					partBytes, setErr = sjson.SetBytes(partBytes, "thoughtSignature", signature.GeminiSkipThoughtSignatureValidator)
+					if setErr != nil {
+						return rawJSON
+					}
+				} else {
+					logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "parallel sibling functionCalls remain unsigned", contentIndex, partIndex, rawSignature)
+				}
+				rewrittenParts = append(rewrittenParts, partBytes)
 				continue
 			}
 
@@ -412,9 +435,12 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 					contentChanged = true
 					logAntigravityClaudeGeminiSignatureSanitize(modelName, "normalize_signature", "compatible_claude_signature", contentIndex, partIndex, rawSignature)
 				}
-				deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
-				part["thoughtSignature"] = normalized
-				partBytes, _ := json.Marshal(part)
+				partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
+				var setErr error
+				partBytes, setErr = sjson.SetBytes(partBytes, "thoughtSignature", normalized)
+				if setErr != nil {
+					return rawJSON
+				}
 				rewrittenParts = append(rewrittenParts, partBytes)
 				continue
 			}
@@ -422,9 +448,8 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 			if hasSignatureKey {
 				changed = true
 				contentChanged = true
-				deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 				logAntigravityClaudeGeminiSignatureSanitize(modelName, "drop_signature", "non-thinking parts should not carry Claude thinking signatures", contentIndex, partIndex, rawSignature)
-				partBytes, _ := json.Marshal(part)
+				partBytes := deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part)
 				rewrittenParts = append(rewrittenParts, partBytes)
 			} else {
 				rewrittenParts = append(rewrittenParts, []byte(partResult.Raw))
@@ -437,7 +462,11 @@ func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON 
 		}
 		if contentChanged || len(rewrittenParts) != len(partsArray) {
 			contentBytes := []byte(content.Raw)
-			contentBytes, _ = sjson.SetRawBytes(contentBytes, "parts", translatorcommon.JoinRawArray(rewrittenParts))
+			var setErr error
+			contentBytes, setErr = sjson.SetRawBytes(contentBytes, "parts", translatorcommon.JoinRawArray(rewrittenParts))
+			if setErr != nil {
+				return rawJSON
+			}
 			rewrittenContents = append(rewrittenContents, contentBytes)
 		} else {
 			rewrittenContents = append(rewrittenContents, []byte(content.Raw))
@@ -563,7 +592,7 @@ func antigravityClaudeGeminiPartThoughtSignature(part map[string]any) (string, b
 	return "", false
 }
 
-func deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part map[string]any) {
+func deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part map[string]any) []byte {
 	for _, path := range [][]string{
 		{"thoughtSignature"},
 		{"thought_signature"},
@@ -573,8 +602,21 @@ func deleteAntigravityClaudeGeminiPartThoughtSignatureFields(part map[string]any
 		{"functionResponse", "thought_signature"},
 		{"extra_content", "google", "thought_signature"},
 	} {
-		deleteAtPath(part, path...)
+		current := part
+		for _, key := range path[:len(path)-1] {
+			next, ok := current[key].(map[string]any)
+			if !ok {
+				current = nil
+				break
+			}
+			current = next
+		}
+		delete(current, path[len(path)-1])
 	}
+	// Reuse the UseNumber-decoded object: duplicate parent/signature keys collapse
+	// before filtering, and large numeric tool arguments retain their JSON value.
+	cleaned, _ := json.Marshal(part)
+	return cleaned
 }
 
 func hasFunctionResponsePart(part map[string]any) bool {
@@ -582,6 +624,14 @@ func hasFunctionResponsePart(part map[string]any) bool {
 		return true
 	}
 	_, ok := part["function_response"]
+	return ok
+}
+
+func hasFunctionCallPart(part map[string]any) bool {
+	if _, ok := part["functionCall"]; ok {
+		return true
+	}
+	_, ok := part["function_call"]
 	return ok
 }
 
@@ -601,21 +651,6 @@ func stringAtPath(value map[string]any, path ...string) (string, bool) {
 	return s, ok
 }
 
-func deleteAtPath(value map[string]any, path ...string) {
-	if len(path) == 0 {
-		return
-	}
-	current := value
-	for _, key := range path[:len(path)-1] {
-		next, ok := current[key].(map[string]any)
-		if !ok {
-			return
-		}
-		current = next
-	}
-	delete(current, path[len(path)-1])
-}
-
 func logAntigravityClaudeGeminiSignatureSanitize(modelName, action, reason string, contentIndex, partIndex int, rawSignature string) {
 	_, _, _, _, _, _ = modelName, action, reason, contentIndex, partIndex, rawSignature
 }
@@ -624,6 +659,74 @@ func logAntigravityClaudeGeminiSignatureSanitize(modelName, action, reason strin
 type FunctionCallGroup struct {
 	ResponsesNeeded int
 	CallNames       []string // ordered function call names for backfilling empty response names
+}
+
+func normalizeAntigravityInlineDataPart(part gjson.Result) ([]byte, bool) {
+	inline := part.Get("inlineData")
+	if !inline.Exists() {
+		inline = part.Get("inline_data")
+	}
+	if !inline.Exists() {
+		return nil, false
+	}
+	data := inline.Get("data").String()
+	if data == "" {
+		return nil, false
+	}
+	mimeType := inline.Get("mimeType").String()
+	if mimeType == "" {
+		mimeType = inline.Get("mime_type").String()
+	}
+	if mimeType == "" {
+		// Cloud Code Assist ignores inlineData without mimeType.
+		mimeType = "image/png"
+	}
+	out := []byte(`{"inlineData":{"mimeType":"","data":""}}`)
+	out, _ = sjson.SetBytes(out, "inlineData.mimeType", mimeType)
+	out, _ = sjson.SetBytes(out, "inlineData.data", data)
+	return out, true
+}
+
+func attachInlineDataToFunctionResponse(response gjson.Result, images [][]byte) gjson.Result {
+	if len(images) == 0 {
+		return response
+	}
+	target := []byte(response.Raw)
+	for _, img := range images {
+		target, _ = sjson.SetRawBytes(target, "functionResponse.parts.-1", img)
+	}
+	return gjson.ParseBytes(target)
+}
+
+// collectFunctionResponsesWithSiblingInlineData keeps functionResponse parts and
+// moves sibling inline_data/inlineData onto the nearest preceding functionResponse.
+// Leading images before the first functionResponse attach to that first response.
+func collectFunctionResponsesWithSiblingInlineData(parts gjson.Result) []gjson.Result {
+	responses := make([]gjson.Result, 0)
+	leadingImages := make([][]byte, 0)
+	current := -1
+	parts.ForEach(func(_, part gjson.Result) bool {
+		if part.Get("functionResponse").Exists() {
+			responses = append(responses, part)
+			current = len(responses) - 1
+			if len(leadingImages) > 0 {
+				responses[current] = attachInlineDataToFunctionResponse(responses[current], leadingImages)
+				leadingImages = nil
+			}
+			return true
+		}
+		imagePart, ok := normalizeAntigravityInlineDataPart(part)
+		if !ok {
+			return true
+		}
+		if current >= 0 {
+			responses[current] = attachInlineDataToFunctionResponse(responses[current], [][]byte{imagePart})
+			return true
+		}
+		leadingImages = append(leadingImages, imagePart)
+		return true
+	})
+	return responses
 }
 
 // parseFunctionResponseRaw attempts to normalize a function response part into a JSON object string.
@@ -735,14 +838,8 @@ func fixCLIToolResponse(input []byte) ([]byte, error) {
 		role := value.Get("role").String()
 		parts := value.Get("parts")
 
-		// Check if this content has function responses
-		var responsePartsInThisContent []gjson.Result
-		parts.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("functionResponse").Exists() {
-				responsePartsInThisContent = append(responsePartsInThisContent, part)
-			}
-			return true
-		})
+		// Collect function responses and attach sibling inlineData to the nearest one.
+		responsePartsInThisContent := collectFunctionResponsesWithSiblingInlineData(parts)
 
 		// If this content has function responses, collect them
 		if len(responsePartsInThisContent) > 0 {

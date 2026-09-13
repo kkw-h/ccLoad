@@ -3,6 +3,7 @@ package app
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -371,6 +372,36 @@ func TestBuildLogFilter(t *testing.T) {
 			},
 		},
 		{
+			name:  "auth_token_id comma separated",
+			query: "auth_token_id=456,789,456",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if !reflect.DeepEqual(lf.AuthTokenIDs, []int64{456, 789}) {
+					t.Fatalf("AuthTokenIDs=%v, want [456 789]", lf.AuthTokenIDs)
+				}
+				if lf.AuthTokenID != nil {
+					t.Fatalf("AuthTokenID=%v, want nil for multiple IDs", lf.AuthTokenID)
+				}
+			},
+		},
+		{
+			name:  "auth_token_id repeated",
+			query: "auth_token_id=456&auth_token_id=789",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if !reflect.DeepEqual(lf.AuthTokenIDs, []int64{456, 789}) {
+					t.Fatalf("AuthTokenIDs=%v, want [456 789]", lf.AuthTokenIDs)
+				}
+			},
+		},
+		{
+			name:  "auth_token_id all invalid fails closed",
+			query: "auth_token_id=invalid,0,-1",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if lf.AuthTokenID == nil || *lf.AuthTokenID != -1 {
+					t.Fatalf("AuthTokenID=%v, want non-matching sentinel -1", lf.AuthTokenID)
+				}
+			},
+		},
+		{
 			name:  "default_log_source_proxy",
 			query: "",
 			check: func(t *testing.T, lf model.LogFilter) {
@@ -394,6 +425,15 @@ func TestBuildLogFilter(t *testing.T) {
 			check: func(t *testing.T, lf model.LogFilter) {
 				if lf.LogSource != model.LogSourceAll {
 					t.Errorf("LogSource=%q, want %q", lf.LogSource, model.LogSourceAll)
+				}
+			},
+		},
+		{
+			name:  "log_source_checkin",
+			query: "log_source=checkin",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if lf.LogSource != model.LogSourceCheckin {
+					t.Errorf("LogSource=%q, want %q", lf.LogSource, model.LogSourceCheckin)
 				}
 			},
 		},
@@ -434,12 +474,15 @@ func TestBuildLogFilter(t *testing.T) {
 }
 
 func TestBuildLogFilterForcesAPITokenWebScope(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/dashboard/logs?auth_token_id=999", nil)
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/logs?auth_token_id=999,1000", nil)
 	c, _ := newTestContext(t, req)
 	c.Set(webIdentityContextKey, WebIdentity{Role: model.WebRoleAPIToken, AuthTokenID: 42})
 
 	filter := BuildLogFilter(c)
 	if filter.AuthTokenID == nil || *filter.AuthTokenID != 42 {
 		t.Fatalf("AuthTokenID=%v, want forced token ID 42", filter.AuthTokenID)
+	}
+	if len(filter.AuthTokenIDs) != 0 {
+		t.Fatalf("AuthTokenIDs=%v, want empty for scoped API token session", filter.AuthTokenIDs)
 	}
 }

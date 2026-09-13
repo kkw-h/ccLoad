@@ -723,7 +723,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 				}
 
 				// tool calls
-				if tcs := delta.Get("tool_calls"); tcs.Exists() && tcs.IsArray() {
+				if tcs := delta.Get("tool_calls"); tcs.Exists() && tcs.IsArray() && len(tcs.Array()) > 0 {
 					if st.ReasoningID != "" {
 						stopReasoning(st.ReasoningBuf.String())
 						st.ReasoningBuf.Reset()
@@ -888,6 +888,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	message := root.Get("choices.0.message")
 	rcText := message.Get("reasoning_content").String()
 	encryptedContent := ""
+	if reasoning := message.Get("reasoning"); reasoning.Exists() && !reasoning.IsArray() && rcText == "" {
+		rcText = reasoning.String()
+	}
 	if reasoning := message.Get("reasoning"); reasoning.IsArray() {
 		for _, item := range reasoning.Array() {
 			if rcText == "" {

@@ -342,11 +342,12 @@ func BuildLogFilter(c *gin.Context) model.LogFilter {
 		lf.UpstreamProtocol = upstreamProtocol
 	}
 
-	// API令牌ID过滤
-	if tidStr := strings.TrimSpace(c.Query("auth_token_id")); tidStr != "" {
-		if id, err := strconv.ParseInt(tidStr, 10, 64); err == nil && id > 0 {
-			lf.AuthTokenID = &id
-		}
+	// API令牌ID过滤：兼容单值、重复参数和逗号分隔多值。
+	authTokenIDs := parsePositiveInt64QueryValues(c.QueryArray("auth_token_id"))
+	if len(authTokenIDs) == 1 {
+		lf.AuthTokenID = &authTokenIDs[0]
+	} else if len(authTokenIDs) > 1 {
+		lf.AuthTokenIDs = authTokenIDs
 	}
 
 	switch strings.TrimSpace(c.Query("log_source")) {
@@ -356,6 +357,8 @@ func BuildLogFilter(c *gin.Context) model.LogFilter {
 		lf.LogSource = model.LogSourceScheduledCheck
 	case model.LogSourceManualTest:
 		lf.LogSource = model.LogSourceManualTest
+	case model.LogSourceCheckin:
+		lf.LogSource = model.LogSourceCheckin
 	case model.LogSourceDetection:
 		lf.LogSource = model.LogSourceDetection
 	case model.LogSourceAll:
@@ -367,4 +370,26 @@ func BuildLogFilter(c *gin.Context) model.LogFilter {
 	ApplyWebIdentityScope(c, &lf)
 
 	return lf
+}
+
+func parsePositiveInt64QueryValues(values []string) []int64 {
+	ids := make([]int64, 0, len(values))
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+			if err != nil || id <= 0 {
+				continue
+			}
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	if len(values) > 0 && len(ids) == 0 {
+		return []int64{-1}
+	}
+	return ids
 }

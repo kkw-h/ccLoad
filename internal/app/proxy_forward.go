@@ -23,6 +23,8 @@ import (
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
+	"ccLoad/internal/xaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/bytedance/sonic"
 	"github.com/tidwall/gjson"
@@ -68,6 +70,9 @@ func (rc *onceCloseReadCloser) Close() error {
 func disableResponseWriteTimeout(w http.ResponseWriter, requestKind string) {
 	rc := http.NewResponseController(w)
 	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			return
+		}
 		log.Printf("[WARN] 无法禁用%s请求的 WriteTimeout: %v", requestKind, err)
 	}
 }
@@ -84,7 +89,7 @@ func responseIsSSE(resp *http.Response, streamExpected bool) bool {
 	if resp == nil {
 		return false
 	}
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+	if responseContentTypeIsSSE(resp, false) {
 		return true
 	}
 	if !streamExpected || resp.Body == nil {
@@ -92,11 +97,100 @@ func responseIsSSE(resp *http.Response, streamExpected bool) bool {
 	}
 
 	originalBody := resp.Body
-	reader := bufio.NewReader(originalBody)
-	prefix, _ := reader.Peek(16)
-	resp.Body = readerWithCloser{Reader: reader, Closer: originalBody}
-	prefix = bytes.TrimPrefix(prefix, []byte{0xef, 0xbb, 0xbf})
-	return bytes.HasPrefix(prefix, []byte("event:")) || bytes.HasPrefix(prefix, []byte("data:"))
+	// Consume+replay (not bufio.Peek): Peek drops a 0-byte terminal error via
+	// readErr(), which would turn a probe failure into a later EOF.
+	probe := make([]byte, 0, SSEProbeSize)
+	chunk := make([]byte, 256)
+	var readErr error
+	for len(probe) < SSEProbeSize {
+		remaining := SSEProbeSize - len(probe)
+		if remaining < len(chunk) {
+			chunk = chunk[:remaining]
+		}
+		n, err := originalBody.Read(chunk)
+		if n > 0 {
+			probe = append(probe, chunk[:n]...)
+			matched, needMore := classifySSEPrefix(probe)
+			if matched || !needMore {
+				readErr = err
+				break
+			}
+		}
+		if err != nil {
+			readErr = err
+			break
+		}
+		if n == 0 {
+			break
+		}
+	}
+	resp.Body = replayResponseProbe(originalBody, probe, readErr)
+	matched, _ := classifySSEPrefix(probe)
+	return matched
+}
+
+type fixedReadError struct{ err error }
+
+func (r fixedReadError) Read([]byte) (int, error) { return 0, r.err }
+
+func replayResponseProbe(original io.ReadCloser, prefix []byte, readErr error) io.ReadCloser {
+	readers := []io.Reader{bytes.NewReader(prefix)}
+	if readErr != nil {
+		readers = append(readers, fixedReadError{err: readErr})
+	} else {
+		readers = append(readers, original)
+	}
+	return readerWithCloser{Reader: io.MultiReader(readers...), Closer: original}
+}
+
+func responseContentTypeIsSSE(resp *http.Response, allowTextPlain bool) bool {
+	if resp == nil {
+		return false
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "text/event-stream") {
+		return true
+	}
+	return allowTextPlain && strings.Contains(contentType, "text/plain")
+}
+
+// classifySSEPrefix recognizes an SSE field after an optional BOM, whitespace,
+// or heartbeat comments. Complete comment lines are skipped, not treated as SSE.
+// needMore is true only while the bytes seen so far can still become SSE.
+func classifySSEPrefix(prefix []byte) (matched, needMore bool) {
+	if len(prefix) < len(utf8BOM) && bytes.HasPrefix(utf8BOM, prefix) {
+		return false, true
+	}
+	for len(prefix) > 0 {
+		prefix = normalizeSSEStreamPrefix(prefix)
+		if len(prefix) == 0 {
+			return false, true
+		}
+		line := prefix
+		complete := false
+		if idx := bytes.IndexByte(prefix, '\n'); idx >= 0 {
+			line = prefix[:idx]
+			prefix = prefix[idx+1:]
+			complete = true
+		} else {
+			prefix = nil
+		}
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		if bytes.HasPrefix(line, []byte("event:")) || bytes.HasPrefix(line, []byte("data:")) {
+			return true, false
+		}
+		if bytes.HasPrefix(line, []byte(":")) {
+			if complete {
+				continue
+			}
+			return false, true
+		}
+		if !complete && (bytes.HasPrefix([]byte("event:"), line) || bytes.HasPrefix([]byte("data:"), line)) {
+			return false, true
+		}
+		return false, false
+	}
+	return false, true
 }
 
 // ============================================================================
@@ -122,9 +216,32 @@ func (s *Server) buildProxyRequest(
 	if reqCtx != nil {
 		sourceBody = reqCtx.transformPlan.OriginalBody
 	}
-	body, err := s.prepareTranslatedUpstreamBody(
+	// 上游 URL 必须在 body 最终化之前解析：Anthropic 的 CCH 签名按上游 origin 分流
+	// （见 anthropicCCHSigningEnabled），签名点拿不到 origin 就只能退化成按凭证判断。
+	xaiResponsesRequest := isXAIOAuthResponsesRequest(cfg, upstreamProtocol, requestPath)
+	upstreamQuery := upstreamQueryForAttempt(reqCtx, rawQuery)
+	upstreamURL := buildUpstreamURL(baseURL, requestPath, upstreamQuery)
+	if isAnthropicOAuthMessagesRequest(cfg, upstreamProtocol, requestPath) {
+		upstreamURL = buildAnthropicOAuthURL(baseURL, requestPath, upstreamQuery)
+	}
+	if xaiResponsesRequest {
+		upstreamURL = buildXAIResponsesURL(baseURL, upstreamQuery)
+	}
+	if cfg.UsesAntigravityOAuth() {
+		antigravityURL, errAntigravity := antigravityUpstreamURL(baseURL, upstreamStreaming)
+		if errAntigravity != nil {
+			return nil, errAntigravity
+		}
+		upstreamURL = antigravityURL
+	}
+	parsedUpstreamURL, err := url.Parse(upstreamURL)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err = s.prepareTranslatedUpstreamBody(
 		cfg, upstreamProtocol, requestPath, body, sourceBody, apiKey, hdr,
-		reqCtx != nil && reqCtx.anthropicClaudeCodeWire,
+		reqCtx != nil && reqCtx.anthropicClaudeCodeWire, parsedUpstreamURL,
 	)
 	if err != nil {
 		return nil, err
@@ -150,7 +267,6 @@ func (s *Server) buildProxyRequest(
 			outer.codexMultiAgentV2Conflict = conflict
 		}
 	}
-	xaiResponsesRequest := isXAIOAuthResponsesRequest(cfg, upstreamProtocol, requestPath)
 	if xaiResponsesRequest {
 		body, err = finalizeXAIResponsesBody(body, reqCtx.transformPlan.RequestModel(), reqCtx.executionIdentity)
 		if err != nil {
@@ -158,24 +274,6 @@ func (s *Server) buildProxyRequest(
 		}
 	}
 
-	upstreamQuery := upstreamQueryForAttempt(reqCtx, rawQuery)
-	upstreamURL := buildUpstreamURL(baseURL, requestPath, upstreamQuery)
-	if isAnthropicOAuthMessagesRequest(cfg, upstreamProtocol, requestPath) {
-		upstreamURL = buildAnthropicOAuthURL(baseURL, requestPath, upstreamQuery)
-	}
-	if xaiResponsesRequest {
-		upstreamURL = buildXAIResponsesURL(baseURL, upstreamQuery)
-	}
-	if cfg.UsesAntigravityOAuth() {
-		upstreamURL, err = antigravityUpstreamURL(baseURL, upstreamStreaming)
-		if err != nil {
-			return nil, err
-		}
-	}
-	parsedUpstreamURL, err := url.Parse(upstreamURL)
-	if err != nil {
-		return nil, err
-	}
 	anthropicClaudeCodeWire := isAnthropicClaudeCodeMessagesRequest(cfg, upstreamProtocol, requestPath)
 	if isAnthropicMessagesRequest(upstreamProtocol, requestPath) {
 		if err = validateAnthropicLegacySystemRequestForUpstream(body, cfg, apiKey, hdr, parsedUpstreamURL); err != nil {
@@ -190,6 +288,15 @@ func (s *Server) buildProxyRequest(
 		if codexSessionID != "" {
 			body = injectCodexPromptCacheKey(body, codexSessionID)
 		}
+	}
+	if isZedResponsesRequest(cfg, upstreamProtocol) {
+		body, reqCtx.zedWire, err = finalizeZedResponsesBodyWithOptions(
+			s.protocolRegistry, body, reqCtx.originalBody, zedBodyRulesPreserveThinking(cfg.BodyRules()),
+		)
+		if err != nil {
+			return nil, err
+		}
+		upstreamStreaming = true
 	}
 
 	// 2. 创建带上下文的请求
@@ -221,8 +328,15 @@ func (s *Server) buildProxyRequest(
 	// 6. 自定义请求头规则（认证头黑名单保护）
 	applyHeaderRules(req.Header, cfg.HeaderRules())
 	wireRebuilt := false
-	if cfg.UsesXAIOAuth() {
-		injectXAIResponsesHeaders(req, apiKey, reqCtx.executionIdentity)
+	if cfg.UsesZedOAuth() {
+		injectZedResponsesHeaders(req, apiKey)
+		wireRebuilt = true
+	} else if cfg.UsesXAIOAuth() {
+		if isXAIImagesResponsesPlan(reqCtx.transformPlan) {
+			injectXAIAPIResponsesHeaders(req, apiKey)
+		} else {
+			injectXAIResponsesHeaders(req, apiKey, reqCtx.executionIdentity)
+		}
 	} else if upstreamProtocol == protocol.Codex {
 		if isCodexOAuthResponsesRequest(cfg, upstreamProtocol, requestPath) {
 			upstreamStreaming = true
@@ -283,11 +397,20 @@ func (s *Server) prepareTranslatedUpstreamBody(
 	apiKey string,
 	headers http.Header,
 	anthropicAlreadyFinalized bool,
+	target *url.URL,
 ) ([]byte, error) {
+	codexOAuthResponsesRequest := isCodexOAuthResponsesRequest(cfg, upstreamProtocol, requestPath)
 	body = normalizeAnyrouterAdaptiveThinking(cfg, string(upstreamProtocol), requestPath, body)
-	body = applyBodyRules(headers.Get("Content-Type"), body, cfg.BodyRules())
+	// Codex OAuth 的契约归一化会删除上游不接受的字段。这类请求的自定义
+	// 规则必须最后执行，才能真正覆盖内置值。
+	if !codexOAuthResponsesRequest {
+		body = applyBodyRules(headers.Get("Content-Type"), body, cfg.BodyRules())
+	}
 	body = prepareCodexResponsesBodyForUpstream(cfg, upstreamProtocol, requestPath, body)
 	body = prepareCodexOAuthResponsesBody(cfg, upstreamProtocol, requestPath, body, headers)
+	if codexOAuthResponsesRequest {
+		body = applyBodyRules(headers.Get("Content-Type"), body, cfg.BodyRules())
+	}
 	if isAnthropicMessagesRequest(upstreamProtocol, requestPath) {
 		var err error
 		switch {
@@ -295,20 +418,29 @@ func (s *Server) prepareTranslatedUpstreamBody(
 			// Z.ai Coding Plan 自带 ZCode 指纹，只做 Anthropic 线协议归一。
 			body, err = normalizeAnthropicMessagesBody(body)
 		case anthropicAlreadyFinalized:
-			var request map[string]any
-			if json.Unmarshal(body, &request) == nil {
-				helperShape := nativeAnthropicHaikuHelperShape(body, request, headers)
+			// 重试重放：body 已在首次尝试时最终化过。这里的判据必须是出站身份判据
+			// （不含 CCH），否则「本渠道策略不签名」会让网关自己的产物被判为非原生，
+			// 平白多跑一轮归一。
+			cchSigning := anthropicCCHSigningEnabled(cfg, target)
+			if isAnthropicJSONObject(body) {
+				helperShape := nativeAnthropicHaikuHelperShape(body, headers)
 				if helperShape == anthropicHaikuHelperMinimal {
 					return body, nil
 				}
 				if helperShape == anthropicHaikuHelperStructured ||
-					isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey) {
-					return finalizeAnthropicCCH(body)
+					isNativeAnthropicClaudeCodeRequest(headers) {
+					if cchSigning {
+						return finalizeAnthropicCCH(body)
+					}
+					return body, nil
 				}
 			}
 			body, err = normalizeAnthropicMessagesBody(body)
+			if err == nil && cchSigning {
+				body, err = finalizeAnthropicCCH(body)
+			}
 		default:
-			body, err = finalizeAnthropicClaudeCodeMessagesBody(body, cfg, apiKey, headers)
+			body, err = finalizeAnthropicClaudeCodeMessagesBody(body, cfg, apiKey, headers, target)
 		}
 		if err != nil {
 			return nil, err
@@ -317,12 +449,20 @@ func (s *Server) prepareTranslatedUpstreamBody(
 	// Z.ai Coding Plan 的 ZCode 设备指纹走 body 的 metadata.user_id。必须留在这个
 	// 共享入口里：挂在代理链路的独立分支上，管理测试就会发出没有指纹的请求。
 	if isZAICodingPlanRequest(cfg, upstreamProtocol, requestPath) {
-		return finalizeZAICodingPlanBody(body, cfg)
+		var err error
+		body, err = finalizeZAICodingPlanBody(body, cfg)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if cfg != nil && cfg.UsesAntigravityOAuth() {
-		return prepareAntigravityRequestBody(
+		var err error
+		body, err = prepareAntigravityRequestBody(
 			cfg, extractModelFromPath(requestPath), body, sourceBody, headers, s.antigravityPromptMatcher,
 		)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return body, nil
 }
@@ -452,7 +592,7 @@ func (s *Server) handleErrorResponse(
 		UpstreamStatus: resp.StatusCode,
 		Header:         hdrClone,
 		Body:           rb,
-		FirstByteTime:  readStats.firstByteSec,
+		FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 		StreamDiagMsg:  diagMsg,
 		ThinkingEffort: extractThinkingEffortFromJSON(rb),
 	}, duration, nil
@@ -606,34 +746,35 @@ func translatedStreamChunkCompletes(clientProtocol protocol.Protocol, chunk []by
 		if !ok {
 			return false
 		}
-		choices, _ := payload["choices"].([]any)
-		if len(choices) == 0 {
-			return false
-		}
-		choice, _ := choices[0].(map[string]any)
-		if choice == nil {
-			return false
-		}
-		finishReason, hasFinishReason := choice["finish_reason"]
-		return hasFinishReason && finishReason != nil
+		return openAIStreamPayloadComplete(payload)
 	case protocol.Gemini:
 		payload, ok := decodeSSEPayload(data)
 		if !ok {
 			return false
 		}
-		candidates, _ := payload["candidates"].([]any)
-		if len(candidates) == 0 {
-			return false
-		}
-		candidate, _ := candidates[0].(map[string]any)
-		if candidate == nil {
-			return false
-		}
-		finishReason, _ := candidate["finishReason"].(string)
-		return strings.TrimSpace(finishReason) != ""
+		return geminiStreamPayloadComplete(payload)
 	default:
 		return false
 	}
+}
+
+// sseSynthesizedDoneEvent 是网关补喂给转换器的 Chat Completions 终止哨兵。
+var sseSynthesizedDoneEvent = []byte("data: [DONE]\n\n")
+
+// needsSynthesizedStreamTerminator 判断跨协议转换是否要补一个终止序列。
+//
+// OpenAI Chat Completions 的终止哨兵是 [DONE]，openai→{anthropic,codex,gemini}
+// 三个转换器都只在收到它时才吐出终止事件（Anthropic 的 message_delta+message_stop、
+// Codex 的 response.completed）。而部分 OpenAI 兼容上游给完 finish_reason 就断流，
+// 客户端会一直等不到终止事件。上游语义既然已判完整，就必须给下游一个完整的终止序列。
+//
+// 补的是 [DONE] 而不是手搓终止帧：open content block、stop_reason、usage 都在
+// 转换器的内部状态里，只有它自己收得干净。同协议直通不补，避免改动透传字节。
+func needsSynthesizedStreamTerminator(upstream, client protocol.Protocol, upstreamComplete, translatedComplete, committed bool) bool {
+	if !committed || !upstreamComplete || translatedComplete {
+		return false
+	}
+	return upstream == protocol.OpenAI && client != protocol.OpenAI
 }
 
 // parseSSEEventChunk 在 []byte 视图上解析 SSE 事件块，避免 string(chunk) 与 []byte(data) 来回拷贝。
@@ -693,6 +834,12 @@ func maybePrepareDynamicStreamTransform(reqCtx *requestContext, resp *http.Respo
 		return "", false, nil
 	}
 	resp.Header.Set("Content-Type", "text/event-stream")
+	// Repair before locating the first event. Glued Codex frames have no \n\n
+	// until a later event; wrapping first lets firstSSEEventEnd see a real
+	// boundary. Known Anthropic/OpenAI upstreams skip the filter.
+	if reqCtx.transformPlan.UpstreamProtocol == "" || reqCtx.transformPlan.UpstreamProtocol == protocol.Codex {
+		resp.Body = wrapCodexSSEBody(resp.Body)
+	}
 
 	prefix, err := readSSEPrefixThroughFirstEvent(resp.Body)
 	if len(prefix) > 0 {
@@ -902,20 +1049,50 @@ func (s *Server) handleSuccessResponse(
 	readStats *streamReadStats,
 	observer *ForwardObserver,
 ) (*fwResult, float64, error) {
-	if reqCtx.responsesSSEUpstreamNonStream && responseIsSSE(resp, true) {
+	// The framing repair is a Codex Responses compatibility fix. Do not put a
+	// generic decorator on every SSE response: Anthropic/OpenAI SSE must remain
+	// byte-for-byte passthrough, and probing an arbitrary stream can block before
+	// the first chunk arrives.
+	isCodexResponses := reqCtx != nil && (protocol.Protocol(upstreamProtocol) == protocol.Codex ||
+		reqCtx.transformPlan.UpstreamProtocol == protocol.Codex)
+	isResponsesSSE := reqCtx != nil && reqCtx.responsesSSEUpstreamNonStream
+	isSSE := false
+	if isCodexResponses || isResponsesSSE {
+		// The OAuth Responses endpoints are SSE even when their HTTP media type is
+		// text/plain. Trust that endpoint contract instead of waiting for a body
+		// probe; this handles leading heartbeats and short streaming reads.
+		allowTextPlain := isResponsesSSE || (isCodexResponses && reqCtx.isStreaming)
+		isSSE = responseContentTypeIsSSE(resp, allowTextPlain)
+		if !isSSE && (isResponsesSSE || reqCtx.isStreaming) {
+			isSSE = responseIsSSE(resp, true)
+		}
+	}
+	if isSSE && isCodexResponses {
+		resp.Body = wrapCodexSSEBody(resp.Body)
+	}
+	if isResponsesSSE && isSSE {
 		return s.handleResponsesSSENonStreamSuccessResponse(reqCtx, resp, hdrClone, w, readStats)
+	}
+	if reqCtx.transformPlan.Streaming && isXAIImagesResponsesPlan(reqCtx.transformPlan) {
+		return s.handleXAIImagesResponsesStreamSuccessResponse(reqCtx, resp, hdrClone, w, readStats, observer)
 	}
 	if reqCtx.isStreaming && s.protocolRegistry != nil {
 		detectedProtocol, transform, err := maybePrepareDynamicStreamTransform(reqCtx, resp)
 		if detectedProtocol != "" {
 			upstreamProtocol = string(detectedProtocol)
 		}
+		if detectedProtocol == protocol.Codex && !isSSE {
+			// maybePrepareDynamicStreamTransform may have already wrapped it
+			// when UpstreamProtocol was Codex; wrapCodexSSEBody is idempotent.
+			resp.Body = wrapCodexSSEBody(resp.Body)
+			isSSE = true
+		}
 		if err != nil {
 			return &fwResult{
 				Status:         resp.StatusCode,
 				UpstreamStatus: resp.StatusCode,
 				Header:         hdrClone,
-				FirstByteTime:  readStats.firstByteSec,
+				FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 				BytesReceived:  readStats.totalBytes,
 			}, reqCtx.Duration().Seconds(), err
 		}
@@ -934,7 +1111,7 @@ func (s *Server) handleSuccessResponse(
 				Status:         resp.StatusCode,
 				UpstreamStatus: resp.StatusCode,
 				Header:         hdrClone,
-				FirstByteTime:  readStats.firstByteSec,
+				FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 				BytesReceived:  readStats.totalBytes,
 			}, reqCtx.Duration().Seconds(), err
 		}
@@ -984,14 +1161,17 @@ func (s *Server) handleSuccessResponse(
 			if deferredWriter == nil || deferredWriter.Committed() {
 				return nil
 			}
-			if parser.GetLastError() != nil || parser.HasStreamOutput() || parser.IsStreamComplete() {
-				markFirstStreamResponse(reqCtx, readStats, observer)
+			if shouldMarkUpstreamFirstByte(parser) {
+				markFirstStreamResponse(reqCtx, readStats)
 			}
 			if parser.GetLastError() != nil {
 				return errAbortStreamBeforeWrite
 			}
 			if parser.HasStreamOutput() {
-				return deferredWriter.Commit()
+				if err := deferredWriter.Commit(); err != nil {
+					return err
+				}
+				markClientFirstByte(reqCtx, readStats, observer)
 			}
 			return nil
 		},
@@ -1014,26 +1194,25 @@ func (s *Server) handleSuccessResponse(
 		Status:            resp.StatusCode,
 		UpstreamStatus:    resp.StatusCode,
 		Header:            hdrClone,
-		FirstByteTime:     readStats.firstByteSec,
+		FirstByteTime:     responseFirstByteSec(reqCtx, readStats),
 		BytesReceived:     readStats.totalBytes, // 记录已接收字节数，用于499诊断
 		ResponseCommitted: deferredWriter == nil || deferredWriter.Committed(),
 	}
 
 	// 提取usage数据和错误事件
 	var streamComplete bool
-	if parser != nil {
-		result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
-		result.ReasoningTokens = parser.GetReasoningTokens()
-		result.Cache5mInputTokens, result.Cache1hInputTokens, result.ServiceTier = parser.GetCacheBreakdown()
-		result.ToolCostUSD = parser.GetToolCostUSD()
-		result.ThinkingEffort = parser.GetThinkingEffort()
+	result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
+	result.ResponseModel = parser.GetResponseModel()
+	result.ReasoningTokens = parser.GetReasoningTokens()
+	result.Cache5mInputTokens, result.Cache1hInputTokens, result.ServiceTier = parser.GetCacheBreakdown()
+	result.ToolCostUSD = parser.GetToolCostUSD()
+	result.ThinkingEffort = parser.GetThinkingEffort()
 
-		if errorEvent := parser.GetLastError(); errorEvent != nil {
-			result.SSEErrorEvent = errorEvent
-		}
-		streamComplete = parser.IsStreamComplete()
-		result.ResponsesTurnResult, result.HasResponsesTurnResult = parser.GetResponsesTurnResult()
+	if errorEvent := parser.GetLastError(); errorEvent != nil {
+		result.SSEErrorEvent = errorEvent
 	}
+	streamComplete = parser.IsStreamComplete()
+	result.ResponsesTurnResult, result.HasResponsesTurnResult = parser.GetResponsesTurnResult()
 
 	// 生成流诊断消息（仅流请求）
 	if reqCtx.isStreaming {
@@ -1076,7 +1255,7 @@ func (s *Server) handleTranslatedNonStreamSuccessResponse(
 			UpstreamStatus: resp.StatusCode,
 			Header:         hdrClone,
 			Body:           []byte(err.Error()),
-			FirstByteTime:  readStats.firstByteSec,
+			FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 		}, reqCtx.Duration().Seconds(), err
 	}
 
@@ -1107,7 +1286,7 @@ func (s *Server) handleTranslatedNonStreamSuccessResponse(
 			UpstreamStatus: resp.StatusCode,
 			Header:         hdrClone,
 			Body:           rawBody,
-			FirstByteTime:  readStats.firstByteSec,
+			FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 		}, reqCtx.Duration().Seconds(), err
 	}
 
@@ -1138,7 +1317,7 @@ func (s *Server) handleTranslatedNonStreamSuccessResponse(
 			UpstreamStatus: resp.StatusCode,
 			Header:         hdrClone,
 			Body:           rawBody,
-			FirstByteTime:  readStats.firstByteSec,
+			FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 		}, reqCtx.Duration().Seconds(), err
 	}
 
@@ -1157,11 +1336,12 @@ func (s *Server) handleTranslatedNonStreamSuccessResponse(
 		Status:            resp.StatusCode,
 		UpstreamStatus:    resp.StatusCode,
 		Header:            hdrClone,
-		FirstByteTime:     readStats.firstByteSec,
+		FirstByteTime:     responseFirstByteSec(reqCtx, readStats),
 		BytesReceived:     readStats.totalBytes,
 		ResponseCommitted: true,
 	}
 	result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
+	result.ResponseModel = parser.GetResponseModel()
 	result.ReasoningTokens = parser.GetReasoningTokens()
 	result.Cache5mInputTokens = parser.Cache5mInputTokens
 	result.Cache1hInputTokens = parser.Cache1hInputTokens
@@ -1190,6 +1370,80 @@ func (s *Server) handleTranslatedStreamSuccessResponse(
 	parser := newSSEUsageParser(upstreamProtocol)
 	var translatedComplete bool
 	var state any
+	commitTranslatedOutput := func(chunks [][]byte) error {
+		// Responses metadata may produce pass-through chunks, but it is not semantic
+		// output. Keep those chunks buffered so a following error can still replace
+		// the attempt (for example invalid_encrypted_content after Codex metadata).
+		if deferredWriter.Committed() || !parser.HasStreamOutput() {
+			return nil
+		}
+		for _, chunk := range chunks {
+			if len(chunk) == 0 {
+				continue
+			}
+			if err := deferredWriter.Commit(); err != nil {
+				return err
+			}
+			markClientFirstByte(reqCtx, readStats, observer)
+			return nil
+		}
+		return nil
+	}
+	translateEvent := func(rawEvent []byte) ([][]byte, error) {
+		if reqCtx.codexMultiAgentV2Optimized && reqCtx.transformPlan.UpstreamProtocol == protocol.Codex {
+			rawEvent = restoreCodexMultiAgentV2SSEEvent(rawEvent, true)
+		}
+		translatedRequestBody := reqCtx.transformPlan.TranslatedBody
+		if reqCtx.antigravityOAuth {
+			providerEvent, err := antigravitySSEData(rawEvent)
+			if err != nil {
+				return nil, err
+			}
+			translatedRequestBody, err = unwrapAntigravityRequest(reqCtx.transformPlan.TranslatedBody)
+			if err != nil {
+				return nil, err
+			}
+			chunks, translateErr := translateAntigravityResponseStream(
+				reqCtx.ctx,
+				reqCtx.transformPlan.ClientProtocol,
+				reqCtx.transformPlan.ResponseModel(),
+				reqCtx.transformPlan.OriginalBody,
+				translatedRequestBody,
+				providerEvent,
+				&state,
+			)
+			if translateErr != nil {
+				return nil, translateErr
+			}
+			if !translatedComplete && translatedStreamChunksComplete(reqCtx.transformPlan.ClientProtocol, chunks) {
+				translatedComplete = true
+			}
+			if err := commitTranslatedOutput(chunks); err != nil {
+				return nil, err
+			}
+			return chunks, nil
+		}
+		chunks, err := s.protocolRegistry.TranslateResponseStream(
+			reqCtx.ctx,
+			reqCtx.transformPlan.UpstreamProtocol,
+			reqCtx.transformPlan.ClientProtocol,
+			reqCtx.transformPlan.ResponseModel(),
+			reqCtx.transformPlan.OriginalBody,
+			translatedRequestBody,
+			rawEvent,
+			&state,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !translatedComplete && translatedStreamChunksComplete(reqCtx.transformPlan.ClientProtocol, chunks) {
+			translatedComplete = true
+		}
+		if err := commitTranslatedOutput(chunks); err != nil {
+			return nil, err
+		}
+		return chunks, nil
+	}
 	streamErr := streamTransformSSEEventsUntil(
 		reqCtx.ctx,
 		resp.Body,
@@ -1209,66 +1463,15 @@ func (s *Server) handleTranslatedStreamSuccessResponse(
 			if err := parser.Feed(parserEvent); err != nil {
 				return err
 			}
-			if parser.GetLastError() != nil || parser.HasStreamOutput() || parser.IsStreamComplete() {
-				markFirstStreamResponse(reqCtx, readStats, observer)
+			if shouldMarkUpstreamFirstByte(parser) {
+				markFirstStreamResponse(reqCtx, readStats)
 			}
 			if !deferredWriter.Committed() && parser.GetLastError() != nil {
 				return errAbortStreamBeforeWrite
 			}
-			if !deferredWriter.Committed() && parser.HasStreamOutput() {
-				return deferredWriter.Commit()
-			}
 			return nil
 		},
-		func(rawEvent []byte) ([][]byte, error) {
-			if reqCtx.codexMultiAgentV2Optimized && reqCtx.transformPlan.UpstreamProtocol == protocol.Codex {
-				rawEvent = restoreCodexMultiAgentV2SSEEvent(rawEvent, true)
-			}
-			translatedRequestBody := reqCtx.transformPlan.TranslatedBody
-			if reqCtx.antigravityOAuth {
-				providerEvent, err := antigravitySSEData(rawEvent)
-				if err != nil {
-					return nil, err
-				}
-				translatedRequestBody, err = unwrapAntigravityRequest(reqCtx.transformPlan.TranslatedBody)
-				if err != nil {
-					return nil, err
-				}
-				chunks, translateErr := translateAntigravityResponseStream(
-					reqCtx.ctx,
-					reqCtx.transformPlan.ClientProtocol,
-					reqCtx.transformPlan.ResponseModel(),
-					reqCtx.transformPlan.OriginalBody,
-					translatedRequestBody,
-					providerEvent,
-					&state,
-				)
-				if translateErr != nil {
-					return nil, translateErr
-				}
-				if !translatedComplete && translatedStreamChunksComplete(reqCtx.transformPlan.ClientProtocol, chunks) {
-					translatedComplete = true
-				}
-				return chunks, nil
-			}
-			chunks, err := s.protocolRegistry.TranslateResponseStream(
-				reqCtx.ctx,
-				reqCtx.transformPlan.UpstreamProtocol,
-				reqCtx.transformPlan.ClientProtocol,
-				reqCtx.transformPlan.ResponseModel(),
-				reqCtx.transformPlan.OriginalBody,
-				translatedRequestBody,
-				rawEvent,
-				&state,
-			)
-			if err != nil {
-				return nil, err
-			}
-			if !translatedComplete && translatedStreamChunksComplete(reqCtx.transformPlan.ClientProtocol, chunks) {
-				translatedComplete = true
-			}
-			return chunks, nil
-		},
+		translateEvent,
 		func() bool {
 			terminalProtocol := reqCtx.transformPlan.UpstreamProtocol == protocol.Codex ||
 				reqCtx.transformPlan.UpstreamProtocol == protocol.Anthropic
@@ -1276,16 +1479,26 @@ func (s *Server) handleTranslatedStreamSuccessResponse(
 		},
 	)
 
+	if needsSynthesizedStreamTerminator(
+		reqCtx.transformPlan.UpstreamProtocol,
+		reqCtx.transformPlan.ClientProtocol,
+		parser.IsStreamComplete(),
+		translatedComplete,
+		deferredWriter.Committed(),
+	) {
+		if chunks, doneErr := translateEvent(sseSynthesizedDoneEvent); doneErr != nil {
+			log.Printf("[WARN] 上游省略 [DONE]，补发终止事件失败: %v", doneErr)
+		} else if writeErr := writeSSEChunks(deferredWriter, chunks); writeErr != nil && streamErr == nil {
+			streamErr = writeErr
+		}
+	}
+
 	abortedBeforeCommit := errors.Is(streamErr, errAbortStreamBeforeWrite)
 	if abortedBeforeCommit {
 		streamErr = nil
-	} else if !deferredWriter.Committed() && isEmptyStreamOutput(parser, readStats) {
+	} else if !deferredWriter.Committed() {
 		if streamErr == nil {
 			return emptyOKResponseResult(reqCtx, resp, hdrClone, readStats, emptyStreamDetail(readStats))
-		}
-	} else if !deferredWriter.Committed() {
-		if commitErr := deferredWriter.Commit(); commitErr != nil && streamErr == nil {
-			streamErr = commitErr
 		}
 	}
 
@@ -1293,11 +1506,12 @@ func (s *Server) handleTranslatedStreamSuccessResponse(
 		Status:            resp.StatusCode,
 		UpstreamStatus:    resp.StatusCode,
 		Header:            hdrClone,
-		FirstByteTime:     readStats.firstByteSec,
+		FirstByteTime:     responseFirstByteSec(reqCtx, readStats),
 		BytesReceived:     readStats.totalBytes,
 		ResponseCommitted: deferredWriter.Committed(),
 	}
 	result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
+	result.ResponseModel = parser.GetResponseModel()
 	result.ReasoningTokens = parser.GetReasoningTokens()
 	result.Cache5mInputTokens = parser.Cache5mInputTokens
 	result.Cache1hInputTokens = parser.Cache1hInputTokens
@@ -1333,31 +1547,33 @@ func isHTTP2StreamCloseError(err error) bool {
 func peekUntilSSEOrLimit(reader *bufio.Reader, limit int) bool {
 	for n := 1; n <= limit; n++ {
 		current, err := reader.Peek(n)
-		if looksLikeSSE(current) {
+		matched, needMore := classifySSEPrefix(current)
+		if matched {
 			return true
 		}
-		if err != nil {
+		if !needMore || err != nil {
 			return false
 		}
 	}
 	return false
 }
 
-// looksLikeSSE 粗略判断文本内容是否包含 SSE 事件结构
+// looksLikeSSE reports whether data already contains both an event: and a
+// data: line prefix. This is stricter than classifySSEPrefix (which matches
+// either field alone for incremental streaming probes) because looksLikeSSE
+// operates on a buffered text/plain body where a lone "data:" could be normal
+// JSON — requiring both fields avoids false positives in proxy_sse_parser.
 func looksLikeSSE(data []byte) bool {
-	// 同时包含 event: 与 data: 行。必须是行前缀，避免普通JSON字符串里的
-	// "event:" 文本把非流响应误判成SSE。
-	hasEvent := false
-	hasData := false
+	hasEvent, hasData := false, false
 	for len(data) > 0 {
-		line := data
+		var line []byte
 		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
 			line = data[:idx]
 			data = data[idx+1:]
 		} else {
+			line = data
 			data = nil
 		}
-
 		line = bytes.TrimLeft(line, " \t\r")
 		if bytes.HasPrefix(line, []byte("event:")) {
 			hasEvent = true
@@ -1389,13 +1605,12 @@ func attachFirstByteDetector(
 				reqCtx.stopFirstByteTimer()
 			}
 			if readStats.firstByteSec == 0 {
-				readStats.firstByteSec = reqCtx.Duration().Seconds()
-				if readStats.firstByteSec == 0 {
-					readStats.firstByteSec = time.Nanosecond.Seconds()
+				firstByteTime := positiveDuration(reqCtx.Duration())
+				readStats.firstByteSec = firstByteTime.Seconds()
+				readStats.clientFirstByteSec = readStats.firstByteSec
+				if reqCtx.isStreaming && observer != nil && observer.OnFirstByteRead != nil {
+					observer.OnFirstByteRead(firstByteTime)
 				}
-			}
-			if reqCtx.isStreaming && observer != nil && observer.OnFirstByteRead != nil {
-				observer.OnFirstByteRead()
 			}
 		},
 		onBytesRead: func(n int64) {
@@ -1406,19 +1621,49 @@ func attachFirstByteDetector(
 	}
 }
 
-func markFirstStreamResponse(reqCtx *requestContext, readStats *streamReadStats, observer *ForwardObserver) {
+// markFirstStreamResponse 记录上游首个有效响应事件的时间。
+// Responses 元数据也属于上游已返回数据，可以结束上游首字节计时；但此处
+// 不通知客户端，因为 deferredResponseWriter 可能仍在缓冲，客户端尚未收到任何字节。
+func markFirstStreamResponse(reqCtx *requestContext, readStats *streamReadStats) {
 	if !reqCtx.isStreaming || readStats.firstByteSec > 0 {
 		return
 	}
 
 	reqCtx.stopFirstByteTimer()
-	readStats.firstByteSec = reqCtx.Duration().Seconds()
-	if readStats.firstByteSec == 0 {
-		readStats.firstByteSec = time.Nanosecond.Seconds()
+	readStats.firstByteSec = positiveDuration(reqCtx.Duration()).Seconds()
+}
+
+func markClientFirstByte(reqCtx *requestContext, readStats *streamReadStats, observer *ForwardObserver) {
+	if reqCtx == nil || readStats == nil || !reqCtx.isStreaming || readStats.clientFirstByteSec > 0 {
+		return
 	}
+	firstByteTime := positiveDuration(reqCtx.Duration())
+	readStats.clientFirstByteSec = firstByteTime.Seconds()
 	if observer != nil && observer.OnFirstByteRead != nil {
-		observer.OnFirstByteRead()
+		observer.OnFirstByteRead(firstByteTime)
 	}
+}
+
+func responseFirstByteSec(reqCtx *requestContext, readStats *streamReadStats) float64 {
+	if readStats == nil {
+		return 0
+	}
+	if reqCtx != nil && reqCtx.isStreaming {
+		return readStats.clientFirstByteSec
+	}
+	return readStats.firstByteSec
+}
+
+func positiveDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return time.Nanosecond
+	}
+	return d
+}
+
+func shouldMarkUpstreamFirstByte(parser usageParser) bool {
+	return parser.GetLastError() != nil || parser.HasStreamOutput() ||
+		parser.IsStreamComplete() || parser.HasResponsesMetadata()
 }
 
 func shouldProbeSoftError(reqCtx *requestContext, resp *http.Response, upstreamProtocol string) bool {
@@ -1577,7 +1822,7 @@ func emptyOKResponseResult(reqCtx *requestContext, resp *http.Response, hdrClone
 		UpstreamStatus: resp.StatusCode,
 		Header:         hdrClone,
 		Body:           []byte(err.Error()),
-		FirstByteTime:  readStats.firstByteSec,
+		FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 	}, duration, err
 }
 
@@ -1644,7 +1889,7 @@ func invalidHTMLSuccessResponseResult(
 		UpstreamStatus: resp.StatusCode,
 		Header:         hdrClone,
 		Body:           body,
-		FirstByteTime:  readStats.firstByteSec,
+		FirstByteTime:  responseFirstByteSec(reqCtx, readStats),
 		BytesReceived:  readStats.totalBytes,
 	}, reqCtx.Duration().Seconds(), err
 }
@@ -1803,7 +2048,8 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	}
 	reqCtx.responsesSSEUpstreamNonStream = !plan.Streaming &&
 		(isCodexOAuthResponsesRequest(cfg, plan.UpstreamProtocol, plan.UpstreamPath) ||
-			isXAIOAuthResponsesRequest(cfg, plan.UpstreamProtocol, plan.UpstreamPath))
+			isXAIOAuthResponsesRequest(cfg, plan.UpstreamProtocol, plan.UpstreamPath) ||
+			isZedResponsesRequest(cfg, plan.UpstreamProtocol))
 
 	// 2. 构建上游请求
 	req, err := s.buildProxyRequest(reqCtx, cfg, apiKey, method, reqCtx.transformPlan.TranslatedBody, hdr, rawQuery, reqCtx.transformPlan.UpstreamPath, baseURL)
@@ -1819,7 +2065,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	usedNativeWebsocket := false
 	if native != nil && native.session != nil {
 		replayReq := cloneRequestWithBody(httpReq, replayBody)
-		copyCodexWebsocketInputHeaders(replayReq.Header, hdr)
+		prepareCodexWebsocketInputHeaders(replayReq.Header, hdr, cfg.HeaderRules())
 		incrementalBody := bytes.Clone(native.incrementalBody)
 		incrementalReq, errBuild := s.buildProxyRequest(
 			reqCtx, cfg, apiKey, method, incrementalBody, hdr, rawQuery,
@@ -1828,7 +2074,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		if errBuild != nil {
 			return nil, 0, errBuild
 		}
-		copyCodexWebsocketInputHeaders(incrementalReq.Header, hdr)
+		prepareCodexWebsocketInputHeaders(incrementalReq.Header, hdr, cfg.HeaderRules())
 		// buildProxyRequest applies body rules and prompt_cache_key; send the
 		// resulting wire body, not the pre-normalized caller input.
 		incrementalBody = bytes.Clone(reqCtx.transformPlan.TranslatedBody)
@@ -1865,6 +2111,9 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		observer.OnUpstreamWebsocket(usedNativeWebsocket)
 	}
 	if resp != nil {
+		if err == nil && cfg.UsesZedOAuth() {
+			err = prepareZedResponsesResponse(resp, reqCtx.zedWire, s.protocolRegistry)
+		}
 		s.persistCodexPassiveUsage(reqCtx.ctx, cfg, resp)
 		s.persistAnthropicPassiveUsage(reqCtx.ctx, cfg, resp)
 		// Claude Code 的 Accept-Encoding 声明了 br/zstd，Go transport 只会自动解 gzip，
@@ -1882,7 +2131,8 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	debugReq := req
 	debugBody := sentBody
 	var websocketDebug codexWebsocketDebugSnapshot
-	if usedNativeWebsocket && req != nil {
+	debugEnabled := s.configService.GetBool("debug_log_enabled", false)
+	if usedNativeWebsocket && req != nil && debugEnabled {
 		websocketDebug = native.session.debugSnapshot()
 		debugReq = req.Clone(req.Context())
 		if websocketDebug.RequestHeaders != nil {
@@ -1900,7 +2150,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	}
 	dc := s.captureDebugRequest(debugReq, debugBody)
 	dc.captureUpstreamError(err)
-	if reqCtx.transformPlan.NeedsTransform || reqCtx.antigravityOAuth {
+	if reqCtx.transformPlan.NeedsTransform || reqCtx.antigravityOAuth || cfg.UsesZedOAuth() {
 		originalReqURL := reqCtx.transformPlan.OriginalPath
 		if rawQuery != "" {
 			separator := "?"
@@ -1959,7 +2209,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	var res *fwResult
 	var duration float64
 	responseWriter := w
-	if (reqCtx.transformPlan.NeedsTransform || reqCtx.antigravityOAuth) && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if (reqCtx.transformPlan.NeedsTransform || reqCtx.antigravityOAuth || cfg.UsesZedOAuth()) && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		responseWriter = dc.wrapTranslatedResponseWriter(w)
 	}
 	res, duration, err = s.handleResponse(reqCtx, resp, responseWriter, string(reqCtx.upstreamProtocol), cfg, apiKey, observer)
@@ -2016,8 +2266,10 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		// Cancellation closes the response body to unblock a pending read. Depending
 		// on scheduling, that read may report io.ErrClosedPipe/net.ErrClosed before
 		// the transport returns ctx.Err(). Preserve the cause that controls retries.
-		if ctxErr := reqCtx.ctx.Err(); ctxErr != nil {
-			err = ctxErr
+		// 必须用 context.Cause 而不是 ctx.Err()：管理端手动中断把「上游断链」语义放在
+		// cause 里，退化成 context.Canceled 会被判成客户端取消（499、不冷却、不切渠道）。
+		if cause := context.Cause(reqCtx.ctx); cause != nil {
+			err = cause
 		}
 	}
 
@@ -2033,11 +2285,20 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	return res, duration, err
 }
 
+// responsesBodyForHTTPTransport 收尾 HTTP 传输边界的 Codex Responses 上游 body。
+// status 剥离不是 HTTP 独有契约：官方 Codex 后端在 HTTP 与原生 WebSocket 上是同一套
+// 校验，WS 侧的对应剥离在 doCodexWebsocketRequest 里。别把它挪进
+// prepareCodexResponsesBodyForUpstream——那里同时服务 WS transcript 的装配阶段，
+// 剥离必须留在两条传输的发送边界上。反过来 prepareCodexOAuthHTTPBody 才是真正的
+// HTTP 专有处理：它删掉 previous_response_id/stream_options，WS 增量请求依赖这两个
+// 字段续接，所以本函数整体不可被 WS 路径复用。
 func responsesBodyForHTTPTransport(cfg *model.Config, plan protocol.TransformPlan, body []byte) []byte {
 	body = prepareCodexOAuthHTTPBody(cfg, plan.UpstreamProtocol, plan.UpstreamPath, body)
-	if plan.ClientProtocol != protocol.Codex || plan.RequestFamily != protocol.RequestFamilyResponses {
+	if plan.ClientProtocol != protocol.Codex || plan.UpstreamProtocol != protocol.Codex ||
+		plan.RequestFamily != protocol.RequestFamilyResponses {
 		return body
 	}
+	body = stripResponsesInputItemStatus(body)
 	if !gjson.GetBytes(body, "generate").Exists() {
 		return body
 	}
@@ -2046,6 +2307,114 @@ func responsesBodyForHTTPTransport(cfg *model.Config, plan protocol.TransformPla
 		return body
 	}
 	return stripped
+}
+
+// stripResponsesInputItemStatus 剥离 Responses input item 的 status 字段。Codex HTTP
+// 上游不定义该字段（官方端点对 function_call 的 status 报 400 "Unknown parameter"），
+// 工具完成态由 call_id/function_call_output 配对重建，剥离不改变执行语义。
+// 必须定点删除而不能整份 Unmarshal/Marshal：Go map 重编码会随机改变 transcript 字段
+// 顺序，破坏相邻请求共享的 prompt-cache 字节前缀。一次收集全部删除区间并压缩，
+// 避免逐字段 DeleteBytes 随历史 status 数量增长成 O(k·n)。
+func stripResponsesInputItemStatus(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"status"`)) {
+		return body
+	}
+	if !gjson.ValidBytes(body) {
+		return body
+	}
+	statuses := gjson.GetBytes(body, "input.#.status")
+	values := statuses.Array()
+	if len(values) == 0 || len(values) != len(statuses.Indexes) {
+		return body
+	}
+
+	type deletionRange struct {
+		start int
+		end   int
+	}
+	ranges := make([]deletionRange, 0, len(values))
+	deletedBytes := 0
+	previousEnd := 0
+	for i, value := range values {
+		start, end, ok := jsonObjectMemberDeletionRange(body, statuses.Indexes[i], len(value.Raw))
+		if !ok || start < previousEnd {
+			return body
+		}
+		ranges = append(ranges, deletionRange{start: start, end: end})
+		deletedBytes += end - start
+		previousEnd = end
+	}
+
+	stripped := make([]byte, 0, len(body)-deletedBytes)
+	previousEnd = 0
+	for _, deletion := range ranges {
+		stripped = append(stripped, body[previousEnd:deletion.start]...)
+		previousEnd = deletion.end
+	}
+	return append(stripped, body[previousEnd:]...)
+}
+
+// jsonObjectMemberDeletionRange 根据 gjson 给出的字段值位置，返回包含对象逗号的
+// 完整成员删除区间。调用方按升序一次复制未删除区间，避免反复移动整个 JSON body。
+func jsonObjectMemberDeletionRange(body []byte, valueStart, valueLength int) (int, int, bool) {
+	valueEnd := valueStart + valueLength
+	if valueStart <= 0 || valueLength <= 0 || valueEnd > len(body) {
+		return 0, 0, false
+	}
+
+	colon := skipJSONWhitespaceBackward(body, valueStart-1)
+	if colon < 0 || body[colon] != ':' {
+		return 0, 0, false
+	}
+	keyEnd := skipJSONWhitespaceBackward(body, colon-1)
+	if keyEnd < 0 || body[keyEnd] != '"' {
+		return 0, 0, false
+	}
+	const statusKey = `"status"`
+	keyStart := keyEnd + 1 - len(statusKey)
+	if keyStart < 0 || !bytes.Equal(body[keyStart:keyEnd+1], []byte(statusKey)) {
+		return 0, 0, false
+	}
+
+	afterValue := skipJSONWhitespaceForward(body, valueEnd)
+	if afterValue >= len(body) || (body[afterValue] != ',' && body[afterValue] != '}') {
+		return 0, 0, false
+	}
+	beforeKey := skipJSONWhitespaceBackward(body, keyStart-1)
+	switch {
+	case beforeKey >= 0 && body[beforeKey] == ',':
+		return beforeKey, valueEnd, true
+	case beforeKey >= 0 && body[beforeKey] == '{' && body[afterValue] == ',':
+		return keyStart, afterValue + 1, true
+	case beforeKey >= 0 && body[beforeKey] == '{' && body[afterValue] == '}':
+		return keyStart, valueEnd, true
+	default:
+		return 0, 0, false
+	}
+}
+
+func skipJSONWhitespaceBackward(body []byte, position int) int {
+	for position >= 0 {
+		switch body[position] {
+		case ' ', '\t', '\r', '\n':
+			position--
+		default:
+			return position
+		}
+	}
+	return position
+}
+
+func skipJSONWhitespaceForward(body []byte, position int) int {
+	for position < len(body) {
+		switch body[position] {
+		case ' ', '\t', '\r', '\n':
+			position++
+		default:
+			return position
+		}
+	}
+	return position
 }
 
 func cloneRequestWithBody(req *http.Request, body []byte) *http.Request {
@@ -2163,8 +2532,43 @@ func (s *Server) forwardAttempt(
 	reqCtx.attemptStartTime = time.Now()
 	reqCtx.baseURL = baseURL
 	reqCtx.upstreamProtocol = upstreamProtocol
+	reqCtx.attemptSeq++
+	reqCtx.debugData = nil
 	actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx, upstreamProtocol)
-	requestPath := replaceModelInPath(reqCtx.requestPath, reqCtx.originalModel, actualModel)
+	requestPath := rewriteUpstreamRequestPath(reqCtx.requestPath, actualModel)
+	var translatedRequestOverride []byte
+	if bridgeModel, bridge := s.xaiImagesResponsesModel(cfg, reqCtx); bridge && upstreamProtocol == protocol.Codex {
+		actualModel = bridgeModel
+		var err error
+		translatedRequestOverride, err = buildXAIImagesResponsesRequest(reqCtx.body, actualModel)
+		if err != nil {
+			channelID := cfg.ID
+			if errors.Is(err, errXAIImagesBridgeUnsupported) {
+				logged := s.logProtocolCapabilityFallback(
+					reqCtx, cfg, actualModel, selectedKey, http.StatusBadRequest,
+					time.Since(reqCtx.attemptStartTime).Seconds(), nil, err.Error(),
+				)
+				return &proxyResult{
+					status:                    http.StatusBadRequest,
+					body:                      []byte(err.Error()),
+					channelID:                 &channelID,
+					succeeded:                 false,
+					nextAction:                cooldown.ActionRetryChannel,
+					proxyLogWritten:           logged,
+					protocolCapabilityMissing: true,
+				}, cooldown.ActionRetryChannel, nil
+			}
+			return &proxyResult{
+				status:     http.StatusBadRequest,
+				body:       []byte(err.Error()),
+				channelID:  &channelID,
+				succeeded:  false,
+				nextAction: cooldown.ActionReturnClient,
+			}, cooldown.ActionReturnClient, nil
+		}
+		bodyToSend = translatedRequestOverride
+		requestPath = buildCodexResponsesPath()
+	}
 	if upstreamProtocol == protocol.Codex {
 		requestPath = normalizeCodexClientPath(requestPath)
 	}
@@ -2172,17 +2576,35 @@ func (s *Server) forwardAttempt(
 	// 转发请求（传递实际的API Key字符串和观测回调）
 	// [FIX] 2026-01: 使用传入的 requestPath（可能已替换模型名）而非 reqCtx.requestPath
 	bodyToSend = prepareCodexResponsesBodyForUpstream(cfg, upstreamProtocol, requestPath, bodyToSend)
-	plan, err := protocol.BuildTransformPlan(
-		reqCtx.clientProtocol,
-		upstreamProtocol,
-		reqCtx.requestPath,
-		requestPath,
-		reqCtx.body,
-		bodyToSend,
-		reqCtx.originalModel,
-		actualModel,
-		reqCtx.isStreaming,
-	)
+	var plan protocol.TransformPlan
+	var err error
+	if translatedRequestOverride != nil {
+		plan = protocol.TransformPlan{
+			ClientProtocol:   reqCtx.clientProtocol,
+			UpstreamProtocol: upstreamProtocol,
+			RequestFamily:    protocol.RequestFamilyImages,
+			OriginalPath:     reqCtx.requestPath,
+			UpstreamPath:     requestPath,
+			OriginalBody:     reqCtx.body,
+			TranslatedBody:   bodyToSend,
+			OriginalModel:    reqCtx.originalModel,
+			ActualModel:      actualModel,
+			Streaming:        reqCtx.isStreaming,
+			NeedsTransform:   true,
+		}
+	} else {
+		plan, err = protocol.BuildTransformPlan(
+			reqCtx.clientProtocol,
+			upstreamProtocol,
+			reqCtx.requestPath,
+			requestPath,
+			reqCtx.body,
+			bodyToSend,
+			reqCtx.originalModel,
+			actualModel,
+			reqCtx.isStreaming,
+		)
+	}
 	if err != nil {
 		channelID := cfg.ID
 		return &proxyResult{
@@ -2194,9 +2616,19 @@ func (s *Server) forwardAttempt(
 		}, cooldown.ActionRetryChannel, nil
 	}
 	var nativeAttempt *nativeCodexWebsocketAttempt
-	if reqCtx.nativeCodexWS != nil && cfg.Websockets && !cfg.UsesXAIOAuth() && upstreamProtocol == protocol.Codex &&
+	if reqCtx.nativeCodexWS != nil && cfg.Websockets && !cfg.UsesXAIOAuth() && !cfg.UsesZedOAuth() && upstreamProtocol == protocol.Codex &&
 		protocol.DetectRequestFamily(requestPath) == protocol.RequestFamilyResponses && !plan.NeedsTransform {
-		incrementalBody := replaceJSONRequestModel(reqCtx.nativeCodexBody, reqCtx.originalModel, actualModel)
+		requestedModel := reqCtx.requestedModel
+		if requestedModel == "" {
+			requestedModel = reqCtx.originalModel
+		}
+		incrementalBody := applyThinkingSuffixForModel(
+			reqCtx.nativeCodexBody,
+			protocol.Codex,
+			requestedModel,
+			actualModel,
+		)
+		incrementalBody = replaceJSONRequestModel(incrementalBody, actualModel)
 		incrementalBody = prepareCodexResponsesBodyForUpstream(cfg, upstreamProtocol, requestPath, incrementalBody)
 		nativeAttempt = &nativeCodexWebsocketAttempt{
 			session:         reqCtx.nativeCodexWS,
@@ -2212,7 +2644,8 @@ func (s *Server) forwardAttempt(
 	executionIdentity := deriveXAIExecutionIDForRequest(reqCtx)
 	res, duration, err := s.forwardOnceAsyncWithNativeCodexWebsocket(
 		ctx, cfg, selectedKey, reqCtx.requestMethod,
-		plan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt, executionIdentity, nil,
+		plan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt, executionIdentity,
+		translatedRequestOverride,
 	)
 
 	// 传递 debug 数据到 proxyRequestContext（用于日志记录）
@@ -2263,6 +2696,7 @@ func (s *Server) forwardAttempt(
 
 	forceReturnClient := false
 	retryStrategies := make([]string, 0, 2)
+	missingStoredItemRetries := 0
 	for !quotaOverdraftReplayed {
 		retrySourcePlan := plan
 		// Rebuild an optimized Codex multi-agent request from the original plan on
@@ -2275,35 +2709,74 @@ func (s *Server) forwardAttempt(
 		if !ok || hasRetryStrategy(retryStrategies, retryStrategy) {
 			break
 		}
+		if strings.HasPrefix(retryStrategy, stripMissingStoredInputItemStrategy+":") {
+			if missingStoredItemRetries >= responsesMissingStoredItemRetryLimit {
+				break
+			}
+			missingStoredItemRetries++
+		}
+		if upstreamProtocol == protocol.Anthropic {
+			// Persist the rejected wire attempt before the retry replaces its
+			// debug capture. Raw bodies stay behind the existing Debug switch;
+			// passing no result keeps echoed user content out of this marker.
+			if !reqCtx.skipProxyLog {
+				s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, res.Status, duration, nil,
+					"request repair retry ["+retryStrategy+"]")
+			}
+			reqCtx.attemptSeq++
+			reqCtx.attemptStartTime = time.Now()
+			reqCtx.debugData = nil
+		}
 		retryStrategies = append(retryStrategies, retryStrategy)
 		retryPlan := plan
 		retryPlan.TranslatedBody = retryBody
+		// 可复用的 WS 连接优先发 attempt.incrementalBody。status
+		// 策略必须从原增量体剥离；retryBody 可能是完整 transcript，
+		// 直接当增量体会把历史再发一遍。
+		retryAttempt := nativeAttempt
+		if nativeAttempt != nil && res.UpstreamWebsocket {
+			incrementalRetryBody := retryBody
+			if retryStrategy == stripUnknownInputParameterStrategy {
+				incrementalRetryBody = stripResponsesInputItemStatus(nativeAttempt.incrementalBody)
+			}
+			retryAttempt = &nativeCodexWebsocketAttempt{
+				session:         nativeAttempt.session,
+				incrementalBody: incrementalRetryBody,
+			}
+		}
 		s.activeRequests.Retry(reqCtx.activeReqID)
 		res, duration, err = s.forwardOnceAsyncWithNativeCodexWebsocket(
 			ctx, cfg, selectedKey, reqCtx.requestMethod,
-			retryPlan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt, executionIdentity,
+			retryPlan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, retryAttempt, executionIdentity,
 			retryBody,
 		)
+		plan = retryPlan
 		if res != nil && res.DebugData != nil {
 			reqCtx.debugData = res.DebugData
 		}
+		if upstreamProtocol == protocol.Anthropic && res != nil {
+			// Failed or cancelled retries need the same recovery evidence as 200s.
+			res.RetryStrategy = strings.Join(retryStrategies, ",")
+		}
 		if err == nil && res != nil && res.Status >= 200 && res.Status < 300 {
 			res.RetryStrategy = strings.Join(retryStrategies, ",")
-			break
+			if len(res.SSEErrorEvent) == 0 {
+				break
+			}
+			continue
 		}
 		if upstreamProtocol != protocol.Anthropic {
 			forceReturnClient = true
 		}
-		plan = retryPlan
 		if err != nil || res == nil {
 			break
 		}
 	}
-	// Codex 请求用 service_tier=priority 明确开启 Fast 模式。计费不能依赖上游
-	// 是否在响应里回显该字段，否则同一请求会因上游响应形状不同而少扣 credits。
-	if res != nil && reqCtx.clientProtocol == protocol.Codex &&
-		gjson.GetBytes(reqCtx.body, "service_tier").String() == "priority" {
-		res.ServiceTier = "priority"
+	// 请求中的 priority 是 Fast 模式计费下限；上游未回显或错误回显
+	// default/standard 都不能把它降档。resolveBillingServiceTier 仍允许更贵的
+	// ultrafast 以及非 priority 请求的真实终态覆盖请求值。
+	if res != nil {
+		res.ServiceTier = resolveBillingServiceTier(requestedServiceTier(reqCtx), res.ServiceTier)
 	}
 	if res != nil && antigravityCapacityRetries > 0 {
 		capacityRetryStrategy := modelCapacityRetryStrategy(antigravityCapacityRetries)
@@ -2329,6 +2802,16 @@ func (s *Server) forwardAttempt(
 	// [INFO] 修复：handleResponse可能返回err即使StatusCode=200（例如Content-Length=0）
 	// [FIX] 2025-12: 传递 res 和 reqCtx，用于保留 499 场景下已消耗的 token 统计
 	if err != nil {
+		var zedValidationErr *zedRequestValidationError
+		if errors.As(err, &zedValidationErr) {
+			return &proxyResult{
+				status:     http.StatusBadRequest,
+				body:       []byte(zedValidationErr.Error()),
+				channelID:  &cfg.ID,
+				succeeded:  false,
+				nextAction: cooldown.ActionReturnClient,
+			}, cooldown.ActionReturnClient, nil
+		}
 		var anthropicValidationErr *anthropicRequestValidationError
 		if errors.As(err, &anthropicValidationErr) {
 			return &proxyResult{
@@ -2352,23 +2835,22 @@ func (s *Server) forwardAttempt(
 		}
 		var translationErr *protocol.RequestTranslationError
 		if errors.As(err, &translationErr) {
-			if cfg.GetProtocolTransformMode() == model.ProtocolTransformModeAuto {
-				return &proxyResult{
-					status:                    http.StatusBadRequest,
-					body:                      []byte(err.Error()),
-					channelID:                 &cfg.ID,
-					succeeded:                 false,
-					nextAction:                cooldown.ActionRetryChannel,
-					protocolCapabilityMissing: true,
-				}, cooldown.ActionRetryChannel, nil
-			}
+			// 无法表示当前请求不是上游故障，也不该当成最终客户端错误。
+			// auto/local 都要继续探下一个协议或渠道；否则 Codex compaction
+			// 这类专用状态会把整个请求钉死在第一个 Anthropic 候选上。
+			logged := s.logProtocolCapabilityFallback(
+				reqCtx, cfg, actualModel, selectedKey, http.StatusBadRequest,
+				duration, res, err.Error(),
+			)
 			return &proxyResult{
-				status:     http.StatusBadRequest,
-				body:       []byte(err.Error()),
-				channelID:  &cfg.ID,
-				succeeded:  false,
-				nextAction: cooldown.ActionReturnClient,
-			}, cooldown.ActionReturnClient, nil
+				status:                    http.StatusBadRequest,
+				body:                      []byte(err.Error()),
+				channelID:                 &cfg.ID,
+				succeeded:                 false,
+				nextAction:                cooldown.ActionRetryChannel,
+				proxyLogWritten:           logged,
+				protocolCapabilityMissing: true,
+			}, cooldown.ActionRetryChannel, nil
 		}
 		if errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrChannelConcurrencyExceeded) {
 			return nil, cooldown.ActionRetryChannel, err
@@ -2404,6 +2886,10 @@ func (s *Server) forwardAttempt(
 
 	if cfg.GetProtocolTransformMode() != model.ProtocolTransformModeUpstream &&
 		isProtocolEndpointMissing(res) {
+		logged := s.logProtocolCapabilityFallback(
+			reqCtx, cfg, actualModel, selectedKey, res.Status, duration, res,
+			fmt.Sprintf("upstream protocol %s rejected request", upstreamProtocol),
+		)
 		return &proxyResult{
 			status:                    res.Status,
 			header:                    res.Header,
@@ -2412,6 +2898,7 @@ func (s *Server) forwardAttempt(
 			duration:                  duration,
 			succeeded:                 false,
 			nextAction:                cooldown.ActionRetryChannel,
+			proxyLogWritten:           logged,
 			protocolCapabilityMissing: true,
 		}, cooldown.ActionRetryChannel, nil
 	}
@@ -2433,16 +2920,20 @@ func shouldRetryCodexInvalidEncryptedContent(
 	plan protocol.TransformPlan,
 	res *fwResult,
 ) bool {
-	if upstreamProtocol != protocol.Codex || res == nil || res.Status != http.StatusBadRequest {
+	if upstreamProtocol != protocol.Codex || res == nil || res.ResponseCommitted {
+		return false
+	}
+	errorBody, status := forwardResultErrorPayload(res)
+	if status != http.StatusBadRequest {
 		return false
 	}
 	if !plan.NeedsTransform {
-		return isInvalidEncryptedContentError(res.Body)
+		return isInvalidEncryptedContentError(errorBody)
 	}
 	if cfg == nil || !cfg.UsesXAIOAuth() {
 		return false
 	}
-	return isInvalidEncryptedContentError(res.Body) || codexBodyHasEncryptedInputItems(plan.TranslatedBody)
+	return isInvalidEncryptedContentError(errorBody) || codexBodyHasEncryptedInputItems(plan.TranslatedBody)
 }
 
 func isInvalidEncryptedContentError(body []byte) bool {
@@ -2480,12 +2971,13 @@ func isInvalidEncryptedContentError(body []byte) bool {
 }
 
 func shouldRetryAnyrouterCodexInvalidResponsesRequest(upstreamProtocol protocol.Protocol, cfg *model.Config, res *fwResult) bool {
-	return upstreamProtocol == protocol.Codex &&
-		cfg != nil &&
-		strings.Contains(strings.ToLower(cfg.Name), "anyrouter") &&
-		res != nil &&
-		res.Status == http.StatusBadRequest &&
-		isInvalidResponsesRequestError(res.Body)
+	if upstreamProtocol != protocol.Codex || cfg == nil ||
+		!strings.Contains(strings.ToLower(cfg.Name), "anyrouter") ||
+		res == nil || res.ResponseCommitted {
+		return false
+	}
+	errorBody, status := forwardResultErrorPayload(res)
+	return status == http.StatusBadRequest && isInvalidResponsesRequestError(errorBody)
 }
 
 func isInvalidResponsesRequestError(body []byte) bool {
@@ -2639,6 +3131,15 @@ func retryBodyForRejectedRequest(
 	if retryBody, strategy, ok := anthropicRetryBodyFor400(upstreamProtocol, plan, res); ok {
 		return retryBody, strategy, true
 	}
+	if retryBody, strategy, ok := responsesRetryBodyForUnknownParameter(upstreamProtocol, plan, res); ok {
+		return retryBody, strategy, true
+	}
+	if retryBody, strategy, ok := responsesRetryBodyForMissingRequiredParameter(plan, res); ok {
+		return retryBody, strategy, true
+	}
+	if retryBody, strategy, ok := responsesRetryBodyForMissingStoredInputItem(plan, res); ok {
+		return retryBody, strategy, true
+	}
 	if cfg != nil && cfg.UsesAntigravityOAuth() && res != nil && !res.ResponseCommitted {
 		if retryBody, strategy, ok := antigravitySignatureRetryBody(plan.TranslatedBody, res.Body, res.Status); ok {
 			return retryBody, strategy, true
@@ -2687,10 +3188,11 @@ func hasRetryStrategy(strategies []string, strategy string) bool {
 }
 
 func shouldRetryCodexUnsupportedThinking(upstreamProtocol protocol.Protocol, res *fwResult) bool {
-	return upstreamProtocol == protocol.Codex &&
-		res != nil &&
-		res.Status == http.StatusBadRequest &&
-		isUnsupportedThinkingError(res.Body)
+	if upstreamProtocol != protocol.Codex || res == nil || res.ResponseCommitted {
+		return false
+	}
+	errorBody, status := forwardResultErrorPayload(res)
+	return status == http.StatusBadRequest && isUnsupportedThinkingError(errorBody)
 }
 
 func isUnsupportedThinkingError(body []byte) bool {
@@ -2734,41 +3236,9 @@ func isUnsupportedThinkingError(body []byte) bool {
 }
 
 func codexBodyWithoutEncryptedInputItems(body []byte) ([]byte, bool) {
-	var root map[string]any
-	if err := sonic.Unmarshal(body, &root); err != nil {
-		return nil, false
-	}
-	input, ok := root["input"].([]any)
-	if !ok {
-		return nil, false
-	}
-
-	filtered := make([]any, 0, len(input))
-	removed := false
-	for _, item := range input {
-		obj, ok := item.(map[string]any)
-		if !ok {
-			filtered = append(filtered, item)
-			continue
-		}
-		typ, _ := obj["type"].(string)
-		_, hasEncryptedContent := obj["encrypted_content"]
-		if typ == "reasoning" || hasEncryptedContent {
-			removed = true
-			continue
-		}
-		filtered = append(filtered, item)
-	}
-	if !removed {
-		return nil, false
-	}
-
-	root["input"] = filtered
-	retryBody, err := sonic.Marshal(root)
-	if err != nil {
-		return nil, false
-	}
-	return retryBody, true
+	return deleteCodexInputItems(body, func(item gjson.Result) bool {
+		return (item.Get("type").Type == gjson.String && item.Get("type").String() == "reasoning") || item.Get("encrypted_content").Exists()
+	})
 }
 
 func codexBodyHasEncryptedInputItems(body []byte) bool {
@@ -2785,71 +3255,48 @@ func codexBodyHasEncryptedInputItems(body []byte) bool {
 }
 
 func codexBodyWithoutThinking(body []byte) ([]byte, bool) {
-	var root map[string]any
-	if err := sonic.Unmarshal(body, &root); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return nil, false
 	}
-
+	updated := body
 	removed := false
-	if _, ok := root["reasoning"]; ok {
-		delete(root, "reasoning")
-		removed = true
-	}
-	if filterCodexThinkingIncludes(root) {
-		removed = true
-	}
-	if input, ok := root["input"].([]any); ok {
-		filtered := make([]any, 0, len(input))
-		for _, item := range input {
-			obj, ok := item.(map[string]any)
-			if !ok {
-				filtered = append(filtered, item)
-				continue
-			}
-			typ, _ := obj["type"].(string)
-			if typ == "reasoning" {
-				removed = true
-				continue
-			}
-			filtered = append(filtered, item)
+	if gjson.GetBytes(updated, "reasoning").Exists() {
+		var err error
+		updated, err = sjson.DeleteBytes(updated, "reasoning")
+		if err != nil {
+			return nil, false
 		}
-		root["input"] = filtered
+		removed = true
 	}
-	if !removed {
-		return nil, false
-	}
-
-	retryBody, err := sonic.Marshal(root)
-	if err != nil {
-		return nil, false
-	}
-	return retryBody, true
-}
-
-func filterCodexThinkingIncludes(root map[string]any) bool {
-	include, ok := root["include"].([]any)
-	if !ok {
-		return false
-	}
-	filtered := make([]any, 0, len(include))
-	removed := false
-	for _, item := range include {
-		value, ok := item.(string)
-		if ok && strings.HasPrefix(value, "reasoning.") {
+	if include := gjson.GetBytes(updated, "include"); include.IsArray() {
+		indices := make([]int, 0)
+		for index, value := range include.Array() {
+			if value.Type == gjson.String && strings.HasPrefix(value.String(), "reasoning.") {
+				indices = append(indices, index)
+			}
+		}
+		for index := len(indices) - 1; index >= 0; index-- {
+			var err error
+			updated, err = sjson.DeleteBytes(updated, fmt.Sprintf("include.%d", indices[index]))
+			if err != nil {
+				return nil, false
+			}
 			removed = true
-			continue
 		}
-		filtered = append(filtered, item)
+		if len(indices) > 0 && len(gjson.GetBytes(updated, "include").Array()) == 0 {
+			updated, _ = sjson.DeleteBytes(updated, "include")
+		}
+	}
+	if filtered, ok := deleteCodexInputItems(updated, func(item gjson.Result) bool {
+		return item.Get("type").Type == gjson.String && item.Get("type").String() == "reasoning"
+	}); ok {
+		updated = filtered
+		removed = true
 	}
 	if !removed {
-		return false
+		return nil, false
 	}
-	if len(filtered) == 0 {
-		delete(root, "include")
-		return true
-	}
-	root["include"] = filtered
-	return true
+	return updated, true
 }
 
 func prepareCodexResponsesBodyForUpstream(cfg *model.Config, upstreamProtocol protocol.Protocol, requestPath string, body []byte) []byte {
@@ -2870,152 +3317,145 @@ func prepareCodexResponsesBodyForUpstream(cfg *model.Config, upstreamProtocol pr
 }
 
 func normalizeCodexToolSearchInputItems(body []byte) ([]byte, bool) {
-	var root map[string]any
-	if err := sonic.Unmarshal(body, &root); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return nil, false
 	}
-	input, ok := root["input"].([]any)
-	if !ok {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
 		return nil, false
 	}
 
 	changed := false
-	filtered := make([]any, 0, len(input))
-	for _, item := range input {
-		obj, ok := item.(map[string]any)
-		if !ok {
-			filtered = append(filtered, item)
+	deleteIndexes := make([]int, 0)
+	updated := body
+	for index, item := range input.Array() {
+		if !item.IsObject() {
 			continue
 		}
-		typ, _ := obj["type"].(string)
+		typValue := item.Get("type")
+		if typValue.Type != gjson.String {
+			continue
+		}
+		typ := typValue.String()
 		if !strings.HasPrefix(typ, "tool_search_") {
-			filtered = append(filtered, item)
 			continue
 		}
-		rawArgs, hasArgs := obj["arguments"]
-		if !hasArgs {
-			filtered = append(filtered, item)
+		rawArgs := item.Get("arguments")
+		if !rawArgs.Exists() {
 			continue
 		}
-		if _, ok := rawArgs.(map[string]any); ok {
-			filtered = append(filtered, item)
+		if rawArgs.IsObject() {
 			continue
 		}
-		argsString, ok := rawArgs.(string)
-		if !ok {
+		if rawArgs.Type != gjson.String {
+			deleteIndexes = append(deleteIndexes, index)
 			changed = true
 			continue
 		}
-
-		var decoded any
-		if err := sonic.Unmarshal([]byte(argsString), &decoded); err != nil {
+		argsRaw := []byte(rawArgs.String())
+		if !isMutableJSONObject(argsRaw) {
+			deleteIndexes = append(deleteIndexes, index)
 			changed = true
 			continue
 		}
-		argsObject, ok := decoded.(map[string]any)
-		if !ok {
-			changed = true
-			continue
+		var err error
+		updated, err = sjson.SetRawBytes(updated, fmt.Sprintf("input.%d.arguments", index), argsRaw)
+		if err != nil {
+			return nil, false
 		}
-		obj["arguments"] = argsObject
 		changed = true
-		filtered = append(filtered, item)
 	}
 	if !changed {
 		return nil, false
 	}
-
-	root["input"] = filtered
-	normalized, err := sonic.Marshal(root)
-	if err != nil {
-		return nil, false
+	for index := len(deleteIndexes) - 1; index >= 0; index-- {
+		var err error
+		updated, err = sjson.DeleteBytes(updated, fmt.Sprintf("input.%d", deleteIndexes[index]))
+		if err != nil {
+			return nil, false
+		}
 	}
-	return normalized, true
+	return updated, true
 }
 
 func codexBodyWithoutToolSearchOnlyInputItems(body []byte) ([]byte, bool) {
-	return codexBodyWithoutInputItems(body, func(typ string) bool {
-		return strings.HasPrefix(typ, "tool_search_")
+	return deleteCodexInputItems(body, func(item gjson.Result) bool {
+		return strings.HasPrefix(item.Get("type").String(), "tool_search_")
 	})
 }
 
-func codexBodyWithoutInputItems(body []byte, shouldDrop func(string) bool) ([]byte, bool) {
-	var root map[string]any
-	if err := sonic.Unmarshal(body, &root); err != nil {
+func deleteCodexInputItems(body []byte, shouldDrop func(gjson.Result) bool) ([]byte, bool) {
+	if !gjson.ParseBytes(body).IsObject() {
 		return nil, false
 	}
-
-	input, ok := root["input"].([]any)
-	if !ok {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
 		return nil, false
 	}
-
-	filtered := make([]any, 0, len(input))
-	removed := false
-	for _, item := range input {
-		obj, ok := item.(map[string]any)
-		if !ok {
-			filtered = append(filtered, item)
-			continue
+	indices := make([]int, 0)
+	for index, item := range input.Array() {
+		if shouldDrop(item) {
+			indices = append(indices, index)
 		}
-		typ, _ := obj["type"].(string)
-		if shouldDrop(typ) {
-			removed = true
-			continue
+	}
+	if len(indices) == 0 {
+		return nil, false
+	}
+	updated := body
+	for index := len(indices) - 1; index >= 0; index-- {
+		var err error
+		updated, err = sjson.DeleteBytes(updated, fmt.Sprintf("input.%d", indices[index]))
+		if err != nil {
+			return nil, false
 		}
-		filtered = append(filtered, item)
 	}
-	if !removed {
-		return nil, false
-	}
-
-	root["input"] = filtered
-	retryBody, err := sonic.Marshal(root)
-	if err != nil {
-		return nil, false
-	}
-	return retryBody, true
+	return updated, true
 }
 
 func codexBodyWithoutEncryptedContent(body []byte) ([]byte, bool) {
-	var root map[string]any
-	if err := sonic.Unmarshal(body, &root); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return nil, false
 	}
-
-	removed := removeEncryptedContentFields(root)
-	if !removed {
+	paths := make([]string, 0)
+	collectJSONKeyPaths(gjson.ParseBytes(body), "", "encrypted_content", 0, &paths)
+	if len(paths) == 0 {
 		return nil, false
 	}
-
-	retryBody, err := sonic.Marshal(root)
-	if err != nil {
-		return nil, false
+	// 无需按长度排序：collectJSONKeyPaths 命中目标键后不再下钻，
+	// 因此不会产出互相嵌套的路径；删除对象成员也不会移动兄弟数组下标。
+	updated := body
+	for _, path := range paths {
+		var err error
+		updated, err = sjson.DeleteBytes(updated, path)
+		if err != nil {
+			return nil, false
+		}
 	}
-	return retryBody, true
+	return updated, true
 }
 
-func removeEncryptedContentFields(value any) bool {
-	removed := false
-	switch v := value.(type) {
-	case map[string]any:
-		if _, ok := v["encrypted_content"]; ok {
-			delete(v, "encrypted_content")
-			removed = true
-		}
-		for _, child := range v {
-			if removeEncryptedContentFields(child) {
-				removed = true
+func collectJSONKeyPaths(value gjson.Result, prefix, key string, depth int, paths *[]string) {
+	if depth > jsonWalkMaxDepth {
+		return
+	}
+	if value.IsObject() {
+		value.ForEach(func(name, child gjson.Result) bool {
+			childPath := sjsonObjectPathJoin(prefix, name.String())
+			if name.String() == key {
+				*paths = append(*paths, childPath)
+				return true
 			}
-		}
-	case []any:
-		for _, child := range v {
-			if removeEncryptedContentFields(child) {
-				removed = true
-			}
+			collectJSONKeyPaths(child, childPath, key, depth+1, paths)
+			return true
+		})
+		return
+	}
+	if value.IsArray() {
+		for index, child := range value.Array() {
+			childPath := sjsonPathJoin(prefix, fmt.Sprintf("%d", index))
+			collectJSONKeyPaths(child, childPath, key, depth+1, paths)
 		}
 	}
-	return removed
 }
 
 // ============================================================================
@@ -3076,6 +3516,29 @@ func selectPinnedCodexWebsocketKey(
 	return 0, "", false
 }
 
+// keyByIndex 在 Key 切片中按语义索引（APIKey.KeyIndex）定位，未找到返回 nil。
+func keyByIndex(apiKeys []*model.APIKey, keyIndex int) *model.APIKey {
+	for _, apiKey := range apiKeys {
+		if apiKey != nil && apiKey.KeyIndex == keyIndex {
+			return apiKey
+		}
+	}
+	return nil
+}
+
+func filterAPIKeysForModel(apiKeys []*model.APIKey, modelName string) ([]*model.APIKey, bool) {
+	if modelName == "" || modelName == "*" {
+		return apiKeys, false
+	}
+	filtered := make([]*model.APIKey, 0, len(apiKeys))
+	for _, apiKey := range apiKeys {
+		if apiKey != nil && apiKey.AllowsModel(modelName) {
+			filtered = append(filtered, apiKey)
+		}
+	}
+	return filtered, len(filtered) != len(apiKeys)
+}
+
 // recordSuccessTTFBToSelector 在2xx响应里把TTFB回报给URLSelector。
 // 非2xx/无延迟数据直接跳过。优先用 firstByteTime，缺失时回退到 duration。
 func recordSuccessTTFBToSelector(selector *URLSelector, channelID int64, urlStr string, result *proxyResult) {
@@ -3132,7 +3595,14 @@ func (s *Server) attemptKeyAcrossURLs(
 	urlsCount := len(sortedURLs)
 	var urlPolicy channelURLAttemptPolicy
 	var deferredFallbackLog *model.LogEntry
+	// 每个 URL 尝试持有独立的可取消 ctx，供管理端「中断」注入连接重置语义。
+	// 循环体有大量 continue/break/return，所以释放只在两个地方做：下一轮开头释放
+	// 上一轮，函数退出时由 defer 释放最后一轮。别改成在循环体内就地 defer。
+	var abortAttempt context.CancelCauseFunc
 	defer func() {
+		if abortAttempt != nil {
+			abortAttempt(nil)
+		}
 		if deferredFallbackLog != nil {
 			s.AddLogAsync(deferredFallbackLog)
 		}
@@ -3140,6 +3610,18 @@ func (s *Server) attemptKeyAcrossURLs(
 	for urlIdx, urlEntry := range sortedURLs {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return buildCtxDoneResult(cfg, ctxErr), nil, nil
+		}
+		if abortAttempt != nil {
+			abortAttempt(nil)
+		}
+		attemptCtx, cancelAttempt := context.WithCancelCause(ctx)
+		abortAttempt = cancelAttempt
+
+		attemptBaseURL := urlEntry.url
+		if _, bridge := s.xaiImagesResponsesModel(cfg, reqCtx); bridge {
+			// The Grok CLI chat proxy silently removes hosted image_generation
+			// tools. xAI exposes that tool only on the public Responses API.
+			attemptBaseURL = xaiauth.APIBaseURL
 		}
 
 		reqCtx.activeReqID = s.activeRequests.BeginAttempt(reqCtx.activeReqID, activeRequestAttempt{
@@ -3153,14 +3635,15 @@ func (s *Server) attemptKeyAcrossURLs(
 			UpstreamProtocol: "",
 			APIKey:           selectedKey,
 			TokenID:          reqCtx.tokenID,
-			BaseURL:          urlEntry.url,
-			CostMultiplier:   cfg.CostMultiplier,
+			BaseURL:          attemptBaseURL,
+			CostMultiplier:   reqCtx.attemptCostMultiplier,
 			ThinkingEffort:   reqCtx.thinkingEffort,
+			Abort:            cancelAttempt,
 		})
 
 		shouldDeferChannelCooldown := urlIdx < len(sortedURLs)-1
 		capabilityKey := protocolCapabilityKey{
-			channelID: cfg.ID, baseURL: urlEntry.url,
+			channelID: cfg.ID, baseURL: attemptBaseURL,
 			clientProtocol: clientProtocol, requestFamily: requestFamily,
 		}
 		if urlEntry.idx < 0 || urlEntry.idx >= len(cfg.URLs) {
@@ -3169,6 +3652,14 @@ func (s *Server) attemptKeyAcrossURLs(
 		protocolCandidates, declared := protocolCandidatesForURL(
 			cfg.URLs[urlEntry.idx], transformMode, clientProtocol, requestFamily, localProtocolOrder,
 		)
+		if _, bridge := s.xaiImagesResponsesModel(cfg, reqCtx); bridge &&
+			cfg.URLs[urlEntry.idx].SupportsProtocol(string(protocol.Codex)) {
+			// Images is not a general OpenAI -> Codex transform. xAI OAuth is the
+			// one provider that deliberately maps this endpoint to a Responses
+			// image_generation tool, so keep the capability exception local here.
+			protocolCandidates = []protocol.Protocol{protocol.Codex}
+			declared = true
+		}
 		learnCapability := transformMode == model.ProtocolTransformModeAuto && !declared
 		if learnCapability {
 			if cachedProtocol, known := s.protocolCapabilities.get(capabilityKey); known {
@@ -3196,11 +3687,12 @@ func (s *Server) attemptKeyAcrossURLs(
 
 		var result *proxyResult
 		var nextAction cooldown.Action
+		stableEndpointUnsupported := true
 		for protocolIdx, upstreamProtocol := range protocolCandidates {
 			s.activeRequests.SetUpstreamProtocol(reqCtx.activeReqID, string(upstreamProtocol))
 			var attemptErr error
 			result, nextAction, attemptErr = s.forwardAttempt(
-				ctx, cfg, keyIndex, selectedKey, reqCtx, upstreamProtocol, urlEntry.url, w,
+				attemptCtx, cfg, keyIndex, selectedKey, reqCtx, upstreamProtocol, attemptBaseURL, w,
 				shouldDeferChannelCooldown, urlPolicy.antigravityCapacityRetries)
 			if attemptErr != nil {
 				return nil, nil, attemptErr
@@ -3211,11 +3703,15 @@ func (s *Server) attemptKeyAcrossURLs(
 				}
 				break
 			}
+			if !shouldCacheProtocolUnsupported(result.status) {
+				stableEndpointUnsupported = false
+			}
 			if protocolIdx < len(protocolCandidates)-1 {
 				s.activeRequests.Retry(reqCtx.activeReqID)
 				continue
 			}
-			if learnCapability {
+			if (learnCapability || requestFamily == protocol.RequestFamilyAlphaSearch) &&
+				stableEndpointUnsupported {
 				s.protocolCapabilities.set(capabilityKey, protocolUnsupported)
 			}
 		}
@@ -3342,6 +3838,8 @@ func prioritizePinnedCodexWebsocketURL(
 
 func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqCtx *proxyRequestContext, w http.ResponseWriter) (*proxyResult, error) {
 	reqCtx.channelStartTime = time.Now()
+	// 倍率默认取渠道级：OAuth 凭证 1:1，渠道级即权威；api_key 渠道稍后按选中 Key 覆盖。
+	reqCtx.attemptCostMultiplier = cfg.CostMultiplier
 
 	// Fail-fast：ctx 已结束（客户端断开/请求超时）时不要再做任何 I/O（查库、选Key、发请求）。
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -3362,19 +3860,29 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	if cfg.UsesZAIOAuth() {
 		return s.tryZAIOAuthChannel(ctx, cfg, reqCtx, w)
 	}
+	if cfg.UsesCursorOAuth() {
+		return s.tryCursorOAuthChannel(ctx, cfg, reqCtx, w)
+	}
+	if cfg.UsesZedOAuth() {
+		return s.tryZedOAuthChannel(ctx, cfg, reqCtx, w)
+	}
 
 	// 查询渠道的API Keys（缓存优先，缓存不可用自动降级到数据库查询）
 	apiKeys, err := s.getAPIKeys(ctx, cfg.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get API keys: %w", err)
 	}
+	if len(apiKeys) == 0 {
+		return nil, fmt.Errorf("no API keys configured for channel %d", cfg.ID)
+	}
+	channelModel := s.resolveChannelRoutingModel(cfg, reqCtx.originalModel)
+	apiKeys, modelScoped := filterAPIKeysForModel(apiKeys, channelModel)
+	if len(apiKeys) == 0 {
+		return nil, fmt.Errorf("%w: channel %d model %q", ErrNoAPIKeyForModel, cfg.ID, channelModel)
+	}
 
 	// 计算实际重试次数
 	actualKeyCount := len(apiKeys)
-	if actualKeyCount == 0 {
-		return nil, fmt.Errorf("no API keys configured for channel %d", cfg.ID)
-	}
-
 	maxKeyRetries := min(s.maxKeyRetries, actualKeyCount)
 	if cfg.RetryOtherKeysOnFailure {
 		maxKeyRetries = actualKeyCount
@@ -3408,11 +3916,19 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 			keyIndex, selectedKey, selectErr = s.selectKeyWithFallback(cfg, apiKeys, triedKeys)
 		}
 		if selectErr != nil {
+			if modelScoped && errors.Is(selectErr, ErrAllKeysUnavailable) {
+				return nil, fmt.Errorf("%w: channel %d model %q", ErrNoAPIKeyForModel, cfg.ID, channelModel)
+			}
 			return nil, selectErr
 		}
 
 		// 标记Key为已尝试
 		triedKeys[keyIndex] = true
+		// 倍率取选中 Key 的权威值，日志快照与 Token 计费随本次 attempt 走。
+		// keyIndex 是 Key 的语义索引（APIKey.KeyIndex），apiKeys 可能已被模型白名单过滤，需按索引定位。
+		if attemptKey := keyByIndex(apiKeys, keyIndex); attemptKey != nil {
+			reqCtx.attemptCostMultiplier = attemptKey.CostMultiplier
+		}
 
 		// URL循环（单URL时退化为单次迭代）
 		immediate, urlLastFailure, attemptErr := s.attemptKeyAcrossURLs(
@@ -3675,6 +4191,29 @@ func (s *Server) tryZAIOAuthChannel(
 	})
 }
 
+func (s *Server) tryZedOAuthChannel(
+	ctx context.Context,
+	cfg *model.Config,
+	reqCtx *proxyRequestContext,
+	w http.ResponseWriter,
+) (*proxyResult, error) {
+	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Zed", true, func(forceRefresh bool, rejectedAccessToken string) (*model.Config, string, error) {
+		var credential *zedauth.Credential
+		var err error
+		if forceRefresh {
+			credential, err = s.zedCredentials.credentialAfterUnauthorized(ctx, cfg, rejectedAccessToken)
+		} else {
+			credential, err = s.zedCredentials.credential(ctx, cfg, false)
+		}
+		if credential == nil {
+			return cfg, "", err
+		}
+		return cfg, credential.AccessToken, err
+	}, func(result *proxyResult) bool {
+		return result != nil && !result.succeeded && zedCredentialRejected(result.status, result.body)
+	})
+}
+
 func (s *Server) tryAntigravityOAuthChannel(
 	ctx context.Context,
 	cfg *model.Config,
@@ -3747,31 +4286,33 @@ func checkSoftError(data []byte, contentType string) bool {
 	ctLower := strings.ToLower(contentType)
 	isJSONCT := strings.Contains(ctLower, "application/json")
 
-	// JSON：仅看顶层结构
+	// JSON：仅看顶层结构。软错误检测故意宽松——重复 key 按 gjson 所见字段判定，
+	// 解析失败不猜，避免把正常响应当错误。
 	if isJSONCT || trimmed[0] == '{' {
-		// 快速短路：99% 成功响应顶层不含错误标记，跳过 sonic.Unmarshal
+		// 快速短路：99% 成功响应顶层不含错误标记。
 		// 同时覆盖紧凑/带空格两种格式；"error" 带引号避免误匹配 "api_error" 等子串
 		if !maybeContainsTopLevelError(trimmed) {
 			if trimmed[0] == '{' {
 				return false // 形态确实是 JSON 对象 → 已确认无错误
 			}
 			// CT=JSON 但内容不像 JSON 对象（如纯文本错误消息）→ 走兜底
-		} else {
-			var obj map[string]any
-			if err := sonic.Unmarshal(trimmed, &obj); err == nil {
-				if v, ok := obj["error"]; ok && v != nil {
+		} else if json.Valid(trimmed) {
+			payload := gjson.ParseBytes(trimmed)
+			if payload.IsObject() {
+				errorField := payload.Get("error")
+				if errorField.Exists() && errorField.Type != gjson.Null {
 					return true
 				}
-				if t, ok := obj["type"].(string); ok && strings.EqualFold(t, "error") {
+				if t := payload.Get("type"); t.Type == gjson.String && strings.EqualFold(t.String(), "error") {
 					return true
 				}
 				return false
 			}
-			// 形态像 JSON（以 '{' 开头）但解析失败：不猜，避免误判
 			if trimmed[0] == '{' {
 				return false
 			}
-			// Content-Type 标注为 JSON 但内容不是 JSON：允许继续走 text/plain 的“前缀+短消息”兜底
+		} else if trimmed[0] == '{' {
+			return false
 		}
 	}
 

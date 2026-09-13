@@ -25,6 +25,10 @@ const (
 var antigravityOAuthDefaultModels = []string{
 	"claude-opus-4-6-thinking",
 	"claude-sonnet-4-6",
+	"gemini-3.8-flash",
+	"gemini-3.8-flash-high",
+	"gemini-3.8-flash-medium",
+	"gemini-3.7-flash",
 	"gemini-3.7-flash-high",
 	"gemini-3.6-flash-high",
 	"gemini-3-flash",
@@ -130,11 +134,7 @@ func antigravityOAuthDefaultURLs() model.ChannelURLs {
 }
 
 func antigravityOAuthModelEntries() []model.ModelEntry {
-	entries := make([]model.ModelEntry, len(antigravityOAuthDefaultModels))
-	for i, name := range antigravityOAuthDefaultModels {
-		entries[i] = model.ModelEntry{Model: name}
-	}
-	return entries
+	return oauthModelEntries(antigravityOAuthDefaultModels)
 }
 
 func antigravityOAuthAvailableModels(upstreamModels []string) []string {
@@ -267,6 +267,10 @@ func (s *Server) HandleRefreshAntigravityCredential(c *gin.Context) {
 	}
 	if !cfg.UsesAntigravityOAuth() {
 		RespondErrorMsg(c, http.StatusConflict, "channel does not use Antigravity OAuth")
+		return
+	}
+	if s.antigravityCredentials == nil {
+		RespondErrorMsg(c, http.StatusServiceUnavailable, "Antigravity credential refresh is unavailable")
 		return
 	}
 	credential, err := s.antigravityCredentials.credential(c.Request.Context(), cfg, true)

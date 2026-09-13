@@ -130,6 +130,39 @@ func respondSettingCombinationError(c *gin.Context, err error) bool {
 	return true
 }
 
+func settingsRequireRestart(updates map[string]string) bool {
+	for key := range updates {
+		if key != modelMultimodalFallbackSettingKey && !isLiveModelCapabilitySetting(key) {
+			return true
+		}
+	}
+	return false
+}
+
+// commitSettingUpdates 将持久化与运行态发布绑定成同一个有序操作。
+// 只要包含多模态映射，就串行化整个提交，避免并发请求让数据库终值与运行态快照错序。
+func (s *Server) commitSettingUpdates(updates map[string]string, persist func() error) (bool, error) {
+	value, updatesMultimodalFallback := updates[modelMultimodalFallbackSettingKey]
+	var multimodalFallbackModels map[string]string
+	if updatesMultimodalFallback {
+		parsed, err := parseMultimodalFallbackModels(value)
+		if err != nil {
+			return false, fmt.Errorf("parse validated multimodal fallback setting: %w", err)
+		}
+		multimodalFallbackModels = parsed
+		s.multimodalFallbackUpdateMu.Lock()
+		defer s.multimodalFallbackUpdateMu.Unlock()
+	}
+
+	if err := persist(); err != nil {
+		return false, err
+	}
+	if updatesMultimodalFallback {
+		s.setMultimodalFallbackModels(multimodalFallbackModels)
+	}
+	return settingsRequireRestart(updates), nil
+}
+
 // AdminListSettings 获取所有配置项
 // GET /admin/settings
 func (s *Server) AdminListSettings(c *gin.Context) {
@@ -205,34 +238,44 @@ func (s *Server) AdminUpdateSetting(c *gin.Context) {
 		return
 	}
 
+	s.settingsMutationMu.Lock()
+	defer s.settingsMutationMu.Unlock()
 	updates, err := s.completeCooldownBoundUpdates(c.Request.Context(), map[string]string{key: req.Value})
 	if respondSettingCombinationError(c, err) {
 		return
 	}
 
 	// 冷却上下限必须作为一个有效快照原子写入，其他设置保持单项更新。
-	if len(updates) == 1 {
-		err = s.configService.UpdateSetting(c.Request.Context(), key, req.Value)
-	} else {
-		err = s.configService.BatchUpdateSettings(c.Request.Context(), updates)
-	}
+	restartRequired, err := s.commitSettingUpdates(updates, func() error {
+		if len(updates) == 1 {
+			return s.configService.UpdateSetting(c.Request.Context(), key, req.Value)
+		}
+		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
+	})
 	if err != nil {
 		log.Printf("[ERROR] AdminUpdateSetting key=%s 失败: %v", key, err)
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.applyLiveSettings(updates); err != nil {
+		log.Printf("[ERROR] AdminUpdateSetting key=%s 热更新失败: %v", key, err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
 
-	// log.Printf("[INFO] Setting updated: %s = %s (restart required)", key, req.Value)
-
-	// 返回成功响应，告知需要重启
+	message := "配置已保存并立即生效"
+	if restartRequired {
+		message = "配置已保存，程序将在2秒后重启"
+	}
 	RespondJSON(c, http.StatusOK, gin.H{
-		"message": "配置已保存，程序将在2秒后重启",
+		"message": message,
 		"key":     key,
 		"value":   req.Value,
 	})
 
-	// 异步触发重启
-	go s.triggerRestart()
+	if restartRequired {
+		go s.triggerRestart()
+	}
 }
 
 // AdminResetSetting 重置配置为默认值
@@ -257,31 +300,42 @@ func (s *Server) AdminResetSetting(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusInternalServerError, fmt.Sprintf("invalid default value for %s: %v", key, err))
 		return
 	}
+	s.settingsMutationMu.Lock()
+	defer s.settingsMutationMu.Unlock()
 	updates, err := s.completeCooldownBoundUpdates(c.Request.Context(), map[string]string{key: setting.DefaultValue})
 	if respondSettingCombinationError(c, err) {
 		return
 	}
-	if len(updates) == 1 {
-		err = s.configService.UpdateSetting(c.Request.Context(), key, setting.DefaultValue)
-	} else {
-		err = s.configService.BatchUpdateSettings(c.Request.Context(), updates)
-	}
+	restartRequired, err := s.commitSettingUpdates(updates, func() error {
+		if len(updates) == 1 {
+			return s.configService.UpdateSetting(c.Request.Context(), key, setting.DefaultValue)
+		}
+		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
+	})
 	if err != nil {
 		log.Printf("[ERROR] AdminResetSetting key=%s 失败: %v", key, err)
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.applyLiveSettings(updates); err != nil {
+		log.Printf("[ERROR] AdminResetSetting key=%s 热更新失败: %v", key, err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
 
-	// log.Printf("[INFO] Setting reset to default: %s = %s (restart required)", key, setting.DefaultValue)
-
+	message := "配置已重置为默认值并立即生效"
+	if restartRequired {
+		message = "配置已重置为默认值，程序将在2秒后重启"
+	}
 	RespondJSON(c, http.StatusOK, gin.H{
-		"message": "配置已重置为默认值，程序将在2秒后重启",
+		"message": message,
 		"key":     key,
 		"value":   setting.DefaultValue,
 	})
 
-	// 异步触发重启
-	go s.triggerRestart()
+	if restartRequired {
+		go s.triggerRestart()
+	}
 }
 
 // AdminBatchUpdateSettings 批量更新配置(事务保护)
@@ -314,32 +368,77 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 			return
 		}
 	}
+	s.settingsMutationMu.Lock()
+	defer s.settingsMutationMu.Unlock()
 	updates, err := s.completeCooldownBoundUpdates(c.Request.Context(), req)
 	if respondSettingCombinationError(c, err) {
 		return
 	}
 
 	// 批量更新(事务保护)
-	if err := s.configService.BatchUpdateSettings(c.Request.Context(), updates); err != nil {
+	restartRequired, err := s.commitSettingUpdates(updates, func() error {
+		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
+	})
+	if err != nil {
 		log.Printf("[ERROR] AdminBatchUpdateSettings 失败: %v", err)
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.applyLiveSettings(updates); err != nil {
+		log.Printf("[ERROR] AdminBatchUpdateSettings 热更新失败: %v", err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
 
-	log.Printf("[INFO] 已批量更新 %d 项配置（需重启）", len(req))
+	message := fmt.Sprintf("已保存 %d 项配置并立即生效", len(req))
+	if restartRequired {
+		message = fmt.Sprintf("已保存 %d 项配置，程序将在2秒后重启", len(req))
+	}
+	log.Printf("[INFO] 已批量更新 %d 项配置（需要重启: %t）", len(req), restartRequired)
 
 	RespondJSON(c, http.StatusOK, gin.H{
-		"message": fmt.Sprintf("已保存 %d 项配置，程序将在2秒后重启", len(req)),
+		"message": message,
 	})
 
-	// 异步触发重启
-	go s.triggerRestart()
+	if restartRequired {
+		go s.triggerRestart()
+	}
+}
+
+func (s *Server) applyLiveSettings(updates map[string]string) error {
+	reasoningValue, updatesReasoning := updates[modelReasoningEffortOverridesSetting]
+	metadataValue, updatesMetadata := updates[modelMetadataOverridesSetting]
+	if updatesReasoning && s.modelReasoningCapabilities == nil {
+		return fmt.Errorf("model reasoning capability resolver is not initialized")
+	}
+	if updatesMetadata && s.modelMetadataCapabilities == nil {
+		return fmt.Errorf("model metadata resolver is not initialized")
+	}
+	if updatesReasoning {
+		if err := s.modelReasoningCapabilities.SetOverrides(reasoningValue); err != nil {
+			return err
+		}
+	}
+	if updatesMetadata {
+		if err := s.modelMetadataCapabilities.SetOverrides(metadataValue); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isLiveModelCapabilitySetting(key string) bool {
+	return key == modelReasoningEffortOverridesSetting || key == modelMetadataOverridesSetting
 }
 
 // validateSettingValue 验证配置值的合法性
 func validateSettingValue(key, valueType, value string) error {
 	if key == globalCooldownDetectionRulesSettingKey {
 		_, err := parseGlobalCooldownDetectionRules(value)
+		return err
+	}
+	if key == modelMultimodalFallbackSettingKey {
+		_, err := parseMultimodalFallbackModels(value)
 		return err
 	}
 
@@ -474,10 +573,18 @@ func validateSettingValue(key, valueType, value string) error {
 		}
 
 	case "json":
-		if key != "antigravity_sensitive_words" {
+		switch key {
+		case "antigravity_sensitive_words":
+			return validateJSONStringArray(value)
+		case modelReasoningEffortOverridesSetting:
+			_, err := parseModelReasoningEffortOverrides(value)
+			return err
+		case modelMetadataOverridesSetting:
+			_, err := parseModelMetadataOverrides(value)
+			return err
+		default:
 			return fmt.Errorf("unknown JSON setting: %s", key)
 		}
-		return validateJSONStringArray(value)
 
 	default:
 		return fmt.Errorf("unknown value type: %s", valueType)

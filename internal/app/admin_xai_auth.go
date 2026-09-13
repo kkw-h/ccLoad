@@ -101,6 +101,36 @@ func (s *Server) HandleImportXAICredentialsStream(c *gin.Context) {
 	s.streamOAuthCredentialImportJob(c, started)
 }
 
+// HandleRefreshXAICredential forces one xAI OAuth refresh through the same
+// database-backed lifecycle used by proxy requests.
+func (s *Server) HandleRefreshXAICredential(c *gin.Context) {
+	id, err := ParseInt64Param(c, "id")
+	if err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, "invalid channel id")
+		return
+	}
+	cfg, err := s.store.GetConfig(c.Request.Context(), id)
+	if err != nil {
+		RespondErrorMsg(c, http.StatusNotFound, "channel not found")
+		return
+	}
+	if !cfg.UsesXAIOAuth() {
+		RespondErrorMsg(c, http.StatusConflict, "channel does not use xAI OAuth")
+		return
+	}
+	if s.xaiCredentials == nil {
+		RespondErrorMsg(c, http.StatusServiceUnavailable, "xAI credential refresh is unavailable")
+		return
+	}
+	credential, err := s.xaiCredentials.credential(c.Request.Context(), cfg, true)
+	if err != nil {
+		RespondError(c, http.StatusBadGateway, err)
+		return
+	}
+	s.InvalidateChannelListCache()
+	RespondJSON(c, http.StatusOK, gin.H{"oauth_credential": credential})
+}
+
 func (s *Server) startXAICredentialImportJob(c *gin.Context) (oauthCredentialImportJobStart, bool) {
 	batch, status, err := s.prepareXAICredentialImport(c)
 	if err != nil {
@@ -668,10 +698,6 @@ func uniqueXAIChannelName(configs []*model.Config, base string) string {
 }
 
 func newXAIOAuthChannel(name, credentialJSON string) *model.Config {
-	models := make([]model.ModelEntry, len(xaiOAuthDefaultModels))
-	for i, modelName := range xaiOAuthDefaultModels {
-		models[i] = model.ModelEntry{Model: modelName}
-	}
 	return &model.Config{
 		Name: name, AuthType: model.AuthTypeXAIOAuth, OAuthCredential: credentialJSON,
 		URLs:                  model.ChannelURLs{{URL: xaiauth.CLIBaseURL, Protocols: []string{"codex"}}},
@@ -679,6 +705,6 @@ func newXAIOAuthChannel(name, credentialJSON string) *model.Config {
 		Priority:              0,
 		Enabled:               true,
 		CostMultiplier:        1,
-		ModelEntries:          models,
+		ModelEntries:          oauthModelEntries(xaiOAuthDefaultModels),
 	}
 }

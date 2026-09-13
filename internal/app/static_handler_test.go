@@ -148,3 +148,17 @@ func TestGetContentType(t *testing.T) {
 		})
 	}
 }
+
+func TestStaticAssetVersionIncludesCommit(t *testing.T) {
+	origVersion, origCommit := version.Version, version.Commit
+	t.Cleanup(func() {
+		version.Version = origVersion
+		version.Commit = origCommit
+	})
+
+	version.Version = "v4.10.2"
+	version.Commit = "e051f2be"
+	if got, want := staticAssetVersion(), "v4.10.2-e051f2be"; got != want {
+		t.Fatalf("staticAssetVersion()=%q, want %q", got, want)
+	}
+}

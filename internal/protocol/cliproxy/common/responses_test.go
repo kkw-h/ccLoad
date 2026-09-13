@@ -68,3 +68,36 @@ func TestSetResponsesToolCallIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeAnthropicResponsePreservesValidatedJSONObject(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"role":"assistant","type":"message","content":[{"text":"ok","type":"text"}],"usage":{"output_tokens":1,"input_tokens":2}}`)
+	got, err := NormalizeAnthropicResponse(raw)
+	if err != nil {
+		t.Fatalf("NormalizeAnthropicResponse() error = %v", err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("response was re-encoded: got %s, want %s", got, raw)
+	}
+}
+
+func TestNormalizeAnthropicResponseRejectsNonMessageType(t *testing.T) {
+	t.Parallel()
+	raw := []byte(`{"type":"error","role":"assistant","content":[]}`)
+	if _, err := NormalizeAnthropicResponse(raw); err == nil {
+		t.Fatal("NormalizeAnthropicResponse accepted a non-message envelope")
+	}
+}
+
+func TestNormalizeAnthropicResponseDuplicateKeysFirstWins(t *testing.T) {
+	t.Parallel()
+	raw := []byte(`{"type":"message","type":"error","role":"assistant","content":[{"type":"text","text":"ok"}],"content":"ignored"}`)
+	got, err := NormalizeAnthropicResponse(raw)
+	if err != nil {
+		t.Fatalf("NormalizeAnthropicResponse() error = %v", err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("response was re-encoded: got %s, want %s", got, raw)
+	}
+}

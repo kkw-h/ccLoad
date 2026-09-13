@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
@@ -64,6 +65,28 @@ func TestServerRestartFuncIsConcurrentAndInstanceScoped(t *testing.T) {
 	if got := secondCalls.Load(); got != triggersPerServer {
 		t.Fatalf("second restart calls=%d, want %d", got, triggersPerServer)
 	}
+}
+
+type blockingFirstSettingsStore struct {
+	storage.Store
+	calls         atomic.Int32
+	firstWritten  chan struct{}
+	secondWritten chan struct{}
+	releaseFirst  chan struct{}
+}
+
+func (s *blockingFirstSettingsStore) UpdateSetting(ctx context.Context, key, value string) error {
+	if err := s.Store.UpdateSetting(ctx, key, value); err != nil {
+		return err
+	}
+	switch s.calls.Add(1) {
+	case 1:
+		close(s.firstWritten)
+		<-s.releaseFirst
+	case 2:
+		close(s.secondWritten)
+	}
+	return nil
 }
 
 func findAdminSetting(t *testing.T, settings []map[string]any, key string) map[string]any {
@@ -374,6 +397,273 @@ func TestAdminCooldownBoundsUseFreshAtomicSnapshot(t *testing.T) {
 	}
 }
 
+func TestAdminReasoningEffortOverridesValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "valid", value: `{"gpt-5.6-sol":["low","high"]}`},
+		{name: "explicit empty", value: `{"no-reasoning":[]}`},
+		{name: "array top level", value: `[]`, wantErr: true},
+		{name: "unknown effort", value: `{"gpt-5.6-sol":["ultra"]}`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSettingValue(modelReasoningEffortOverridesSetting, "json", tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validate error = %v, wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestAdminReasoningEffortOverridesApplyLiveWithoutRestart(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelReasoningEffortOverridesSetting, map[string]string{
+		"value": `{"gpt-5.6-sol":["low","high"]}`,
+	}))
+	c.Params = gin.Params{{Key: "key", Value: modelReasoningEffortOverridesSetting}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", w.Code, w.Body.String())
+	}
+	got, known := resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"low", "high"}, true)
+	assertRestartNotTriggered(t, restarted)
+
+	c, w = newTestContext(t, newRequest(http.MethodPost, "/admin/settings/"+modelReasoningEffortOverridesSetting+"/reset", nil))
+	c.Params = gin.Params{{Key: "key", Value: modelReasoningEffortOverridesSetting}}
+	server.AdminResetSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset status=%d body=%s", w.Code, w.Body.String())
+	}
+	got, known = resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"low", "medium", "high", "xhigh"}, true)
+	assertRestartNotTriggered(t, restarted)
+}
+
+func TestAdminModelMetadataOverridesApplyLiveWithoutRestart(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelMetadataResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelMetadataCapabilities = resolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	value := `{"gpt-5.6-sol":{"provider":"Custom","contextWindow":300000,"maxTokens":64000,"inputTypes":["text","image"]}}`
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelMetadataOverridesSetting, map[string]string{
+		"value": value,
+	}))
+	c.Params = gin.Params{{Key: "key", Value: modelMetadataOverridesSetting}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", w.Code, w.Body.String())
+	}
+	got := resolver.Resolve("gpt-5.6-sol")
+	assertMetadataString(t, "provider", got.Provider, "Custom")
+	assertMetadataInt64(t, "contextWindow", got.ContextWindow, 300000)
+	assertMetadataStrings(t, "inputTypes", got.InputTypes, []string{"image", "text"})
+	assertRestartNotTriggered(t, restarted)
+
+	c, w = newTestContext(t, newRequest(http.MethodPost, "/admin/settings/"+modelMetadataOverridesSetting+"/reset", nil))
+	c.Params = gin.Params{{Key: "key", Value: modelMetadataOverridesSetting}}
+	server.AdminResetSetting(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset status=%d body=%s", w.Code, w.Body.String())
+	}
+	got = resolver.Resolve("gpt-5.6-sol")
+	assertMetadataString(t, "provider", got.Provider, "OpenAI")
+	assertMetadataInt64(t, "contextWindow", got.ContextWindow, 372000)
+	assertRestartNotTriggered(t, restarted)
+}
+
+func TestAdminModelMetadataOverridesValidationRejectsInvalidJSON(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelMetadataResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelMetadataCapabilities = resolver
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelMetadataOverridesSetting, map[string]string{
+		"value": `{"gpt-5.6-sol":{"contextWindow":0}}`,
+	}))
+	c.Params = gin.Params{{Key: "key", Value: modelMetadataOverridesSetting}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("update status=%d, want 400 body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAdminReasoningEffortOverridesConcurrentUpdatesKeepRuntimeInSync(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	blockingStore := &blockingFirstSettingsStore{
+		Store:         store,
+		firstWritten:  make(chan struct{}),
+		secondWritten: make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+	}
+	server.configService = NewConfigService(blockingStore)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	update := func(value string) <-chan int {
+		done := make(chan int, 1)
+		go func() {
+			c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelReasoningEffortOverridesSetting, map[string]string{
+				"value": value,
+			}))
+			c.Params = gin.Params{{Key: "key", Value: modelReasoningEffortOverridesSetting}}
+			server.AdminUpdateSetting(c)
+			done <- w.Code
+		}()
+		return done
+	}
+
+	firstDone := update(`{"gpt-5.6-sol":["low"]}`)
+	<-blockingStore.firstWritten
+	secondDone := update(`{"gpt-5.6-sol":["high"]}`)
+	select {
+	case <-blockingStore.secondWritten:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(blockingStore.releaseFirst)
+
+	if status := <-firstDone; status != http.StatusOK {
+		t.Fatalf("first update status=%d", status)
+	}
+	if status := <-secondDone; status != http.StatusOK {
+		t.Fatalf("second update status=%d", status)
+	}
+	persisted, err := store.GetSetting(context.Background(), modelReasoningEffortOverridesSetting)
+	if err != nil {
+		t.Fatalf("GetSetting: %v", err)
+	}
+	if persisted.Value != `{"gpt-5.6-sol":["high"]}` {
+		t.Fatalf("persisted value=%s, want second update", persisted.Value)
+	}
+	got, known := resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"high"}, true)
+}
+
+func TestAdminReasoningEffortOverridesMixedBatchAppliesLiveAndRestarts(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	resolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = resolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+		modelReasoningEffortOverridesSetting: `{"gpt-5.6-sol":["medium"]}`,
+		"log_retention_days":                 "14",
+	}))
+	server.AdminBatchUpdateSettings(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch status=%d body=%s", w.Code, w.Body.String())
+	}
+	got, known := resolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, got, known, []string{"medium"}, true)
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected mixed batch restart")
+	}
+}
+
+func TestAdminModelCapabilityOverridesMixedBatchApplyLiveAndRestart(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults: %v", err)
+	}
+	reasoningResolver, err := newModelReasoningCapabilityResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new reasoning resolver: %v", err)
+	}
+	metadataResolver, err := newModelMetadataResolver(`{}`)
+	if err != nil {
+		t.Fatalf("new metadata resolver: %v", err)
+	}
+	server.modelReasoningCapabilities = reasoningResolver
+	server.modelMetadataCapabilities = metadataResolver
+
+	restarted := make(chan struct{}, 2)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+		modelReasoningEffortOverridesSetting: `{"gpt-5.6-sol":["medium"]}`,
+		modelMetadataOverridesSetting:        `{"gpt-5.6-sol":{"provider":"Custom"}}`,
+		"log_retention_days":                 "14",
+	}))
+	server.AdminBatchUpdateSettings(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch status=%d body=%s", w.Code, w.Body.String())
+	}
+	efforts, known := reasoningResolver.Resolve("gpt-5.6-sol")
+	assertReasoningEfforts(t, efforts, known, []string{"medium"}, true)
+	metadata := metadataResolver.Resolve("gpt-5.6-sol")
+	assertMetadataString(t, "provider", metadata.Provider, "Custom")
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected mixed batch restart")
+	}
+}
+
+func assertRestartNotTriggered(t testing.TB, restarted <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-restarted:
+		t.Fatal("reasoning-only setting update must not restart")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestAdminSettingsHandlers(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -385,6 +675,19 @@ func TestAdminSettingsHandlers(t *testing.T) {
 
 	restartCh := make(chan struct{}, 10)
 	server.SetRestartFunc(func() { restartCh <- struct{}{} })
+	drainRestarts := func() {
+		for len(restartCh) > 0 {
+			<-restartCh
+		}
+	}
+	assertNoRestart := func(t *testing.T) {
+		t.Helper()
+		select {
+		case <-restartCh:
+			t.Fatal("unexpected restart triggered")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 
 	t.Run("AdminGetSetting_missing_key", func(t *testing.T) {
 		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/settings/", nil))
@@ -504,6 +807,35 @@ func TestAdminSettingsHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("AdminUpdateSetting_multimodal_fallback_hot_reloads_without_restart", func(t *testing.T) {
+		drainRestarts()
+		mapping := `{"gpt-text":"gpt-vision-update"}`
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelMultimodalFallbackSettingKey, map[string]string{
+			"value": mapping,
+		}))
+		c.Params = gin.Params{{Key: "key", Value: modelMultimodalFallbackSettingKey}}
+
+		server.AdminUpdateSetting(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "重启") {
+			t.Fatalf("hot update response must not claim restart: %s", w.Body.String())
+		}
+		if got := server.multimodalFallbackModel("gpt-text", true); got != "gpt-vision-update" {
+			t.Fatalf("runtime fallback=%q, want gpt-vision-update", got)
+		}
+		persisted, err := store.GetSetting(context.Background(), modelMultimodalFallbackSettingKey)
+		if err != nil {
+			t.Fatalf("GetSetting failed: %v", err)
+		}
+		if persisted.Value != mapping {
+			t.Fatalf("persisted mapping=%q, want %q", persisted.Value, mapping)
+		}
+		assertNoRestart(t)
+	})
+
 	t.Run("AdminGetSetting_returns_latest_db_value_before_restart", func(t *testing.T) {
 		if err := store.UpdateSetting(context.Background(), "channel_check_interval_hours", "1"); err != nil {
 			t.Fatalf("failed to seed setting in db: %v", err)
@@ -587,6 +919,37 @@ func TestAdminSettingsHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("AdminResetSetting_multimodal_fallback_hot_clears_without_restart", func(t *testing.T) {
+		drainRestarts()
+		mapping := `{"gpt-text":"gpt-vision-reset"}`
+		if err := store.UpdateSetting(context.Background(), modelMultimodalFallbackSettingKey, mapping); err != nil {
+			t.Fatalf("seed multimodal fallback: %v", err)
+		}
+		server.setMultimodalFallbackModels(map[string]string{"gpt-text": "gpt-vision-reset"})
+
+		c, w := newTestContext(t, newRequest(http.MethodPost, "/admin/settings/"+modelMultimodalFallbackSettingKey+"/reset", nil))
+		c.Params = gin.Params{{Key: "key", Value: modelMultimodalFallbackSettingKey}}
+		server.AdminResetSetting(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "重启") {
+			t.Fatalf("hot reset response must not claim restart: %s", w.Body.String())
+		}
+		if got := server.multimodalFallbackModel("gpt-text", true); got != "" {
+			t.Fatalf("runtime fallback after reset=%q, want empty", got)
+		}
+		persisted, err := store.GetSetting(context.Background(), modelMultimodalFallbackSettingKey)
+		if err != nil {
+			t.Fatalf("GetSetting failed: %v", err)
+		}
+		if persisted.Value != "{}" {
+			t.Fatalf("persisted mapping after reset=%q, want {}", persisted.Value)
+		}
+		assertNoRestart(t)
+	})
+
 	t.Run("AdminBatchUpdateSettings_empty_body_reject", func(t *testing.T) {
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/settings/batch", []byte(`{}`)))
 
@@ -638,6 +1001,88 @@ func TestAdminSettingsHandlers(t *testing.T) {
 		}
 		if after.Value != before.Value {
 			t.Fatalf("persisted value=%q, want unchanged %q", after.Value, before.Value)
+		}
+	})
+
+	t.Run("AdminBatchUpdateSettings_invalid_multimodal_fallback_reject", func(t *testing.T) {
+		before, err := store.GetSetting(context.Background(), modelMultimodalFallbackSettingKey)
+		if err != nil {
+			t.Fatalf("GetSetting before update failed: %v", err)
+		}
+		drainRestarts()
+		server.setMultimodalFallbackModels(map[string]string{"existing-text": "existing-vision"})
+
+		invalidMapping := `{"gpt-5.6-luna":"gpt-5.6-luna"}`
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+			modelMultimodalFallbackSettingKey: invalidMapping,
+		}))
+
+		server.AdminBatchUpdateSettings(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+		}
+		after, err := store.GetSetting(context.Background(), modelMultimodalFallbackSettingKey)
+		if err != nil {
+			t.Fatalf("GetSetting after update failed: %v", err)
+		}
+		if after.Value != before.Value {
+			t.Fatalf("persisted value=%q, want unchanged %q", after.Value, before.Value)
+		}
+		if got := server.multimodalFallbackModel("existing-text", true); got != "existing-vision" {
+			t.Fatalf("runtime fallback=%q, want unchanged existing-vision", got)
+		}
+		assertNoRestart(t)
+	})
+
+	t.Run("AdminBatchUpdateSettings_multimodal_fallback_hot_reloads_without_restart", func(t *testing.T) {
+		drainRestarts()
+		mapping := `{"gpt-text":"gpt-vision-batch"}`
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+			modelMultimodalFallbackSettingKey: mapping,
+		}))
+
+		server.AdminBatchUpdateSettings(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "重启") {
+			t.Fatalf("hot batch response must not claim restart: %s", w.Body.String())
+		}
+		if got := server.multimodalFallbackModel("gpt-text", true); got != "gpt-vision-batch" {
+			t.Fatalf("runtime fallback=%q, want gpt-vision-batch", got)
+		}
+		persisted, err := store.GetSetting(context.Background(), modelMultimodalFallbackSettingKey)
+		if err != nil {
+			t.Fatalf("GetSetting failed: %v", err)
+		}
+		if persisted.Value != mapping {
+			t.Fatalf("persisted mapping=%q, want %q", persisted.Value, mapping)
+		}
+		assertNoRestart(t)
+	})
+
+	t.Run("AdminBatchUpdateSettings_mixed_multimodal_update_still_restarts", func(t *testing.T) {
+		drainRestarts()
+		mapping := `{"gpt-text":"gpt-vision-mixed"}`
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
+			modelMultimodalFallbackSettingKey: mapping,
+			"log_retention_days":              "21",
+		}))
+
+		server.AdminBatchUpdateSettings(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+		if got := server.multimodalFallbackModel("gpt-text", true); got != "gpt-vision-mixed" {
+			t.Fatalf("runtime fallback=%q, want gpt-vision-mixed", got)
+		}
+		select {
+		case <-restartCh:
+		case <-time.After(time.Second):
+			t.Fatal("mixed settings update must trigger restart")
 		}
 	})
 

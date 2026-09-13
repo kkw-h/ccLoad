@@ -12,6 +12,7 @@ const (
 	LogSourceScheduledCheck = "scheduled_check"
 	LogSourceManualTest     = "manual_test"
 	LogSourceManualChat     = "manual_chat"
+	LogSourceCheckin        = "checkin"
 
 	LogSourceDetection = "detection"
 	LogSourceAll       = "all"
@@ -28,6 +29,8 @@ func NormalizeStoredLogSource(raw string) string {
 		return LogSourceManualTest
 	case LogSourceManualChat:
 		return LogSourceManualChat
+	case LogSourceCheckin:
+		return LogSourceCheckin
 	default:
 		return LogSourceProxy
 	}
@@ -66,7 +69,8 @@ type LogEntry struct {
 	ID                   int64    `json:"id"`
 	Time                 JSONTime `json:"time"`
 	Model                string   `json:"model"`
-	ActualModel          string   `json:"actual_model,omitempty"` // 实际转发的模型（空表示未重定向）
+	ActualModel          string   `json:"actual_model,omitempty"`   // 实际发给上游的模型（空表示未重定向）
+	ResponseModel        string   `json:"response_model,omitempty"` // 上游成功响应声明的模型
 	LogSource            string   `json:"log_source,omitempty"`
 	ChannelID            int64    `json:"channel_id"`
 	ChannelName          string   `json:"channel_name,omitempty"`
@@ -84,7 +88,7 @@ type LogEntry struct {
 	UpstreamProtocol     string   `json:"upstream_protocol,omitempty"`  // 当前尝试实际使用的上游协议
 	ClientIP             string   `json:"client_ip"`                    // 客户端IP地址（新增2025-12）
 	BaseURL              string   `json:"base_url,omitempty"`           // 请求使用的上游URL（多URL场景）
-	ServiceTier          string   `json:"service_tier,omitempty"`       // OpenAI service_tier；Codex priority 按模型计 Fast 倍率
+	ServiceTier          string   `json:"service_tier,omitempty"`       // 上游 service_tier/speed；Codex ultrafast 按模型计10倍
 	ThinkingEffort       string   `json:"thinking_effort,omitempty"`
 
 	// Token统计（2025-11新增，支持Claude API usage字段）
@@ -98,8 +102,9 @@ type LogEntry struct {
 	Cost                     float64 `json:"cost"`                        // 请求成本（美元，标准成本）
 	CostMultiplier           float64 `json:"cost_multiplier"`             // 写日志时快照的渠道倍率，默认1
 
-	// 瞬态字段：不持久化到 logs 表，仅用于传递 debug 数据到写入管道
-	DebugData *DebugLogEntry `json:"-"`
+	// 瞬态字段：不持久化到 logs 表，仅用于传递附属数据到写入管道
+	DebugData  *DebugLogEntry `json:"-"`
+	UsageEvent *UsageEvent    `json:"-"`
 }
 
 // LogFilter 日志查询过滤条件
@@ -110,9 +115,10 @@ type LogFilter struct {
 	Model            string
 	ModelLike        string
 	StatusCode       *int
-	ClientProtocol   string // 客户端入口协议过滤
-	UpstreamProtocol string // 实际上游协议过滤
-	AuthTokenID      *int64 // API令牌ID过滤
+	ClientProtocol   string  // 客户端入口协议过滤
+	UpstreamProtocol string  // 实际上游协议过滤
+	AuthTokenID      *int64  // 单个API令牌ID过滤（兼容旧调用方）
+	AuthTokenIDs     []int64 // 多个API令牌ID过滤
 	LogSource        string
 }
 

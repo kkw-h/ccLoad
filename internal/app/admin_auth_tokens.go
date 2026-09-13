@@ -210,7 +210,7 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 
 	authToken := &model.AuthToken{
 		Token:                  tokenHash,
-		Description:            req.Description,
+		Description:            normalizeUsageEventTokenDescription(req.Description),
 		ExpiresAt:              req.ExpiresAt,
 		IsActive:               isActive,
 		AllowedModels:          req.AllowedModels,
@@ -328,7 +328,7 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 
 	// 更新字段
 	if req.Description != nil {
-		token.Description = *req.Description
+		token.Description = normalizeUsageEventTokenDescription(*req.Description)
 	}
 	if req.IsActive != nil {
 		token.IsActive = *req.IsActive

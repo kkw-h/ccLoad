@@ -100,7 +100,7 @@ type failingTokenStatsStore struct {
 func (s *failingTokenStatsStore) UpdateTokenStats(
 	context.Context,
 	string,
-	bool,
+	model.TokenStatOutcome,
 	float64,
 	bool,
 	float64,
@@ -131,8 +131,8 @@ func TestApplyTokenStatsUpdateAddsCostToCacheWhenStoreFails(t *testing.T) {
 
 	srv.applyTokenStatsUpdate(tokenStatsUpdate{
 		tokenHash:      tokenHash,
+		outcome:        model.TokenStatSuccess(),
 		completedAt:    time.Now(),
-		isSuccess:      true,
 		costUSD:        0.0002,
 		costMultiplier: 1,
 	})

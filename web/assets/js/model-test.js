@@ -583,11 +583,99 @@ function normalizeModelTestPriorityValue(value, fallback) {
   return Math.max(MODEL_TEST_PRIORITY_MIN, Math.min(MODEL_TEST_PRIORITY_MAX, Math.trunc(num)));
 }
 
+function formatModelTestHealthScore(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '';
+  const formatted = num.toFixed(1);
+  return formatted.endsWith('.0') ? formatted.slice(0, -2) : formatted;
+}
+
+function isChannelDynamicPriorityVisible(ch) {
+  return ch && ch.effective_priority !== undefined && ch.effective_priority !== null;
+}
+
+// 按模型测试行在静态优先级下方叠加显示渠道动态优先级(P_eff = priority - 失败惩罚 - TTFB 惩罚)，
+// 与渠道页 ch-priority-stack 的健康度行同一语义：健康度模式关闭(无 effective_priority)或与静态优先级
+// 一致(无惩罚)时不显示，避免叠加一个相同的数字造成噪音。
+function getModelTestDynamicPriorityInfo(ch, basePriority) {
+  if (!isChannelDynamicPriorityVisible(ch)) return null;
+  const eff = Number(ch.effective_priority);
+  const base = Number.isFinite(Number(basePriority)) ? Number(basePriority) : 0;
+  // 与渠道页一致：动态优先级与静态值一致（无惩罚）时不显示，避免叠加一个相同的数字
+  if (!Number.isFinite(eff) || Math.abs(eff - base) < 0.1) return null;
+  const value = formatModelTestHealthScore(eff);
+  if (!value) return null;
+
+  const label = i18nText('modelTest.dynamicPriority', '动态优先级');
+  const priorityLabel = i18nText('channels.table.priority', '优先级');
+  const operationKey = eff < base ? 'bad' : 'good';
+  const title = `${priorityLabel}: ${base} | ${label}: ${value}`;
+  return { operationKey, title, value };
+}
+
+function buildModelTestDynamicPriorityHtml(ch, basePriority) {
+  const info = getModelTestDynamicPriorityInfo(ch, basePriority);
+  if (!info) return '';
+  return `<div class="ch-priority-row ch-priority-health model-test-dyn-priority" title="${info.title}"><span class="ch-priority-value ch-priority-health-${info.operationKey}">${info.value}</span></div>`;
+}
+
+function refreshModelTestDynamicPriorityTitles() {
+  if (!tbody) return;
+  tbody.querySelectorAll('.model-test-dyn-priority').forEach((element) => {
+    const row = element.closest('tr');
+    if (!row) return;
+    const channelId = Number(row?.dataset.channelId);
+    const channel = channelsList.find(ch => Number(ch.id) === channelId);
+    if (!channel) return;
+
+    const input = row.querySelector('.ch-priority-input');
+    const basePriority = input?.value || input?.dataset.originalPriority || 0;
+    const info = getModelTestDynamicPriorityInfo(channel, basePriority);
+    if (info) element.title = info.title;
+  });
+}
+
 function updateLocalModelTestChannelPriority(channelId, priority) {
   if (!Array.isArray(channelsList)) return;
   channelsList.forEach((ch) => {
-    if (Number(ch.id) === channelId) ch.priority = priority;
+    if (Number(ch.id) !== channelId) return;
+    if (ch.effective_priority !== undefined && ch.effective_priority !== null) {
+      const oldPriority = normalizeModelTestPriorityValue(ch.priority, 0);
+      const offset = Number(ch.effective_priority) - oldPriority;
+      // 动态优先级随静态优先级平移，与 channels-render.js 的 updateLocalChannelPriority 同一语义
+      if (Number.isFinite(offset)) ch.effective_priority = priority + offset;
+    }
+    ch.priority = priority;
   });
+}
+
+function syncModelTestRowDynamicPriority(input) {
+  if (!input) return;
+  const row = input.closest('tr');
+  if (!row) return;
+  const channelId = Number(input.dataset.channelId);
+  const ch = channelsList.find(c => Number(c.id) === channelId);
+  const nextPriority = normalizeModelTestPriorityValue(input.value, 0);
+  const html = ch ? buildModelTestDynamicPriorityHtml(ch, nextPriority) : '';
+  const container = row.querySelector('.model-test-col-priority');
+  if (!container) return;
+  let el = container.querySelector('.model-test-dyn-priority');
+  if (!html) {
+    if (el) el.remove();
+    return;
+  }
+  // 动态显示在行内编辑后同步：已显示则原地替换，否则插到输入框之后（与模板结构一致）
+  if (el) container.replaceChild(buildModelTestDynamicPriorityNode(html), el);
+  else {
+    const inputWrap = container.querySelector('.ch-priority-editor-wrap');
+    if (inputWrap) inputWrap.insertAdjacentHTML('afterend', html);
+  }
+}
+
+function buildModelTestDynamicPriorityNode(html) {
+  const tpl = document.createElement('td');
+  tpl.innerHTML = html;
+  return tpl.firstElementChild;
 }
 
 async function saveModelTestInlinePriority(input) {
@@ -614,6 +702,7 @@ async function saveModelTestInlinePriority(input) {
     });
     input.classList.remove('is-dirty');
     updateLocalModelTestChannelPriority(channelId, nextPriority);
+    syncModelTestRowDynamicPriority(input);
   } catch (error) {
     console.error('Update channel priority failed:', error);
     input.dataset.originalPriority = String(originalPriority);
@@ -649,43 +738,89 @@ function flushModelTestPrioritySave(input) {
   return saveModelTestInlinePriority(input);
 }
 
-function updateLocalModelTestChannelEnabled(channelId, enabled) {
-  if (!Array.isArray(channelsList)) return;
-  channelsList.forEach((ch) => {
-    if (Number(ch.id) === channelId) ch.enabled = enabled;
-  });
+function findChannelModelEntry(channel, modelName) {
+  const target = String(modelName || '').trim().toLowerCase();
+  if (!channel || !target || !Array.isArray(channel.models)) return null;
+  return channel.models.find(entry => String(getModelName(entry) || '').trim().toLowerCase() === target) || null;
 }
 
-function applyModelTestRowEnabledStyle(row, enabled) {
+function isChannelModelEnabled(channel, modelName) {
+  const entry = findChannelModelEntry(channel, modelName);
+  return !entry || entry.disabled !== true;
+}
+
+function updateLocalModelTestModelDisabled(channelId, modelName, disabled) {
+  const channel = Array.isArray(channelsList)
+    ? channelsList.find(ch => Number(ch.id) === channelId)
+    : null;
+  const entry = findChannelModelEntry(channel, modelName);
+  if (!entry) return null;
+  const previous = entry.disabled === true;
+  entry.disabled = disabled === true;
+  return () => {
+    entry.disabled = previous;
+  };
+}
+
+function isModelTestChannelEnabled(channel) {
+  return channel?.enabled !== false;
+}
+
+function formatModelTestRowDisplayName(baseName, channelEnabled, modelEnabled) {
+  const tags = [];
+  if (!channelEnabled) tags.push(i18nText('channels.statusDisabled', '已禁用'));
+  if (!modelEnabled) tags.push(i18nText('channels.modelStatusDisabled', '已停用'));
+  if (tags.length === 0) return baseName;
+  return `${baseName} [${tags.join('] [')}]`;
+}
+
+function applyModelTestRowMuted(row, muted) {
   if (!row) return;
+  row.classList.toggle('model-test-row--muted', Boolean(muted));
+}
+
+function applyModelTestRowEnabledStyle(row, modelEnabled) {
+  if (!row) return;
+  const channelEnabled = row.dataset.channelEnabled !== 'false';
   const btn = row.querySelector('.channel-enable-switch');
   if (btn) {
-    btn.dataset.enabled = String(enabled);
-    btn.setAttribute('aria-checked', String(enabled));
-    btn.classList.toggle('channel-enable-switch--on', enabled);
-    btn.classList.toggle('channel-enable-switch--off', !enabled);
-    btn.title = enabled ? i18nText('channels.toggleDisable', '禁用') : i18nText('channels.toggleEnable', '启用');
+    btn.dataset.enabled = String(modelEnabled);
+    btn.setAttribute('aria-checked', String(modelEnabled));
+    btn.classList.toggle('channel-enable-switch--on', modelEnabled);
+    btn.classList.toggle('channel-enable-switch--off', !modelEnabled);
+    btn.title = modelEnabled ? i18nText('modelTest.toggleDisable', '禁用模型') : i18nText('modelTest.toggleEnable', '启用模型');
     btn.setAttribute('aria-label', btn.title);
   }
-  row.style.background = enabled ? '' : 'rgba(148, 163, 184, 0.14)';
-  row.style.color = enabled ? '' : 'var(--color-text-secondary)';
+  const link = row.querySelector('.channel-link');
+  const baseName = row.dataset.channelBaseName || '';
+  if (link && baseName) {
+    const displayName = formatModelTestRowDisplayName(baseName, channelEnabled, modelEnabled);
+    link.textContent = displayName;
+    link.title = displayName;
+  }
+  applyModelTestRowMuted(row, !channelEnabled || !modelEnabled);
 }
 
-async function toggleModelTestChannelEnabled(row, channelId, newEnabled) {
-  updateLocalModelTestChannelEnabled(channelId, newEnabled);
+async function toggleModelTestModelEnabled(row, channelId, modelName, newEnabled) {
+  const rollback = updateLocalModelTestModelDisabled(channelId, modelName, !newEnabled);
+  if (!rollback) {
+    showError(i18nText('modelTest.modelNotInChannel', '该渠道没有独立的该模型条目'));
+    return;
+  }
   applyModelTestRowEnabledStyle(row, newEnabled);
 
   try {
     const resp = await fetchAPIWithAuth(`/admin/channels/${channelId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: newEnabled })
+      body: JSON.stringify({ model: modelName, disabled: !newEnabled })
     });
     if (!resp.success) throw new Error(resp.error || 'failed');
   } catch (e) {
-    console.error('Toggle channel enabled failed:', e);
-    updateLocalModelTestChannelEnabled(channelId, !newEnabled);
+    console.error('Toggle model enabled failed:', e);
+    rollback();
     applyModelTestRowEnabledStyle(row, !newEnabled);
+    showError(i18nText('modelTest.toggleModelFailed', '切换模型启用状态失败'));
   }
 }
 
@@ -697,6 +832,15 @@ function normalizeModelTestCostMultiplier(multiplier) {
 function buildModelTestCostDisplay(standardCost, multiplier) {
   const cost = Number(standardCost);
   if (!Number.isFinite(cost) || cost <= 0) return null;
+
+  // 模型模式下可能无法知道后端自动挑选的具体 Key；此时只显示标准成本，
+  // 不能用 API Key 渠道固定为 1 的渠道倍率伪造 effective cost。
+  if (multiplier === null || multiplier === undefined) {
+    return {
+      html: formatCost(cost),
+      effectiveCost: cost
+    };
+  }
 
   const effectiveCost = cost * normalizeModelTestCostMultiplier(multiplier);
   if (typeof buildCostStackHtml === 'function') {
@@ -713,14 +857,38 @@ function buildModelTestCostDisplay(standardCost, multiplier) {
   };
 }
 
-function getRowCostMultiplier(row) {
-  const rowMultiplier = row?.dataset?.costMultiplier;
-  if (rowMultiplier !== undefined && rowMultiplier !== '') {
-    return normalizeModelTestCostMultiplier(rowMultiplier);
+function getRowCostMultiplier(row, result) {
+  // 单渠道模式提交带 key_index，倍率取选中 Key 的 cost_multiplier。
+  if (testMode !== TEST_MODE_MODEL && Number.isInteger(selectedKeyIndex)) {
+    const key = channelKeys.find(k => normalizeModelTestKeyIndex(k?.key_index) === selectedKeyIndex);
+    if (key) return normalizeModelTestCostMultiplier(key.cost_multiplier);
   }
 
   const channelId = String(row?.dataset?.channelId || '');
   const channel = channelsList.find(ch => String(ch.id) === channelId);
+
+  if (testMode === TEST_MODE_MODEL) {
+    const testedKeyIndex = normalizeModelTestKeyIndex(result?.tested_key_index);
+    const cachedKeys = channelKeysById.get(Number(channelId));
+    if (testedKeyIndex !== null && Array.isArray(cachedKeys)) {
+      const testedKey = cachedKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === testedKeyIndex);
+      if (testedKey) return normalizeModelTestCostMultiplier(testedKey.cost_multiplier);
+    }
+
+    // 渠道列表提供倍率区间；只有区间退化为单值时才能确定 effective cost。
+    const multiplierMin = channel?.cost_multiplier_min == null ? NaN : Number(channel.cost_multiplier_min);
+    const multiplierMax = channel?.cost_multiplier_max == null ? NaN : Number(channel.cost_multiplier_max);
+    if (Number.isFinite(multiplierMin) && Number.isFinite(multiplierMax)) {
+      if (Math.abs(multiplierMin - multiplierMax) < 1e-9) {
+        return normalizeModelTestCostMultiplier(multiplierMin);
+      }
+      return null;
+    }
+
+    // OAuth 渠道的渠道级倍率仍然是准确值；API Key 渠道缺少区间时保持未知。
+    if (String(channel?.auth_type || '').toLowerCase() === 'api_key') return null;
+  }
+
   return normalizeModelTestCostMultiplier(channel?.cost_multiplier);
 }
 
@@ -1514,9 +1682,11 @@ function renderChannelModeRows() {
   }
 
   const fragment = document.createDocumentFragment();
+  const channelEnabled = isModelTestChannelEnabled(selectedChannel);
   models.forEach(entry => {
     const modelName = getModelName(entry);
     if (!modelName) return;
+    const modelEnabled = entry?.disabled !== true;
     const row = TemplateEngine.render('tpl-model-row', {
       model: modelName,
       displayName: modelName,
@@ -1524,7 +1694,10 @@ function renderChannelModeRows() {
       costMultiplier: normalizeModelTestCostMultiplier(selectedChannel.cost_multiplier),
       ...getResultRowMobileLabels('common.model', '模型')
     });
-    if (row) fragment.appendChild(row);
+    if (row) {
+      applyModelTestRowMuted(row, !channelEnabled || !modelEnabled);
+      fragment.appendChild(row);
+    }
   });
 
   tbody.innerHTML = '';
@@ -1590,20 +1763,23 @@ function renderModelModeRows() {
 
   const fragment = document.createDocumentFragment();
   pairs.forEach(({ channel: ch, model }) => {
-    const isEnabled = ch.enabled !== false;
+    const modelEnabled = isChannelModelEnabled(ch, model);
+    const channelEnabled = isModelTestChannelEnabled(ch);
+    const available = channelEnabled && modelEnabled;
     const baseName = isExact ? ch.name : `${ch.name} · ${model}`;
-    const channelName = isEnabled
-      ? baseName
-      : `${baseName} [${i18nText('common.disabled', '已禁用')}]`;
+    const channelName = formatModelTestRowDisplayName(baseName, channelEnabled, modelEnabled);
     const priorityValue = (ch.priority !== null && ch.priority !== undefined && Number.isFinite(Number(ch.priority))) ? Number(ch.priority) : 0;
 
     const row = TemplateEngine.render('tpl-channel-row-by-model', {
       channelId: String(ch.id),
       channelName,
+      channelBaseName: baseName,
+      channelEnabled: String(channelEnabled),
       channelPriority: String(priorityValue),
-      channelEnabled: String(isEnabled),
-      toggleSwitchClass: isEnabled ? 'channel-enable-switch--on' : 'channel-enable-switch--off',
-      toggleTitle: isEnabled ? i18nText('channels.toggleDisable', '禁用') : i18nText('channels.toggleEnable', '启用'),
+      dynamicPriorityHtml: buildModelTestDynamicPriorityHtml(ch, priorityValue),
+      modelEnabled: String(modelEnabled),
+      toggleSwitchClass: modelEnabled ? 'channel-enable-switch--on' : 'channel-enable-switch--off',
+      toggleTitle: modelEnabled ? i18nText('modelTest.toggleDisable', '禁用模型') : i18nText('modelTest.toggleEnable', '启用模型'),
       costMultiplier: normalizeModelTestCostMultiplier(ch.cost_multiplier),
       model,
       ...getResultRowMobileLabels('modelTest.channel', '渠道')
@@ -1612,13 +1788,9 @@ function renderModelModeRows() {
     if (row) {
       const checkbox = row.querySelector('.channel-checkbox');
       if (checkbox) {
-        restoreRowSelectionState(row, previousSelectionState, isEnabled);
+        restoreRowSelectionState(row, previousSelectionState, available);
       }
-
-      if (!isEnabled) {
-        row.style.background = 'rgba(148, 163, 184, 0.14)';
-        row.style.color = 'var(--color-text-secondary)';
-      }
+      applyModelTestRowEnabledStyle(row, modelEnabled);
     }
 
     if (row) fragment.appendChild(row);
@@ -1749,8 +1921,7 @@ function getSelectedTargets() {
           row,
           model: row.dataset.model || selectedModelName,
           channelId: channel.id,
-          clientProtocol: selectedProtocol,
-          keyIndex: normalizeModelTestKeyIndex(getPreferredModelTestKey(channelKeysById.get(channel.id))?.key_index)
+          clientProtocol: selectedProtocol
         };
       }
 
@@ -1764,20 +1935,6 @@ function getSelectedTargets() {
       };
     })
     .filter(Boolean);
-}
-
-async function attachModelModeKeySelection(targets) {
-  if (testMode !== TEST_MODE_MODEL || !Array.isArray(targets) || targets.length === 0) {
-    return targets;
-  }
-
-  const channelIDs = [...new Set(targets.map(target => target.channelId).filter(Number.isFinite))];
-  await Promise.all(channelIDs.map(channelId => getModelTestChannelKeys(channelId)));
-
-  return targets.map(target => ({
-    ...target,
-    keyIndex: normalizeModelTestKeyIndex(getPreferredModelTestKey(channelKeysById.get(target.channelId))?.key_index)
-  }));
 }
 
 function resetRowStatus(row) {
@@ -1816,7 +1973,7 @@ function applyTestResultToRow(row, data) {
     row.querySelector('.cache-read').textContent = usage.cache_read_input_tokens || usage.cached_tokens || '-';
     row.querySelector('.cache-create').textContent = usage.cache_creation_input_tokens || '-';
     const costCell = row.querySelector('.cost');
-    const costDisplay = buildModelTestCostDisplay(data.cost_usd, getRowCostMultiplier(row));
+    const costDisplay = buildModelTestCostDisplay(data.cost_usd, getRowCostMultiplier(row, data));
     if (costDisplay) {
       costCell.innerHTML = costDisplay.html;
       if (costCell.dataset) costCell.dataset.sortValue = String(costDisplay.effectiveCost);
@@ -2042,7 +2199,7 @@ async function runModelTests() {
     return;
   }
 
-  let targets = getSelectedTargets();
+  const targets = getSelectedTargets();
   if (targets.length === 0) {
     showError(i18nText('modelTest.selectAtLeastOne', '请至少选择一条记录'));
     return;
@@ -2052,7 +2209,6 @@ async function runModelTests() {
   clearProgress();
   setRunTestButtonDisabled(true);
   try {
-    targets = await attachModelModeKeySelection(targets);
     await runBatchTests(targets);
   } catch (error) {
     console.error('runModelTests failed:', error);
@@ -2985,6 +3141,7 @@ function bindEvents() {
   window.addEventListener('localechange', () => {
     syncClientProtocolCombobox();
     syncChatClientProtocolCombobox();
+    refreshModelTestDynamicPriorityTitles();
   });
   const streamEnabled = document.getElementById('streamEnabled');
   if (streamEnabled) {
@@ -3058,9 +3215,10 @@ function bindEvents() {
     if (enableSwitch) {
       const row = enableSwitch.closest('tr');
       const channelId = parseInt(enableSwitch.dataset.channelId, 10);
-      if (Number.isFinite(channelId) && channelId > 0 && row) {
+      const modelName = String(row?.dataset?.model || '').trim();
+      if (Number.isFinite(channelId) && channelId > 0 && row && modelName) {
         const currentEnabled = enableSwitch.dataset.enabled === 'true';
-        toggleModelTestChannelEnabled(row, channelId, !currentEnabled);
+        toggleModelTestModelEnabled(row, channelId, modelName, !currentEnabled);
       }
       return;
     }
@@ -4548,7 +4706,7 @@ async function bootstrap() {
     return;
   }
   window.ChannelModalHooks = {
-    afterSave: async () => {
+    afterUpdate: async () => {
       await loadChannels({ preserveSelection: true, preserveTableState: true });
     }
   };

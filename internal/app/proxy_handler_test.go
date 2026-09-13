@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,26 @@ func TestHandleProxyRequest_UnknownPathReturns404(t *testing.T) {
 	}
 }
 
+func TestHandleProxyRequest_InvalidResearchIDReturns400(t *testing.T) {
+	srv := &Server{
+		concurrencySem: make(chan struct{}, 1),
+		activeRequests: newActiveRequestManager(),
+	}
+	req := newRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"model":"claude"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(researchIDHeader, "invalid/research")
+	c, w := newTestContext(t, req)
+
+	srv.HandleProxyRequest(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), researchIDHeader) {
+		t.Fatalf("body=%q, want research header error", w.Body.String())
+	}
+}
+
 func TestWriteFinalProxyResponse_DisablesWriteTimeoutForJSONFallback(t *testing.T) {
 	t.Parallel()
 
@@ -50,7 +71,7 @@ func TestWriteFinalProxyResponse_DisablesWriteTimeoutForJSONFallback(t *testing.
 		clientIP:  "127.0.0.1",
 	}
 
-	srv.writeFinalProxyResponse(c, reqCtx, "gpt-test", false, &proxyResult{status: 0}, 1)
+	srv.writeFinalProxyResponse(c, reqCtx, false, &proxyResult{status: 0}, 1)
 
 	if !w.deadlineCalled {
 		t.Fatal("SetWriteDeadline was not called")
@@ -70,6 +91,7 @@ func TestParseIncomingRequest_ValidJSON(t *testing.T) {
 		name         string
 		body         string
 		path         string
+		contentType  string
 		expectModel  string
 		expectStream bool
 		expectError  bool
@@ -130,6 +152,36 @@ func TestParseIncomingRequest_ValidJSON(t *testing.T) {
 			expectStream: false,
 			expectError:  false,
 		},
+		{
+			name:        "尾随JSON被拒绝",
+			body:        `{"model":"gpt-4","messages":[]} []`,
+			path:        "/v1/chat/completions",
+			expectError: true,
+		},
+		{
+			name:         "思考后缀-从模型名剥离等级",
+			body:         `{"model":"gpt-5.6-luna(max)","messages":[]}`,
+			path:         "/v1/chat/completions",
+			expectModel:  "gpt-5.6-luna",
+			expectStream: false,
+			expectError:  false,
+		},
+		{
+			name:         "思考后缀-未识别括号保留原名",
+			body:         `{"model":"gpt-5.6-luna(foo)","messages":[]}`,
+			path:         "/v1/chat/completions",
+			expectModel:  "gpt-5.6-luna(foo)",
+			expectStream: false,
+			expectError:  false,
+		},
+		{
+			name:         "思考后缀-从 Gemini 路径剥离",
+			body:         `{"contents":[]}`,
+			path:         "/v1beta/models/gemini-2.5-pro(high):generateContent",
+			expectModel:  "gemini-2.5-pro",
+			expectStream: false,
+			expectError:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -139,7 +191,11 @@ func TestParseIncomingRequest_ValidJSON(t *testing.T) {
 			if tt.body == "" {
 				req.Method = http.MethodGet
 			}
-			req.Header.Set("Content-Type", "application/json")
+			contentType := tt.contentType
+			if contentType == "" {
+				contentType = "application/json"
+			}
+			req.Header.Set("Content-Type", contentType)
 
 			c, _ := newTestContext(t, req)
 
@@ -448,6 +504,15 @@ func TestParseIncomingRequest_MultipartModel(t *testing.T) {
 	}
 	if incoming.isStreaming {
 		t.Fatal("images 请求不应为流式")
+	}
+}
+
+func TestParseIncomingRequest_RejectsMalformedMultipartFraming(t *testing.T) {
+	req := newRequest(http.MethodPost, "/v1/images/edits", bytes.NewBufferString("not a multipart payload"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=missing")
+	c, _ := newTestContext(t, req)
+	if _, err := parseIncomingRequest(c, requestBodyLimits{}); err == nil {
+		t.Fatal("malformed multipart framing was accepted")
 	}
 }
 

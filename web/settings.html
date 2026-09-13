@@ -18,7 +18,9 @@
   <script defer src="/web/assets/js/template-engine.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/web-auth.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/ui.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/searchable-select.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-cooldown-detection.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/model-reasoning-efforts.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/settings.js?v=__VERSION__"></script>
 </head>
 <body>
@@ -50,6 +52,11 @@
             <button id="runtime-metrics-btn" type="button" class="btn btn-secondary settings-runtime-metrics-btn" data-i18n="settings.runtimeMetrics.button">
               运行状态
             </button>
+            <button id="model-multimodal-fallback-btn" type="button" class="btn btn-secondary settings-multimodal-fallback-btn" data-i18n="settings.multimodalFallback.edit">
+              多模态回退
+            </button>
+            <span id="model-multimodal-fallback-summary" class="settings-multimodal-fallback-summary"></span>
+            <input type="hidden" id="model_multimodal_fallback" value="{}">
             <button id="save-all-btn" class="btn btn-primary settings-save-btn" data-i18n="settings.saveAll">
               保存所有更改
             </button>
@@ -114,6 +121,49 @@
     </div>
   </div>
 
+  <!-- 原模型推理强度覆盖 -->
+  <div id="modelReasoningEffortsModal" class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="modelReasoningEffortsTitle" aria-describedby="modelReasoningEffortsDescription" aria-hidden="true">
+    <div class="modal-content model-reasoning-efforts-modal">
+      <div class="modal-header">
+        <div>
+          <h2 id="modelReasoningEffortsTitle" class="modal-title" data-i18n="settings.modelReasoningEfforts.title">原模型推理强度覆盖</h2>
+          <p id="modelReasoningEffortsDescription" class="modal-description" data-i18n="settings.modelReasoningEfforts.description">按渠道重定向后的原模型名称配置可用推理强度；留空覆盖表示明确不支持推理强度。</p>
+        </div>
+        <button type="button" class="close-btn" data-action="close-model-reasoning-efforts"
+          data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
+      </div>
+
+      <div class="model-reasoning-efforts-editor">
+        <label class="model-reasoning-efforts-model-field" for="model-reasoning-efforts-model">
+          <span data-i18n="settings.modelReasoningEfforts.modelName">原模型名称</span>
+          <input id="model-reasoning-efforts-model" type="text" class="form-input"
+            autocomplete="off" spellcheck="false" placeholder="gpt-5.6-sol">
+        </label>
+        <fieldset class="model-reasoning-efforts-options">
+          <legend data-i18n="settings.modelReasoningEfforts.available">可用推理强度</legend>
+          <label><input type="checkbox" name="model-reasoning-effort" value="none"> none</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="minimal"> minimal</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="low"> low</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="medium"> medium</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="high"> high</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="xhigh"> xhigh</label>
+          <label><input type="checkbox" name="model-reasoning-effort" value="max"> max</label>
+        </fieldset>
+        <button type="button" class="btn btn-secondary model-reasoning-efforts-upsert"
+          data-action="upsert-model-reasoning-effort" data-i18n="settings.modelReasoningEfforts.addOrUpdate">添加或更新</button>
+        <div id="model-reasoning-efforts-list" class="model-reasoning-efforts-list" aria-live="polite"></div>
+      </div>
+
+      <div class="modal-footer custom-rules-footer">
+        <button type="button" class="btn btn-secondary" data-action="close-model-reasoning-efforts"
+          data-i18n="common.cancel">取消</button>
+        <button type="button" class="btn btn-primary" data-action="apply-model-reasoning-efforts"
+          data-i18n="settings.modelReasoningEfforts.apply">应用到设置</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 进程运行指标 -->
   <div id="runtimeMetricsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="runtimeMetricsTitle" aria-hidden="true">
     <div class="modal-content runtime-metrics-modal">
@@ -133,6 +183,39 @@
           <button id="refresh-runtime-metrics-btn" type="button" class="btn btn-secondary" data-i18n="settings.runtimeMetrics.refresh">刷新</button>
           <button type="button" class="btn btn-primary" data-action="close-runtime-metrics" data-i18n="common.close">关闭</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 多模态回退模型 -->
+  <div id="multimodalFallbackModal" class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="multimodalFallbackTitle" aria-describedby="multimodalFallbackDescription" aria-hidden="true">
+    <div class="modal-content advanced-settings-modal">
+      <div class="modal-header">
+        <div>
+          <h2 id="multimodalFallbackTitle" class="modal-title" data-i18n="settings.multimodalFallback.title">多模态回退模型</h2>
+          <p id="multimodalFallbackDescription" class="modal-description" data-i18n="settings.multimodalFallback.description">请求含图片、文件等非文本内容时，自动改用回退模型。保存后立即生效。</p>
+        </div>
+        <button type="button" class="close-btn" data-action="close-multimodal-fallback"
+          data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
+      </div>
+
+      <section class="advanced-settings-panel" role="region" aria-labelledby="multimodalFallbackTitle">
+        <div class="multimodal-fallback-toolbar">
+          <p class="multimodal-fallback-intro" data-i18n="settings.multimodalFallback.intro">左侧为文本模型，右侧为含非文本内容时切换到的回退模型。</p>
+          <button type="button" class="btn btn-secondary" data-action="add-multimodal-fallback-row"
+            data-i18n="settings.multimodalFallback.addRow">+ 添加映射</button>
+        </div>
+        <div id="multimodalFallbackRows" class="multimodal-fallback-rows"></div>
+        <p id="multimodalFallbackEmpty" class="multimodal-fallback-empty" data-i18n="settings.multimodalFallback.empty">尚未配置任何映射。</p>
+        <div id="multimodalFallbackError" class="custom-rules-error" role="alert" hidden></div>
+      </section>
+
+      <div class="modal-footer custom-rules-footer">
+        <button type="button" class="btn btn-secondary" data-action="close-multimodal-fallback"
+          data-i18n="common.cancel">取消</button>
+        <button type="button" class="btn btn-primary" data-action="apply-multimodal-fallback"
+          data-i18n="settings.multimodalFallback.apply">保存并应用</button>
       </div>
     </div>
   </div>

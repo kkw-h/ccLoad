@@ -27,6 +27,8 @@ import (
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
+	"ccLoad/internal/cursorauth"
+	"ccLoad/internal/eventbus"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	protocolbuiltin "ccLoad/internal/protocol/builtin"
@@ -35,6 +37,7 @@ import (
 	"ccLoad/internal/version"
 	"ccLoad/internal/xaiauth"
 	"ccLoad/internal/zaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -44,9 +47,12 @@ type Server struct {
 	// ============================================================================
 	// 服务层
 	// ============================================================================
-	authService   *AuthService   // 认证授权服务
-	logService    *LogService    // 日志管理服务
-	configService *ConfigService // 配置管理服务
+	authService       *AuthService   // 认证授权服务
+	logService        *LogService    // 日志管理服务
+	configService     *ConfigService // 配置管理服务
+	channelManagement *channelManagementService
+	// 串行化管理设置的持久化与热应用，保证运行时快照和数据库提交顺序一致。
+	settingsMutationMu sync.Mutex
 
 	// ============================================================================
 	// 核心字段
@@ -67,6 +73,8 @@ type Server struct {
 	urlSelector                   *URLSelector               // URL选择器（多URL场景的延迟追踪与冷却）
 	disabledURLSyncMu             sync.Mutex
 	protocolRegistry              *protocol.Registry
+	modelReasoningCapabilities    *modelReasoningCapabilityResolver
+	modelMetadataCapabilities     *modelMetadataResolver
 	client                        *http.Client // HTTP客户端（全局默认）
 	antigravityClient             *http.Client // Antigravity 专用标准 HTTP/1.1 客户端
 	xaiSSOClient                  *http.Client // xAI Web SSO 专用 HTTP/1.1 客户端
@@ -97,8 +105,21 @@ type Server struct {
 	zaiService                    *zaiauth.Service
 	zaiCredentials                *zaiCredentialManager
 	zaiOAuth                      *zaiOAuthManager
+	zedService                    *zedauth.Service
+	zedCredentials                *zedCredentialManager
+	zedOAuth                      *codexOAuthManager
+	cursorService                 *cursorauth.Service
+	cursorCredentials             *cursorCredentialManager
+	cursorRunnerMu                sync.RWMutex
+	cursorRunner                  cursorauth.Runner
+	cursorBridgeRequired          atomic.Bool
+	cursorBridgeStartOnce         sync.Once
+	ensureCursorBridge            func(context.Context) (string, error)
+	startCursorBridge             func(context.Context, string) (cursorauth.Runner, error)
 	antigravityPromptMatcher      *regexp.Regexp
 	scheduledChannelChecksRunning atomic.Bool
+	// 首次管理账户签到扫描完成信号；测试构造器用它避免在后台初扫仍读取时替换依赖。
+	managementCheckinInitialScanDone chan struct{}
 
 	// 异步统计（有界队列，避免每请求起goroutine）
 	tokenStatsCh               chan tokenStatsUpdate
@@ -126,6 +147,9 @@ type Server struct {
 	codexMap429To503          bool
 	// 渠道未配置专属规则时使用的进程级默认规则。
 	globalCooldownDetectionRules *model.CooldownDetectionRules
+	// 多模态回退映射使用不可变快照热更新；更新锁保证持久化顺序与运行态发布顺序一致。
+	multimodalFallbackModels   atomic.Pointer[multimodalFallbackSnapshot]
+	multimodalFallbackUpdateMu sync.Mutex
 
 	// 登录速率限制器（用于传递给AuthService）
 	loginRateLimiter *util.LoginRateLimiter
@@ -150,6 +174,9 @@ type Server struct {
 	oauthCredentialCleanupJobsMu sync.Mutex
 	oauthCredentialCleanupJobs   *oauthCredentialCleanupJobManager
 	oauthCredentialRefreshes     *oauthCredentialRefreshTracker
+
+	// 用量事件发布器（Redis）；未配置时为 NoopPublisher。
+	eventPublisher eventbus.Publisher
 }
 
 // NewServer 创建并初始化一个新的 Server 实例
@@ -206,12 +233,28 @@ func NewServer(store storage.Store) *Server {
 	logHostOverrides(getHostOverrides())
 
 	baseCtx, baseCancel := context.WithCancel(context.Background())
+	reasoningCapabilities, err := newModelReasoningCapabilityResolver(
+		configService.GetString(modelReasoningEffortOverridesSetting, "{}"),
+	)
+	if err != nil {
+		log.Printf("[WARN] 推理强度覆盖配置无效，已回退内置能力: %v", err)
+		reasoningCapabilities, _ = newModelReasoningCapabilityResolver("{}")
+	}
+	metadataCapabilities, err := newModelMetadataResolver(
+		configService.GetString(modelMetadataOverridesSetting, "{}"),
+	)
+	if err != nil {
+		log.Printf("[WARN] 模型元数据覆盖配置无效，已回退内置能力: %v", err)
+		metadataCapabilities, _ = newModelMetadataResolver("{}")
+	}
 
 	s := &Server{
-		startedAt:        startedAt,
-		store:            store,
-		configService:    configService,
-		loginRateLimiter: util.NewLoginRateLimiter(),
+		startedAt:                  startedAt,
+		store:                      store,
+		configService:              configService,
+		loginRateLimiter:           util.NewLoginRateLimiter(),
+		modelReasoningCapabilities: reasoningCapabilities,
+		modelMetadataCapabilities:  metadataCapabilities,
 
 		// 运行时配置（启动时加载，修改后重启生效）
 		maxKeyRetries:            runtimeCfg.MaxKeyRetries,
@@ -240,11 +283,14 @@ func NewServer(store storage.Store) *Server {
 		maxConcurrency: maxConcurrency,
 
 		// 初始化优雅关闭机制
-		baseCtx:                  baseCtx,
-		baseCancel:               baseCancel,
-		shutdownCh:               make(chan struct{}),
-		shutdownDone:             make(chan struct{}),
-		oauthCredentialRefreshes: newOAuthCredentialRefreshTracker(),
+		baseCtx:                          baseCtx,
+		baseCancel:                       baseCancel,
+		shutdownCh:                       make(chan struct{}),
+		shutdownDone:                     make(chan struct{}),
+		oauthCredentialRefreshes:         newOAuthCredentialRefreshTracker(),
+		ensureCursorBridge:               cursorauth.EnsureBridge,
+		startCursorBridge:                startCursorSDKRunner,
+		managementCheckinInitialScanDone: make(chan struct{}),
 
 		// Token统计队列（避免每请求起goroutine）
 		tokenStatsCh:        make(chan tokenStatsUpdate, config.DefaultTokenStatsBufferSize),
@@ -266,10 +312,12 @@ func NewServer(store storage.Store) *Server {
 		channelRPMLimiter:         newChannelRPMLimiter(time.Now),
 		channelConcurrencyLimiter: newChannelConcurrencyLimiter(),
 	}
+	s.setMultimodalFallbackModels(runtimeCfg.MultimodalFallbackModels)
 
 	reg := protocol.NewRegistry()
 	protocolbuiltin.Register(reg)
 	s.protocolRegistry = reg
+	s.channelManagement = newChannelManagementService(store, s.getClientForChannel)
 
 	// 初始化高性能缓存层（60秒TTL，避免数据库性能杀手查询）
 	s.channelCache = storage.NewChannelCache(store, 60*time.Second)
@@ -280,6 +328,7 @@ func NewServer(store storage.Store) *Server {
 		log.Fatalf("[FATAL] 加载渠道配置失败: %v", err)
 	}
 	log.Printf("[INFO] 已加载渠道配置（%d项）", len(channels))
+	s.cursorBridgeRequired.Store(hasCursorChannel(channels))
 
 	codexOAuthService := codexauth.NewService(s.client)
 	s.codexService = codexOAuthService
@@ -350,6 +399,20 @@ func NewServer(store storage.Store) *Server {
 			return cfg.ID, cfg.Name, nil
 		},
 	)
+	s.zedService = zedauth.NewService(s.client)
+	s.zedCredentials = newZedCredentialManager(s.zedService, store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.zedCredentials.refreshTracker = s.oauthCredentialRefreshes
+	s.zedOAuth = newZedOAuthManager(s.zedService, store, func(channelID int64) {
+		s.zedCredentials.invalidate(channelID)
+		s.InvalidateChannelListCache()
+	})
+	s.cursorService = cursorauth.NewService(s.client)
+	s.cursorCredentials = newCursorCredentialManager(store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.cursorCredentials.refreshTracker = s.oauthCredentialRefreshes
 
 	// 初始化冷却管理器（统一管理渠道级和Key级冷却）
 	// 传入Server作为configGetter，利用缓存层查询渠道配置
@@ -383,6 +446,8 @@ func NewServer(store storage.Store) *Server {
 	// 创建服务层（仅保留有价值的服务）
 	// ============================================================================
 
+	s.eventPublisher = newEventPublisherFromEnv()
+
 	// 1. LogService（负责日志管理）
 	s.logService = NewLogService(
 		store,
@@ -393,6 +458,7 @@ func NewServer(store storage.Store) *Server {
 		&s.isShuttingDown,
 		&s.wg,
 	)
+	s.logService.SetEventPublisher(s.eventPublisher)
 	// 2. AuthService（负责认证授权）
 	// 初始化时自动从数据库加载API访问令牌
 	s.authService = NewAuthService(
@@ -426,6 +492,99 @@ func NewServer(store storage.Store) *Server {
 
 	return s
 
+}
+
+func hasCursorChannel(channels []*model.Config) bool {
+	for _, channel := range channels {
+		if channel != nil && channel.UsesCursorOAuth() {
+			return true
+		}
+	}
+	return false
+}
+
+const cursorBridgeInitializationTimeout = 5 * time.Minute
+
+// StartCursorSDKBridge initializes the pinned companion in the background.
+// Non-Cursor deployments never perform installation or process startup work.
+func (s *Server) StartCursorSDKBridge() {
+	if s == nil || !s.cursorBridgeRequired.Load() || s.isShuttingDown.Load() {
+		return
+	}
+	s.cursorBridgeStartOnce.Do(func() {
+		if s.ensureCursorBridge == nil || s.startCursorBridge == nil {
+			log.Print("[WARN] Cursor SDK Bridge 后台初始化不可用")
+			return
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			ctx, cancel := context.WithTimeout(s.baseCtx, cursorBridgeInitializationTimeout)
+			defer cancel()
+			if err := s.initializeCursorSDKBridge(ctx); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("[WARN] Cursor SDK Bridge 后台初始化失败: %v", err)
+				}
+			}
+		}()
+	})
+}
+
+func (s *Server) initializeCursorSDKBridge(ctx context.Context) error {
+	path, err := s.ensureCursorBridge(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure cursor-sdk-bridge: %w", err)
+	}
+	runner, err := s.startCursorBridge(ctx, path)
+	if err != nil {
+		return fmt.Errorf("start cursor-sdk-bridge: %w", err)
+	}
+	if s.isShuttingDown.Load() {
+		closeCursorRunner(runner)
+		return context.Canceled
+	}
+	previous := s.swapCursorRunner(runner)
+	closeCursorRunner(previous)
+	log.Printf("[INFO] Cursor SDK Bridge 已就绪: %s", path)
+	return nil
+}
+
+func startCursorSDKRunner(ctx context.Context, path string) (cursorauth.Runner, error) {
+	runner := cursorauth.NewSDKRunner(path)
+	if err := runner.Start(ctx); err != nil {
+		closeCursorRunner(runner)
+		return nil, err
+	}
+	return runner, nil
+}
+
+func (s *Server) cursorRunnerSnapshot() cursorauth.Runner {
+	if s == nil {
+		return nil
+	}
+	s.cursorRunnerMu.RLock()
+	defer s.cursorRunnerMu.RUnlock()
+	return s.cursorRunner
+}
+
+func (s *Server) swapCursorRunner(next cursorauth.Runner) cursorauth.Runner {
+	s.cursorRunnerMu.Lock()
+	previous := s.cursorRunner
+	s.cursorRunner = next
+	s.cursorRunnerMu.Unlock()
+	return previous
+}
+
+func closeCursorRunner(runner cursorauth.Runner) {
+	closer, ok := runner.(interface{ Close(context.Context) error })
+	if !ok || closer == nil {
+		return
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*cursorauth.BridgeShutdownGrace)
+	if err := closer.Close(closeCtx); err != nil {
+		log.Printf("[WARN] 关闭 Cursor SDK Bridge Runner 失败: %v", err)
+	}
+	cancel()
 }
 
 // RefreshAntigravityUserAgent resolves the Antigravity Hub version before the
@@ -516,6 +675,7 @@ type serverRuntimeConfig struct {
 	ActiveRequestTitleEnabled    bool
 	CodexMap429To503             bool
 	GlobalCooldownDetectionRules *model.CooldownDetectionRules
+	MultimodalFallbackModels     map[string]string
 	Cooldown                     util.CooldownSettings
 }
 
@@ -526,6 +686,17 @@ func loadGlobalCooldownDetectionRules(cs *ConfigService) *model.CooldownDetectio
 		return nil
 	}
 	return rules
+}
+
+// loadMultimodalFallbackModels 读取多模态回退映射。解析失败只 WARN 回退 nil
+// （等于未配置），不让一条写坏的管理员配置挡住整个进程启动。
+func loadMultimodalFallbackModels(cs *ConfigService) map[string]string {
+	mappings, err := parseMultimodalFallbackModels(cs.GetString(modelMultimodalFallbackSettingKey, "{}"))
+	if err != nil {
+		log.Printf("[WARN] 无效的 %s，已回退为未配置: %v", modelMultimodalFallbackSettingKey, err)
+		return nil
+	}
+	return mappings
 }
 
 // loadPositiveInt 读取必须为正数的配置项，非法值回退默认并告警。
@@ -639,6 +810,7 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 		ActiveRequestTitleEnabled:    cs.GetBool(config.ActiveRequestTitleEnabledSettingKey, false),
 		CodexMap429To503:             cs.GetBool(config.CodexMap429To503SettingKey, false),
 		GlobalCooldownDetectionRules: loadGlobalCooldownDetectionRules(cs),
+		MultimodalFallbackModels:     loadMultimodalFallbackModels(cs),
 		Cooldown:                     loadCooldownSettings(cs),
 	}
 }
@@ -821,6 +993,8 @@ func (s *Server) startBackgroundWorkers() {
 
 	s.wg.Add(1)
 	go s.responsesExecutionSessionCleanupLoop()
+	s.wg.Add(1)
+	go s.managementCheckinLoop()
 }
 
 func (s *Server) disabledURLReloadLoop() {
@@ -1397,12 +1571,15 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 	// Codex CLI 直连路由别名（chatgpt_base_url 兼容），对齐 CLIProxyAPI 的
 	// codexDirect 路由组。GET 是 Responses WebSocket 升级；POST 是 SSE
 	// fallback，两者都由 DetectRequestFamily 识别为 RequestFamilyResponses。
+	// /alpha/search 是 Codex 独立搜索端点，转发时把 Exact /responses URL
+	// 改写成 sibling /alpha/search。
 	codexDirect := r.Group("/backend-api/codex")
 	codexDirect.Use(s.authService.RequireAPIAuth())
 	codexDirect.Use(captureClientRequestMetadata())
 	{
 		codexDirect.GET("/responses", s.HandleProxyRequest)
 		codexDirect.POST("/responses", s.HandleProxyRequest)
+		codexDirect.POST("/alpha/search", s.HandleProxyRequest)
 	}
 
 	// 健康检查（公开访问，无需认证，K8s liveness/readiness probe）
@@ -1451,6 +1628,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/:id/oauth-usage", s.HandleOAuthUsage)
 		admin.POST("/channels/:id/codex-quota-reset", s.HandleResetCodexQuota)
 		admin.POST("/channels/oauth-usage/batch/stream", s.HandleOAuthUsageBatchStream)
+		admin.POST("/channels/usage/active/batch/stream", s.HandleActiveChannelUsageBatchStream)
 		admin.POST("/antigravity/oauth/start", s.HandleStartAntigravityOAuth)
 		admin.GET("/antigravity/oauth/status", s.HandleAntigravityOAuthStatus)
 		admin.POST("/antigravity/oauth/cancel", s.HandleCancelAntigravityOAuth)
@@ -1463,6 +1641,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/xai/oauth/callback", s.HandleSubmitXAIOAuthCallback)
 		admin.POST("/xai/credentials/import/stream", s.HandleImportXAICredentialsStream)
 		admin.POST("/xai/credentials/import/jobs", s.HandleStartXAICredentialImportJob)
+		admin.POST("/channels/:id/xai-credential/refresh", s.HandleRefreshXAICredential)
 		admin.POST("/anthropic/oauth/start", s.HandleStartAnthropicOAuth)
 		admin.GET("/anthropic/oauth/status", s.HandleAnthropicOAuthStatus)
 		admin.POST("/anthropic/oauth/cancel", s.HandleCancelAnthropicOAuth)
@@ -1473,6 +1652,14 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/zai/oauth/status", s.HandleZAIOAuthStatus)
 		admin.POST("/zai/oauth/cancel", s.HandleCancelZAIOAuth)
 		admin.POST("/zai/credentials/import", s.HandleImportZAICredential)
+		admin.POST("/channels/:id/zai-credential/refresh", s.HandleRefreshZAICredential)
+		admin.POST("/zed/oauth/start", s.HandleStartZedOAuth)
+		admin.GET("/zed/oauth/status", s.HandleZedOAuthStatus)
+		admin.POST("/zed/oauth/cancel", s.HandleCancelZedOAuth)
+		admin.POST("/zed/oauth/callback", s.HandleSubmitZedOAuthCallback)
+		admin.POST("/channels/:id/zed-credential/refresh", s.HandleRefreshZedCredential)
+		admin.POST("/cursor/credentials/import", s.HandleImportCursorCredential)
+		admin.POST("/channels/:id/cursor-credential/refresh", s.HandleRefreshCursorCredential)
 		admin.POST("/channels/check-duplicate", s.HandleCheckDuplicateChannel)
 		admin.POST("/channels/batch-priority", s.HandleBatchUpdatePriority) // 批量更新渠道优先级
 		admin.POST("/channels/batch-enabled", s.HandleBatchSetEnabled)      // 批量启用/禁用渠道
@@ -1485,6 +1672,9 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.DELETE("/channels/:id", s.HandleChannelByID)
 		admin.GET("/channels/:id/editor", s.HandleChannelEditor)
 		admin.GET("/channels/:id/keys", s.HandleChannelKeys)
+		admin.POST("/channel-management/sub2api-login", s.HandleChannelManagementSub2APILogin)
+		admin.POST("/channels/:id/management-account/balance", s.HandleChannelManagementBalance)
+		admin.POST("/channels/:id/management-account/checkin", s.HandleChannelManagementCheckin)
 		admin.GET("/channels/:id/model-stats", s.HandleChannelModelStats)
 		admin.GET("/channels/:id/url-stats", s.HandleChannelURLStats)
 		admin.POST("/channels/:id/url-disable", s.HandleURLDisable)
@@ -1492,7 +1682,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/:id/key-disable", s.HandleAPIKeyDisable)
 		admin.POST("/channels/:id/key-enable", s.HandleAPIKeyEnable)
 		admin.POST("/channels/models/fetch", s.HandleFetchModelsPreview) // 临时渠道配置获取模型列表
-		admin.POST("/channels/billing/fetch", s.HandleFetchSub2APIBilling)
+		admin.POST("/channels/billing/fetch", s.HandleFetchKeyRate)
 		admin.POST("/channels/websocket-probe", s.HandleChannelWebsocketProbe)
 		admin.POST("/channels/models/refresh-batch", s.HandleBatchRefreshModels)
 		admin.GET("/channels/:id/models/fetch", s.HandleFetchModels) // 获取渠道可用模型列表(新增)
@@ -1514,6 +1704,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/active-requests", s.HandleActiveRequests) // 进行中请求（内存状态）
 		admin.GET("/runtime-metrics", s.HandleRuntimeMetrics)
 		admin.GET("/active-requests/:request_id/debug-log", s.HandleGetActiveRequestDebugLog)
+		admin.POST("/active-requests/:request_id/abort", s.HandleAbortActiveRequest) // 手动中断当前上游尝试（按上游断链处理）
 		admin.GET("/metrics", s.HandleMetrics)
 		admin.GET("/stats", s.HandleStats)
 		admin.GET("/stats/filter-options", s.HandleStatsFilterOptions)
@@ -1531,6 +1722,9 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.PUT("/settings/:key", s.AdminUpdateSetting)
 		admin.POST("/settings/:key/reset", s.AdminResetSetting)
 		admin.POST("/settings/batch", s.AdminBatchUpdateSettings)
+
+		// 手动触发完整更新流程（检查、下载、校验、替换、空闲后重启）
+		admin.POST("/update/check", s.HandleManualUpdate)
 	}
 
 	// Web 仪表盘只读 API。API Token 会话由服务端强制绑定 auth_token_id。
@@ -1552,6 +1746,9 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 	dashboardProxy.Use(s.authService.RequireWebAuth(), s.authService.RequireWebAPITokenProxyAuth(), captureDashboardProxyMetadata())
 	dashboardProxy.Any("/v1/*path", s.HandleProxyRequest)
 	dashboardProxy.Any("/v1beta/*path", s.HandleProxyRequest)
+
+	// 管理后台 OpenAPI 文档公开读取；实际 /admin API 仍要求管理员 Bearer Token。
+	setupDocsRoutes(r)
 
 	// 静态文件服务（带版本号和缓存控制）
 	// - HTML：不缓存，动态替换 __VERSION__ 占位符
@@ -1720,6 +1917,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.zaiOAuth != nil {
 		s.zaiOAuth.close()
 	}
+	if s.zedOAuth != nil {
+		s.zedOAuth.close()
+	}
 	if s.responsesExecutionSessions != nil {
 		s.responsesExecutionSessions.close()
 	}
@@ -1781,6 +1981,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if err == nil {
 			err = ctx.Err()
 		}
+	}
+	if closer, ok := s.cursorRunnerSnapshot().(interface{ Close(context.Context) error }); ok {
+		if closeErr := closer.Close(ctx); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+
+	// 日志 worker 完成后再关闭发布器，确保已落库的 attempt 事件能够排空。
+	if s.eventPublisher != nil {
+		s.eventPublisher.Close()
 	}
 
 	// 停止连接池老化计时器并关闭全局及渠道代理 Transport 的空闲连接。

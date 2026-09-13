@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -24,6 +25,22 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// Anthropic CCH 签名按上游 origin 分流（见 anthropicCCHSigningEnabled）：第一方 origin
+// 上非 OAuth 凭证也签，第三方网关不签。测试要么钉住第一方形态，要么钉住第三方形态，
+// 所以这里给出两个固定 target，不要在测试里传 nil 让判据退化成「只看凭证」。
+var (
+	anthropicOfficialTestURL   = mustParseTestURL("https://api.anthropic.com/v1/messages")
+	anthropicThirdPartyTestURL = mustParseTestURL("https://gateway.example.com/v1/messages")
+)
+
+func mustParseTestURL(raw string) *url.URL {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}
 
 const antigravitySandboxDailyBaseURLForTest = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 
@@ -182,9 +199,12 @@ func dispatchTestHTTPRequest(req *http.Request) (*http.Response, error) {
 		ready:  make(chan struct{}),
 	}
 
+	// 与真实 net/http 一致：请求 context 被 WithCancelCause 取消时，传输层向调用方
+	// 暴露的是 cause 本身而不是 context.Canceled。管理端手动中断依赖这条语义走网络故障
+	// 分类，harness 若在这里退化成 ctx.Err() 就会把中断测成客户端取消。
 	go func() {
 		<-req.Context().Done()
-		rw.abort(req.Context().Err())
+		rw.abort(context.Cause(req.Context()))
 	}()
 
 	go func() {
@@ -212,8 +232,9 @@ func dispatchTestHTTPRequest(req *http.Request) (*http.Response, error) {
 	case <-rw.ready:
 		return rw.response(req, pr), nil
 	case <-req.Context().Done():
-		_ = pw.CloseWithError(req.Context().Err())
-		return nil, req.Context().Err()
+		cause := context.Cause(req.Context())
+		_ = pw.CloseWithError(cause)
+		return nil, cause
 	}
 }
 
@@ -400,7 +421,17 @@ func newInMemoryServer(t testing.TB) *Server {
 	return newInMemoryServerWithSettings(t, nil)
 }
 
+// newInMemoryServerWithCustomStore 创建内存服务器，并在 NewServer 之前用 wrapper
+// 替换 store，避免后台 goroutine 启动后直接写 server.store 导致的 data race。
+func newInMemoryServerWithCustomStore(t testing.TB, wrap func(storage.Store) storage.Store) *Server {
+	return newInMemoryServerCore(t, nil, wrap)
+}
+
 func newInMemoryServerWithSettings(t testing.TB, settings map[string]string) *Server {
+	return newInMemoryServerCore(t, settings, nil)
+}
+
+func newInMemoryServerCore(t testing.TB, settings map[string]string, wrapStore func(storage.Store) storage.Store) *Server {
 	t.Helper()
 
 	store, err := storage.CreateSQLiteStore(":memory:")
@@ -414,7 +445,13 @@ func newInMemoryServerWithSettings(t testing.TB, settings map[string]string) *Se
 		}
 	}
 
-	srv := NewServer(store)
+	var serverStore storage.Store
+	if wrapStore != nil {
+		serverStore = wrapStore(store)
+	} else {
+		serverStore = store
+	}
+	srv := NewServer(serverStore)
 	closeUpstreamHTTPClient(srv.client)
 	closeUpstreamHTTPClient(srv.antigravityClient)
 	testClient := newTestHTTPClient()

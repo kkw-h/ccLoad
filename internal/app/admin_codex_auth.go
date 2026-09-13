@@ -29,10 +29,12 @@ const (
 	codexOAuthTimeout            = 5 * time.Minute
 	codexOAuthStatusTTL          = 10 * time.Minute
 	codexUpstreamURL             = "https://chatgpt.com/backend-api/codex/responses"
+	codexAlphaSearchURL          = "https://chatgpt.com/backend-api/codex/alpha/search"
 )
 
 // 导入凭证和模型获取必须共享这一份 Codex 模型目录，并按订阅计划过滤。
 var codexOAuthDefaultModels = []string{
+	"gpt-6-astra",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
@@ -47,6 +49,7 @@ var codexOAuthDefaultModels = []string{
 
 var codexOAuthExcludedModelsByPlan = map[string]map[string]struct{}{
 	"free": {
+		"gpt-6-astra":         {},
 		"gpt-5.6-sol":         {},
 		"gpt-5.4":             {},
 		"gpt-5.3-codex-spark": {},
@@ -125,18 +128,21 @@ func (r *codexOAuthCancelRequest) Validate() error {
 }
 
 type codexOAuthManager struct {
-	startMu      sync.Mutex
-	mu           sync.Mutex
-	provider     string
-	callbackPath string
-	redirectURI  string
-	prepare      func(string) (string, string, func(context.Context, string) (any, error), func(context.Context, any) (int64, error), error)
-	listenAddr   string
-	timeout      time.Duration
-	now          func() time.Time
-	sessions     map[string]*codexOAuthSession
-	active       *codexOAuthSession
-	invalidate   func(int64)
+	startMu              sync.Mutex
+	mu                   sync.Mutex
+	provider             string
+	callbackPath         string
+	redirectURI          string
+	prepare              func(string) (string, string, func(context.Context, string) (any, error), func(context.Context, any) (int64, error), error)
+	prepareWithHint      func(string, string) (string, string, func(context.Context, string) (any, error), func(context.Context, any) (int64, error), error)
+	parseCallbackRequest func(*http.Request, string) (codexOAuthResult, error)
+	parseSubmittedURL    func(string, string) (codexOAuthResult, error)
+	listenAddr           string
+	timeout              time.Duration
+	now                  func() time.Time
+	sessions             map[string]*codexOAuthSession
+	active               *codexOAuthSession
+	invalidate           func(int64)
 }
 
 func newCodexOAuthManager(service *codexauth.Service, store storage.Store, invalidate func(int64)) *codexOAuthManager {
@@ -220,7 +226,11 @@ func newAntigravityOAuthManager(service *antigravityauth.Service, store storage.
 }
 
 func (m *codexOAuthManager) start() (string, string, error) {
-	if m == nil || m.prepare == nil {
+	return m.startWithHint("")
+}
+
+func (m *codexOAuthManager) startWithHint(hint string) (string, string, error) {
+	if m == nil || (m.prepare == nil && m.prepareWithHint == nil) {
 		return "", "", errors.New("oauth is unavailable")
 	}
 	m.startMu.Lock()
@@ -262,7 +272,15 @@ func (m *codexOAuthManager) start() (string, string, error) {
 		m.mu.Unlock()
 		return "", "", fmt.Errorf("%s OAuth redirect URI is unavailable", m.provider)
 	}
-	state, authURL, exchange, commit, err := m.prepare(redirectURI)
+	var state, authURL string
+	var exchange func(context.Context, string) (any, error)
+	var commit func(context.Context, any) (int64, error)
+	var err error
+	if m.prepareWithHint != nil {
+		state, authURL, exchange, commit, err = m.prepareWithHint(redirectURI, hint)
+	} else {
+		state, authURL, exchange, commit, err = m.prepare(redirectURI)
+	}
 	if err != nil {
 		if listener != nil {
 			_ = listener.Close()
@@ -307,16 +325,27 @@ func (m *codexOAuthManager) handleCallback(session *codexOAuthSession, w http.Re
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	result := codexOAuthResult{
-		code:     strings.TrimSpace(r.URL.Query().Get("code")),
-		state:    strings.TrimSpace(r.URL.Query().Get("state")),
-		errorMsg: strings.TrimSpace(r.URL.Query().Get("error")),
-	}
-	if result.errorMsg == "" && result.code == "" {
-		result.errorMsg = "missing authorization code"
-	}
-	if result.errorMsg == "" && !oauthStateEqual(result.state, session.state) {
-		result.errorMsg = "invalid OAuth state"
+	var result codexOAuthResult
+	if m.parseCallbackRequest != nil {
+		var err error
+		result, err = m.parseCallbackRequest(r, session.state)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(w, "<h1>%s 登录失败</h1><p>%s</p>", html.EscapeString(m.provider), html.EscapeString(err.Error()))
+			return
+		}
+	} else {
+		result = codexOAuthResult{
+			code:     strings.TrimSpace(r.URL.Query().Get("code")),
+			state:    strings.TrimSpace(r.URL.Query().Get("state")),
+			errorMsg: strings.TrimSpace(r.URL.Query().Get("error")),
+		}
+		if result.errorMsg == "" && result.code == "" {
+			result.errorMsg = "missing authorization code"
+		}
+		if result.errorMsg == "" && !oauthStateEqual(result.state, session.state) {
+			result.errorMsg = "invalid OAuth state"
+		}
 	}
 	if err := m.deliverCallback(session, result); err != nil {
 		result.errorMsg = err.Error()
@@ -349,6 +378,23 @@ func (m *codexOAuthManager) deliverCallback(session *codexOAuthSession, result c
 }
 
 func (m *codexOAuthManager) submitCallbackURL(rawURL string) (string, error) {
+	if m != nil && m.parseSubmittedURL != nil {
+		m.mu.Lock()
+		m.pruneLocked()
+		session := m.active
+		m.mu.Unlock()
+		if session == nil {
+			return "", fmt.Errorf("%s OAuth session not found", m.provider)
+		}
+		result, err := m.parseSubmittedURL(rawURL, session.state)
+		if err != nil {
+			return "", err
+		}
+		if err := m.deliverCallback(session, result); err != nil {
+			return "", err
+		}
+		return result.state, nil
+	}
 	result, err := parseOAuthCallbackURL(rawURL, m.callbackPath, m.provider)
 	if err != nil {
 		return "", err
@@ -825,13 +871,35 @@ func codexOAuthModelEntries(planType string) []model.ModelEntry {
 			entries = append(entries, model.ModelEntry{Model: name})
 		}
 	}
+	sortOAuthModelEntries(entries)
 	return entries
+}
+
+func codexOAuthModelTarget(entry model.ModelEntry) string {
+	if target := strings.TrimSpace(entry.RedirectModel); target != "" {
+		return target
+	}
+	return strings.TrimSpace(entry.Model)
+}
+
+func validateCodexOAuthModelEntries(entries []model.ModelEntry, planType string) error {
+	for _, entry := range entries {
+		target := codexOAuthModelTarget(entry)
+		if codexOAuthModelAllowed(target, planType) {
+			continue
+		}
+		if strings.TrimSpace(entry.RedirectModel) != "" {
+			return fmt.Errorf("model %q redirects to unsupported Codex model %q for current plan", strings.TrimSpace(entry.Model), target)
+		}
+		return fmt.Errorf("unsupported Codex model %q for current plan", target)
+	}
+	return nil
 }
 
 func filterCodexOAuthModelEntries(entries []model.ModelEntry, planType string) []model.ModelEntry {
 	filtered := make([]model.ModelEntry, 0, len(entries))
 	for _, entry := range entries {
-		if codexOAuthModelAllowed(entry.Model, planType) {
+		if codexOAuthModelAllowed(codexOAuthModelTarget(entry), planType) {
 			filtered = append(filtered, entry)
 		}
 	}
@@ -839,16 +907,17 @@ func filterCodexOAuthModelEntries(entries []model.ModelEntry, planType string) [
 }
 
 func mergeCodexOAuthModelEntries(entries []model.ModelEntry, planType string) []model.ModelEntry {
-	existing := make(map[string]model.ModelEntry, len(entries))
-	for _, entry := range entries {
-		existing[entry.Model] = entry
+	models := filterCodexOAuthModelEntries(entries, planType)
+	existing := make(map[string]struct{}, len(models))
+	for _, entry := range models {
+		existing[entry.Model] = struct{}{}
 	}
-	models := codexOAuthModelEntries(planType)
-	for i := range models {
-		if entry, ok := existing[models[i].Model]; ok {
-			models[i] = entry
+	for _, entry := range codexOAuthModelEntries(planType) {
+		if _, ok := existing[entry.Model]; !ok {
+			models = append(models, entry)
 		}
 	}
+	sortOAuthModelEntries(models)
 	return models
 }
 

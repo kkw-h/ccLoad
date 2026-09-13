@@ -40,7 +40,7 @@ func TestUpdateTokenStats_SingleUpdateSemantics(t *testing.T) {
 	}
 
 	// 失败请求：只累加失败次数；平均值仍应更新；token与费用不应累加。
-	if err := store.UpdateTokenStats(ctx, tokenHash, false, 2.0, false, 0, 10, 20, 3, 4, 1.23, 0.25, time.Now()); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatFailure(), 2.0, false, 0, 10, 20, 3, 4, 1.23, 0.25, time.Now()); err != nil {
 		t.Fatalf("update token stats (failure): %v", err)
 	}
 
@@ -64,7 +64,7 @@ func TestUpdateTokenStats_SingleUpdateSemantics(t *testing.T) {
 
 	// 成功请求：累加成功次数、token与费用；平均值继续更新。
 	completedAt := time.Now()
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 4.0, false, 0, 10, 20, 3, 4, 0.5, 0.25, completedAt); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 4.0, false, 0, 10, 20, 3, 4, 0.5, 0.25, completedAt); err != nil {
 		t.Fatalf("update token stats (success): %v", err)
 	}
 
@@ -134,7 +134,7 @@ func TestUpdateTokenStats_UsesCompletionPeriodWithoutRegressingNewerWindows(t *t
 	oldDayStart, oldMonthStart := model.AuthTokenCostPeriodStarts(oldCompletedAt)
 	currentDayStart, currentMonthStart := model.AuthTokenCostPeriodStarts(now)
 
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 1.0, false, 0, 1, 1, 0, 0, 0.1, 0.1, oldCompletedAt); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 1.0, false, 0, 1, 1, 0, 0, 0.1, 0.1, oldCompletedAt); err != nil {
 		t.Fatalf("update old-period token stats: %v", err)
 	}
 
@@ -154,11 +154,11 @@ func TestUpdateTokenStats_UsesCompletionPeriodWithoutRegressingNewerWindows(t *t
 		t.Fatalf("last_used_at=%v, want %d", got.LastUsedAt, oldCompletedAt.UnixMilli())
 	}
 
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 1.0, false, 0, 1, 1, 0, 0, 0.2, 0.2, now); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 1.0, false, 0, 1, 1, 0, 0, 0.2, 0.2, now); err != nil {
 		t.Fatalf("update current-period token stats: %v", err)
 	}
 	// 再迟到一个旧周期事件：总额仍应记账，但当前日/月窗口和 last_used_at 不得倒退。
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 1.0, false, 0, 1, 1, 0, 0, 0.1, 0.1, oldCompletedAt); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 1.0, false, 0, 1, 1, 0, 0, 0.1, 0.1, oldCompletedAt); err != nil {
 		t.Fatalf("update delayed old-period token stats: %v", err)
 	}
 	got, err = store.GetAuthTokenByValue(ctx, tokenHash)
@@ -182,6 +182,42 @@ func TestUpdateTokenStats_UsesCompletionPeriodWithoutRegressingNewerWindows(t *t
 	}
 	if got.LastUsedAt == nil || *got.LastUsedAt != now.UnixMilli() {
 		t.Fatalf("last_used_at regressed: got %v, want %d", got.LastUsedAt, now.UnixMilli())
+	}
+}
+
+func TestUpdateTokenStats_BilledNeutralAccumulatesUsageButNotHealth(t *testing.T) {
+	t.Parallel()
+
+	store, err := storage.CreateSQLiteStore(filepath.Join(t.TempDir(), "neutral.db"))
+	if err != nil {
+		t.Fatalf("create sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+	tokenHash := "neutral_hash"
+	if err := store.CreateAuthToken(ctx, &model.AuthToken{
+		Token: tokenHash, Description: "test", CreatedAt: time.Now(), IsActive: true,
+	}); err != nil {
+		t.Fatalf("create auth token: %v", err)
+	}
+
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatBilledNeutral(), 1.5, false, 0, 10, 20, 3, 4, 1.0, 0.5, time.Now()); err != nil {
+		t.Fatalf("update token stats: %v", err)
+	}
+
+	got, err := store.GetAuthTokenByValue(ctx, tokenHash)
+	if err != nil {
+		t.Fatalf("get auth token: %v", err)
+	}
+	if got.SuccessCount != 0 || got.FailureCount != 0 {
+		t.Fatalf("neutral billing changed health counts: success=%d failure=%d", got.SuccessCount, got.FailureCount)
+	}
+	if got.PromptTokensTotal != 10 || got.CompletionTokensTotal != 20 || got.CacheReadTokensTotal != 3 || got.CacheCreationTokensTotal != 4 {
+		t.Fatalf("neutral billing did not accumulate tokens: %+v", got)
+	}
+	if got.TotalCostUSD != 1 || got.EffectiveCostUSD != 0.5 || got.CostUsedMicroUSD != util.USDToMicroUSD(0.5) {
+		t.Fatalf("neutral billing did not accumulate cost: total=%v effective=%v used=%d", got.TotalCostUSD, got.EffectiveCostUSD, got.CostUsedMicroUSD)
 	}
 }
 
@@ -209,7 +245,7 @@ func TestUpdateTokenStats_StreamingRequest(t *testing.T) {
 	}
 
 	// 第一次流式请求：TTFB = 100ms
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 0, true, 100.0, 10, 20, 0, 0, 0.1, 0.1, time.Now()); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 0, true, 100.0, 10, 20, 0, 0, 0.1, 0.1, time.Now()); err != nil {
 		t.Fatalf("update token stats (streaming 1): %v", err)
 	}
 
@@ -225,7 +261,7 @@ func TestUpdateTokenStats_StreamingRequest(t *testing.T) {
 	}
 
 	// 第二次流式请求：TTFB = 200ms，期望平均值 = (100+200)/2 = 150
-	if err := store.UpdateTokenStats(ctx, tokenHash, true, 0, true, 200.0, 5, 10, 0, 0, 0.05, 0.05, time.Now()); err != nil {
+	if err := store.UpdateTokenStats(ctx, tokenHash, model.TokenStatSuccess(), 0, true, 200.0, 5, 10, 0, 0, 0.05, 0.05, time.Now()); err != nil {
 		t.Fatalf("update token stats (streaming 2): %v", err)
 	}
 

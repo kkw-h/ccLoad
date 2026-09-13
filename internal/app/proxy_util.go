@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,9 +19,16 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
-const anthropicBillingHeaderPrefix = "x-anthropic-billing-header:"
+const (
+	anthropicBillingHeaderPrefix = "x-anthropic-billing-header:"
+	researchIDHeader             = "X-Sedna-Research-Id"
+)
+
+var researchIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // ============================================================================
 // 常量定义
@@ -127,12 +135,14 @@ type fwResult struct {
 	// 或心跳传输错误结束。该故障按物理连接连续计数，不得升级为模型冷却。
 	UpstreamWebsocketTransportFailure bool
 
-	// OpenAI service_tier（2026-03新增）。Codex 请求中的 priority 是 Fast 模式标记；
-	// 其他情况由上游响应中的 service_tier 决定。
+	// OpenAI service_tier（2026-03新增）。请求中的 priority 是 Fast 模式标记，
+	// 计费时不能被上游回显的 default/standard 降档。
 	ServiceTier string
 
 	// ThinkingEffort 记录请求或上游响应声明的思考等级；上游响应非空时覆盖请求值。
 	ThinkingEffort string
+	// ResponseModel 是上游响应声明的模型；只用于日志，不参与路由、冷却或计费。
+	ResponseModel string
 
 	// Debug日志数据（debug开启时填充，传递到日志写入管道）
 	DebugData *model.DebugLogEntry
@@ -143,15 +153,17 @@ type fwResult struct {
 
 // ForwardObserver 封装转发过程中的观测回调（遵循SRP，避免函数签名膨胀）
 type ForwardObserver struct {
-	OnBytesRead         func(int64) // 字节读取回调（可选）
-	OnFirstByteRead     func()      // 首字节读取回调（可选）
-	OnUpstreamWebsocket func(bool)  // 实际上游传输变化回调（可选）
+	OnBytesRead         func(int64)         // 字节读取回调（可选）
+	OnFirstByteRead     func(time.Duration) // 客户端首字节耗时回调（可选）
+	OnUpstreamWebsocket func(bool)          // 实际上游传输变化回调（可选）
 	OnDebugCapture      func(*debugCapture)
 }
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
 type proxyRequestContext struct {
-	originalModel              string
+	clientModel                string // 客户端请求的原始模型基名；仅用于日志，避免被回退/重定向覆盖
+	originalModel              string // 当前用于选路的模型基名，可能已被多模态回退替换
+	requestedModel             string // 当前用于选路的字面模型名，可能带思考后缀
 	clientProtocol             protocol.Protocol
 	codexClient                bool
 	upstreamProtocol           protocol.Protocol
@@ -163,6 +175,7 @@ type proxyRequestContext struct {
 	header                     http.Header
 	isStreaming                bool
 	tokenHash                  string               // Token哈希值（用于统计）
+	tokenEnvironment           string               // Token 环境标识（用于用量事件分流）
 	tokenID                    int64                // Token ID（用于日志记录，0表示未使用token）
 	clientIP                   string               // 客户端IP地址（用于日志记录）
 	activeReqID                int64                // 活跃请求ID（用于更新渠道信息）
@@ -171,14 +184,29 @@ type proxyRequestContext struct {
 	channelStartTime           time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
 	attemptStartTime           time.Time            // 渠道内单次 Key/URL 尝试开始时间
 	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
+	attemptCostMultiplier      float64              // 当前 attempt 的成本倍率（api_key 渠道取 Key 级，OAuth 取渠道级）
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
+	skipProxyLog               bool                 // 管理测试等外层会统一持久化日志的调用路径
 	thinkingEffort             string
+	requestID                  string                     // 关联同一用户请求的所有用量事件
+	researchID                 string                     // 可选研究归属，来自客户端后端的 workspace incarnation_id
+	attemptSeq                 int                        // 真实上游尝试序号（每次转发前自增）
 	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
 	nativeCodexWS              *codexUpstreamWebsocketSession
 	nativeCodexBody            []byte
 	quotaOverdraftTranscript   []byte
 	codexMultiAgentV2Optimized bool
 	codexMultiAgentV2Conflict  bool
+}
+
+func (r *proxyRequestContext) requestLogModel() string {
+	if r == nil {
+		return ""
+	}
+	if r.clientModel != "" {
+		return r.clientModel
+	}
+	return r.originalModel
 }
 
 // proxyResult 代理请求结果
@@ -242,22 +270,36 @@ func isStreamingRequest(path string, body []byte) bool {
 // buildUpstreamURL 构建上游完整URL（KISS）
 func buildUpstreamURL(baseURL string, requestPath, rawQuery string) string {
 	upstreamURL := model.StripExactUpstreamURLMarker(baseURL)
-	if !model.HasExactUpstreamURLMarker(baseURL) {
+	if model.HasExactUpstreamURLMarker(baseURL) {
+		if protocol.DetectRequestFamily(requestPath) == protocol.RequestFamilyAlphaSearch {
+			if parsed, err := neturl.Parse(upstreamURL); err == nil {
+				if rewritten, ok := protocol.RewriteResponsesPathToAlphaSearch(parsed.Path); ok {
+					parsed.Path = rewritten
+					parsed.RawPath = ""
+					upstreamURL = parsed.String()
+				}
+			}
+		}
+	} else {
 		upstreamURL = strings.TrimRight(upstreamURL, "/") + requestPath
 	}
 
-	// 移除 key 参数（Gemini API 认证格式），避免泄露到上游
-	if rawQuery != "" {
-		if values, err := neturl.ParseQuery(rawQuery); err == nil {
-			values.Del("key")
-			rawQuery = values.Encode()
-		}
+	parsed, err := neturl.Parse(upstreamURL)
+	if err != nil || rawQuery == "" {
+		return upstreamURL
 	}
 
-	if rawQuery != "" {
-		upstreamURL += "?" + rawQuery
+	// 请求查询参数必须与 Exact URL 自带的查询串合并，不能在已序列化 URL 后再拼第二个 '?'。
+	// ParseQuery 会在返回错误时保留其余合法参数。丢弃坏片段，不能让畸形转义绕过 key 剔除。
+	requestQuery, _ := neturl.ParseQuery(rawQuery)
+	// 移除客户端的 Gemini key 参数，避免把下游凭证泄露到上游；Exact URL 自带参数不受影响。
+	requestQuery.Del("key")
+	mergedQuery := parsed.Query()
+	for key, values := range requestQuery {
+		mergedQuery[key] = append(mergedQuery[key], values...)
 	}
-	return upstreamURL
+	parsed.RawQuery = mergedQuery.Encode()
+	return parsed.String()
 }
 
 // buildUpstreamRequest 创建带上下文的HTTP请求
@@ -336,7 +378,8 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 		// 不透传认证头（由上游注入）
 		if strings.EqualFold(k, "Authorization") ||
 			strings.EqualFold(k, "X-Api-Key") ||
-			strings.EqualFold(k, "x-goog-api-key") {
+			strings.EqualFold(k, "x-goog-api-key") ||
+			strings.EqualFold(k, researchIDHeader) {
 			continue
 		}
 		// 不透传 Accept-Encoding，避免上游返回 br/gzip 压缩导致错误体乱码
@@ -351,6 +394,21 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 	if dst.Header.Get("Accept") == "" {
 		dst.Header.Set("Accept", "application/json")
 	}
+}
+
+func parseResearchIDHeader(header http.Header) (string, error) {
+	values := header.Values(researchIDHeader)
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) != 1 {
+		return "", fmt.Errorf("%s must appear exactly once", researchIDHeader)
+	}
+	researchID := strings.TrimSpace(values[0])
+	if !researchIDPattern.MatchString(researchID) {
+		return "", fmt.Errorf("%s is invalid", researchIDHeader)
+	}
+	return researchID, nil
 }
 
 // injectAPIKeyHeaders 按运行时上游协议注入 API Key 头。
@@ -405,7 +463,7 @@ func injectAnthropicBetaFlag(req *http.Request, flag string) {
 		return
 	}
 	h := req.Header
-	key, exists := existingHeaderKey(h, "anthropic-beta")
+	key, exists := mergeHeaderVariantsToKey(h, "anthropic-beta")
 	if !exists {
 		h.Set("anthropic-beta", flag)
 		return
@@ -454,35 +512,47 @@ func normalizeAnyrouterAdaptiveThinking(cfg *model.Config, upstreamProtocol, req
 	if requestPath != "/v1/messages" {
 		return body
 	}
-	var obj map[string]any
-	if err := sonic.Unmarshal(body, &obj); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return body
 	}
-	thinking, hasThinking := obj["thinking"]
-	if hasThinking {
-		thinkMap, ok := thinking.(map[string]any)
-		if !ok {
-			return body
-		}
-		typ, _ := thinkMap["type"].(string)
-		if typ != "enabled" {
-			return body
-		}
-		effort := "high"
-		if budget, ok := thinkMap["budget_tokens"].(float64); ok && budget > 0 {
-			effort = anthropicBudgetToEffort(int(budget))
-		}
-		obj["thinking"] = map[string]string{"type": "adaptive"}
-		setAnthropicOutputEffort(obj, effort)
-	} else {
-		obj["thinking"] = map[string]string{"type": "adaptive"}
-		setAnthropicOutputEffort(obj, "high")
+	thinking := gjson.GetBytes(body, "thinking")
+	if thinking.Exists() && !thinking.IsObject() {
+		return body
 	}
-	newBody, err := sonic.Marshal(obj)
+	effort := "high"
+	if thinking.Exists() {
+		if gjson.GetBytes(body, "thinking.type").String() != "enabled" {
+			return body
+		}
+		if budget := gjson.GetBytes(body, "thinking.budget_tokens"); budget.Exists() && budget.Num > 0 {
+			effort = anthropicBudgetToEffort(int(budget.Num))
+		}
+	}
+
+	updated, err := sjson.SetRawBytes(body, "thinking", []byte(`{"type":"adaptive"}`))
 	if err != nil {
 		return body
 	}
-	return newBody
+	outputConfig := gjson.GetBytes(updated, "output_config")
+	if !outputConfig.Exists() || outputConfig.Type == gjson.Null {
+		updated, err = sjson.SetRawBytes(updated, "output_config", []byte(`{}`))
+		if err != nil {
+			return body
+		}
+		updated, err = sjson.SetBytes(updated, "output_config.effort", effort)
+	} else if outputConfig.IsObject() && !gjson.GetBytes(updated, "output_config.effort").Exists() {
+		updated, err = sjson.SetBytes(updated, "output_config.effort", effort)
+	} else if !outputConfig.IsObject() {
+		updated, err = sjson.SetRawBytes(updated, "output_config", []byte(`{}`))
+		if err != nil {
+			return body
+		}
+		updated, err = sjson.SetBytes(updated, "output_config.effort", effort)
+	}
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 func isAnyrouterChannel(cfg *model.Config) bool {
@@ -493,18 +563,16 @@ func isAnyrouterChannel(cfg *model.Config) bool {
 	return strings.Contains(haystack, "anyrouter")
 }
 
-func setAnthropicOutputEffort(obj map[string]any, effort string) {
-	if effort == "" {
-		return
+// setAnthropicOutputEffort 写入 output_config.effort，已有值不覆盖。
+func setAnthropicOutputEffort(body []byte, effort string) []byte {
+	if effort == "" || gjson.GetBytes(body, "output_config.effort").Exists() {
+		return body
 	}
-	outputConfig, _ := obj["output_config"].(map[string]any)
-	if outputConfig == nil {
-		outputConfig = map[string]any{}
-		obj["output_config"] = outputConfig
+	updated, err := sjson.SetBytes(body, "output_config.effort", effort)
+	if err != nil {
+		return body
 	}
-	if _, exists := outputConfig["effort"]; !exists {
-		outputConfig["effort"] = effort
-	}
+	return updated
 }
 
 // anthropicBudgetToEffort 把旧 Anthropic budget_tokens 映射成 output_config.effort 档位。
@@ -597,6 +665,12 @@ func replaceModelInPath(path string, originalModel string, actualModel string) s
 	return path[:idx+len(modelPrefix)] + actualModel + path[end:]
 }
 
+// rewriteUpstreamRequestPath 把路径里的模型段换成实际上游模型。以路径自身携带的
+// 模型名为准，客户端写的是 gemini-2.5-pro(high) 时同样能替换掉。
+func rewriteUpstreamRequestPath(path, actualModel string) string {
+	return replaceModelInPath(path, extractModelFromPath(path), actualModel)
+}
+
 func buildGeminiGeneratePath(model string, isStreaming bool) string {
 	if isStreaming {
 		return "/v1beta/models/" + model + ":streamGenerateContent"
@@ -616,39 +690,42 @@ func buildCodexResponsesPath() string {
 	return "/v1/responses"
 }
 
-// prepareRequestBody 准备请求体（处理模型重定向和模糊匹配）
-// 遵循SRP原则：单一职责 - 负责模型名解析和请求体准备
-//
-// 模型名解析优先级：
-// 1. 精确匹配的重定向（redirect_model 配置）
-// 2. 模糊匹配（启用 model_fuzzy_match 时）
-// 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
+// resolveChannelRoutingModel returns the logical model configured on the channel,
+// before redirecting it to an upstream model. API Key scopes use this identity.
+func (s *Server) resolveChannelRoutingModel(cfg *model.Config, originalModel string) string {
+	routedModel := model.RoutingModelName(originalModel)
+	if !cfg.SupportsModel(routedModel) && s.modelFuzzyMatch {
+		if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
+			return model.RoutingModelName(matched)
+		}
+	}
+	return routedModel
+}
+
+// resolveActualModel preserves the historical redirect/fuzzy-match order used for upstream requests.
 func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) string {
-	actualModel := originalModel
-	// 1. 检查模型重定向（精确匹配优先）
-	if redirectModel, ok := cfg.GetRedirectModel(originalModel); ok && redirectModel != "" {
+	routedModel := model.RoutingModelName(originalModel)
+	actualModel := routedModel
+	// 1. 精确匹配的重定向优先。
+	if redirectModel, ok := cfg.GetRedirectModel(routedModel); ok && redirectModel != "" {
 		actualModel = redirectModel
 	}
 
-	// 2. 模糊匹配回退（仅当未触发重定向时）
-	if actualModel == originalModel && s.modelFuzzyMatch {
-		// 先检查精确匹配，避免不必要的模糊匹配
-		if !cfg.SupportsModel(originalModel) {
-			if matched, ok := cfg.FuzzyMatchModel(originalModel); ok {
-				actualModel = matched
-			}
+	// 2. 仅在未触发精确重定向时做模糊匹配。
+	if actualModel == routedModel && s.modelFuzzyMatch && !cfg.SupportsModel(routedModel) {
+		if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
+			actualModel = matched
 		}
 	}
 
-	// 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
-	// 场景：请求 gemini-3-flash → 模糊匹配 gemini-3-flash-preview → 重定向 gemini-3-flash-preview-0719
-	// 仅当模型已变更且变更后的模型有重定向配置时触发
-	if actualModel != originalModel {
+	// 3. 历史行为只对上一步得到的模型再解析一次重定向。
+	if actualModel != routedModel {
 		if redirectModel, ok := cfg.GetRedirectModel(actualModel); ok && redirectModel != "" {
 			actualModel = redirectModel
 		}
 	}
-	return actualModel
+	// 渠道条目或重定向目标可能字面带思考后缀，但后缀绝不能出现在发往上游的模型名里。
+	return model.RoutingModelName(actualModel)
 }
 
 // resolveFinalUpstreamModel 返回真正发送给上游的模型身份。
@@ -666,31 +743,41 @@ func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestConte
 	actualModel = s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, string(upstreamProtocol))
 
 	bodyToSend = reqCtx.body
+	requestedModel := reqCtx.requestedModel
+	if requestedModel == "" {
+		requestedModel = reqCtx.originalModel
+	}
+	// 后缀来自客户端字面模型名，能力却属于重定向/模糊匹配后的实际上游模型。
+	bodyToSend = applyThinkingSuffixForModel(bodyToSend, reqCtx.clientProtocol, requestedModel, actualModel)
 	// billing/CCH 块是真 Claude Code 请求的身份与签名载体。只有跨协议
 	// 转换时才能删除；Anthropic -> Anthropic 必须保留，供 OAuth finalizer
 	// 识别并保留原生 Claude Code prompt。
 	if reqCtx.clientProtocol == protocol.Anthropic && upstreamProtocol != protocol.Anthropic {
 		bodyToSend = stripAnthropicBillingHeaders(bodyToSend)
 	}
-	bodyToSend = replaceJSONRequestModel(bodyToSend, reqCtx.originalModel, actualModel)
+	bodyToSend = replaceJSONRequestModel(bodyToSend, actualModel)
 
 	return actualModel, bodyToSend
 }
 
-func replaceJSONRequestModel(body []byte, originalModel, actualModel string) []byte {
-	if len(body) == 0 || actualModel == "" || actualModel == originalModel {
+// replaceJSONRequestModel 以请求体里现有的 model 值为准做替换：客户端写的可能是
+// 带思考后缀的名字，也可能和路由用的基名不一致。没有 model 字段的请求体（Gemini
+// 把模型放在 URL 里）保持原样，不能顺手注入一个字段。
+func replaceJSONRequestModel(body []byte, actualModel string) []byte {
+	if len(body) == 0 || actualModel == "" {
 		return body
 	}
-	var reqData map[string]json.RawMessage
-	if err := sonic.Unmarshal(body, &reqData); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return body
 	}
-	modelRaw, err := sonic.Marshal(actualModel)
-	if err != nil {
+	current := gjson.GetBytes(body, "model")
+	if current.Type != gjson.String {
 		return body
 	}
-	reqData["model"] = modelRaw
-	modifiedBody, err := sonic.Marshal(reqData)
+	if strings.TrimSpace(current.String()) == "" || current.String() == actualModel {
+		return body
+	}
+	modifiedBody, err := sjson.SetBytes(body, "model", actualModel)
 	if err != nil {
 		return body
 	}
@@ -705,49 +792,37 @@ func stripAnthropicBillingHeaders(body []byte) []byte {
 	if !bytes.Contains(body, []byte(anthropicBillingHeaderPrefix)) {
 		return body
 	}
-
-	var reqData map[string]json.RawMessage
-	if err := sonic.Unmarshal(body, &reqData); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return body
 	}
 
-	systemRaw, ok := reqData["system"]
-	if !ok {
+	system := gjson.GetBytes(body, "system")
+	if !system.IsArray() {
 		return body
 	}
-
-	var systemArr []json.RawMessage
-	if err := sonic.Unmarshal(systemRaw, &systemArr); err != nil {
-		return body // system 是 string，不处理
-	}
-
-	filtered := make([]json.RawMessage, 0, len(systemArr))
-	changed := false
-	for _, item := range systemArr {
-		if isAnthropicBillingHeaderSystemBlock(item) {
-			changed = true
-			continue
+	indices := make([]int, 0)
+	for index, item := range system.Array() {
+		if isAnthropicBillingHeaderSystemBlock(json.RawMessage(item.Raw)) {
+			indices = append(indices, index)
 		}
-		filtered = append(filtered, item)
 	}
-
-	if !changed {
+	if len(indices) == 0 {
 		return body
 	}
-
-	if len(filtered) == 0 {
-		delete(reqData, "system")
-	} else {
-		filteredSystemRaw, err := sonic.Marshal(filtered)
+	result := body
+	for index := len(indices) - 1; index >= 0; index-- {
+		var err error
+		result, err = sjson.DeleteBytes(result, fmt.Sprintf("system.%d", indices[index]))
 		if err != nil {
 			return body
 		}
-		reqData["system"] = filteredSystemRaw
 	}
-
-	result, err := sonic.Marshal(reqData)
-	if err != nil {
-		return body
+	if !gjson.GetBytes(result, "system").IsArray() || len(gjson.GetBytes(result, "system").Array()) == 0 {
+		var err error
+		result, err = sjson.DeleteBytes(result, "system")
+		if err != nil {
+			return body
+		}
 	}
 	return result
 }
@@ -897,7 +972,8 @@ func stringMapValue(values map[string]any, key string) string {
 // logEntryParams 日志条目构建参数（避免多个 string 参数顺序混淆）
 type logEntryParams struct {
 	RequestModel     string // 客户端请求的原始模型名称
-	ActualModel      string // 实际转发到上游的模型名称（可能经过重定向）
+	ActualModel      string // 实际发给上游的模型名称（可能经过重定向）
+	ResponseModel    string // 成功响应声明的模型；只用于日志展示
 	RequestPath      string // 客户端请求路径（用于识别按次计费的特殊端点）
 	ChannelID        int64
 	StatusCode       int
@@ -915,6 +991,11 @@ type logEntryParams struct {
 	DebugData        *model.DebugLogEntry // Debug日志数据
 	CostMultiplier   float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
 	ThinkingEffort   string
+	TokenHash        string // 认证 token 哈希（用量事件维度）
+	TokenEnvironment string // 认证 token 归属环境（用量事件路由维度）
+	RequestID        string // 关联同一用户请求的用量事件
+	ResearchID       string // 可选研究归属
+	AttemptSeq       int    // 真实上游尝试序号
 }
 
 // resolveProxyBillingModel 选择代理请求的计费模型。
@@ -967,6 +1048,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 	if p.ActualModel != "" && p.ActualModel != p.RequestModel {
 		entry.ActualModel = p.ActualModel
 	}
+	entry.ResponseModel = p.ResponseModel
 
 	if p.ErrMsg != "" {
 		// [FIX] 2026-02: 错误场景下也保留诊断信息（特别是499客户端取消）
@@ -991,6 +1073,9 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			}
 		}
 		entry.Message = truncateErr(msg)
+		if p.StatusCode == 499 && p.Result != nil && hasConsumedTokens(p.Result) {
+			fillEntryUsage(entry, p.Result, billingModel)
+		}
 	} else if p.Result != nil {
 		res := p.Result
 		if p.StatusCode >= 200 && p.StatusCode < 300 {
@@ -1017,22 +1102,11 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			entry.FirstByteTime = res.FirstByteTime
 		}
 
-		// Token统计（2025-11新增，从SSE响应中提取）
-		entry.InputTokens = res.InputTokens
-		entry.OutputTokens = res.OutputTokens
-		entry.ReasoningTokens = res.ReasoningTokens
-		entry.CacheReadInputTokens = res.CacheReadInputTokens
-		entry.CacheCreationInputTokens = res.CacheCreationInputTokens
-		entry.Cache5mInputTokens = res.Cache5mInputTokens
-		entry.Cache1hInputTokens = res.Cache1hInputTokens
-		entry.ServiceTier = res.ServiceTier
-
 		if p.StatusCode >= http.StatusOK && p.StatusCode < http.StatusMultipleChoices {
-			// 使用实际转发的模型计算成本（重定向时价格可能不同）；
-			// 始终调用以支持按次计费图像模型（tokens=0 时返回固定成本）。
-			// 优先 actual（重定向可能换价）；无定价时回退 request（渠道第一列作定价别名）
-			// alpha/search 固定按 search_call 计费。
-			entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+			fillEntryUsage(entry, res, billingModel)
+		} else {
+			// 失败日志保留既有 usage 可见性，但不计算成本。
+			fillEntryTokenUsage(entry, res)
 		}
 	} else {
 		entry.Message = "unknown"
@@ -1047,7 +1121,58 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		}
 	}
 	entry.DebugData = p.DebugData
+	entry.UsageEvent = buildAttemptUsageEvent(p, entry)
 	return entry
+}
+
+func fillEntryTokenUsage(entry *model.LogEntry, res *fwResult) {
+	entry.InputTokens = res.InputTokens
+	entry.OutputTokens = res.OutputTokens
+	entry.ReasoningTokens = res.ReasoningTokens
+	entry.CacheReadInputTokens = res.CacheReadInputTokens
+	entry.CacheCreationInputTokens = res.CacheCreationInputTokens
+	entry.Cache5mInputTokens = res.Cache5mInputTokens
+	entry.Cache1hInputTokens = res.Cache1hInputTokens
+	entry.ServiceTier = res.ServiceTier
+}
+
+func fillEntryUsage(entry *model.LogEntry, res *fwResult, billingModel string) {
+	fillEntryTokenUsage(entry, res)
+	entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res)
+}
+
+func buildAttemptUsageEvent(p logEntryParams, entry *model.LogEntry) *model.UsageEvent {
+	if p.RequestID == "" {
+		return nil
+	}
+	return &model.UsageEvent{
+		RequestID:                p.RequestID,
+		ResearchID:               p.ResearchID,
+		AttemptSeq:               p.AttemptSeq,
+		Kind:                     model.UsageEventAttempt,
+		Time:                     entry.Time,
+		Environment:              p.TokenEnvironment,
+		AuthTokenID:              entry.AuthTokenID,
+		ChannelID:                entry.ChannelID,
+		Model:                    entry.Model,
+		ActualModel:              entry.ActualModel,
+		StatusCode:               entry.StatusCode,
+		IsStreaming:              entry.IsStreaming,
+		Duration:                 entry.Duration,
+		FirstByte:                entry.FirstByteTime,
+		ClientIP:                 entry.ClientIP,
+		InputTokens:              entry.InputTokens,
+		OutputTokens:             entry.OutputTokens,
+		ReasoningTokens:          entry.ReasoningTokens,
+		CacheReadInputTokens:     entry.CacheReadInputTokens,
+		CacheCreationInputTokens: entry.CacheCreationInputTokens,
+		Cache5mInputTokens:       entry.Cache5mInputTokens,
+		Cache1hInputTokens:       entry.Cache1hInputTokens,
+		StandardCostUSD:          entry.Cost,
+		CostMultiplier:           entry.CostMultiplier,
+		EffectiveCostUSD:         entry.Cost * entry.CostMultiplier,
+		ServiceTier:              entry.ServiceTier,
+	}
 }
 
 func appendRetryStrategyToMessage(message, strategy string) string {
@@ -1062,7 +1187,7 @@ func appendRetryStrategyToMessage(message, strategy string) string {
 	return truncateErr(fmt.Sprintf("%s [%s]", message, strategy))
 }
 
-// computeRequestCost 集中两处计费分支（buildLogEntry / logFailedAttempt 旁路）。
+// computeRequestCost 是请求总成本的唯一口径：标准 token 成本加 Responses 工具成本。
 // fast 模式专用模型走 CalculateFastModeCost（已含 fast 倍率）。
 // OpenAI service_tier 是价格倍率，不改变按 token 数选择的长上下文分档；
 // 非 OpenAI 白名单模型即使响应携带 service_tier 也不加倍率。
@@ -1078,7 +1203,85 @@ func computeRequestCost(model string, serviceTier string, res *fwResult) float64
 		res.CacheReadInputTokens,
 		res.Cache5mInputTokens,
 		res.Cache1hInputTokens,
-	).Total
+	).Total + res.ToolCostUSD
+}
+
+func requestedServiceTier(reqCtx *proxyRequestContext) string {
+	if reqCtx == nil {
+		return ""
+	}
+	body := reqCtx.translatedBody
+	if len(body) == 0 {
+		body = reqCtx.body
+	}
+	if len(body) == 0 {
+		return ""
+	}
+	if reqCtx.upstreamProtocol == protocol.Anthropic {
+		return normalizeBillingServiceTier(gjson.GetBytes(body, "speed").String())
+	}
+	return normalizeBillingServiceTier(gjson.GetBytes(body, "service_tier").String())
+}
+
+func normalizeObservedServiceTier(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeBillingServiceTier(value string) string {
+	switch normalizeObservedServiceTier(value) {
+	case "ultrafast", "auto", "priority", "fast", "flex", "default", "standard":
+		return normalizeObservedServiceTier(value)
+	default:
+		return ""
+	}
+}
+
+func serviceTierCostRank(value string) (int, bool) {
+	switch normalizeBillingServiceTier(value) {
+	case "flex":
+		return 0, true
+	case "default", "standard":
+		return 1, true
+	case "auto", "priority", "fast":
+		return 2, true
+	case "ultrafast":
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+// resolveBillingServiceTier merges the requested tier with the upstream tier.
+// priority is an explicit Fast-mode purchase and therefore a billing floor:
+// gateways that omit it or echo default/standard must not silently undercharge.
+// An explicit ultrafast response still wins because it carries a higher charge.
+func resolveBillingServiceTier(requested, observed string) string {
+	requested = normalizeBillingServiceTier(requested)
+	observed = normalizeBillingServiceTier(observed)
+	// auto and ultrafast are explicit upstream processing tiers. They must win
+	// even when the request asked for a cheaper tier; otherwise the actual
+	// upstream charge is lost.
+	if observed == "auto" || observed == "ultrafast" {
+		return observed
+	}
+	if requested == "priority" {
+		return requested
+	}
+	if requested == "" {
+		if rank, ok := serviceTierCostRank(observed); ok && rank <= 1 {
+			return observed
+		}
+		return ""
+	}
+	if observed == "" {
+		return requested
+	}
+	requestedRank, requestedOK := serviceTierCostRank(requested)
+	observedRank, observedOK := serviceTierCostRank(observed)
+	if !requestedOK || !observedOK || observedRank > requestedRank {
+		return requested
+	}
+	return observed
 }
 
 // truncateErr 截断错误信息到512字符（防止日志过长）
@@ -1195,4 +1398,77 @@ func formatModelDisplayName(modelID string) string {
 		}
 	}
 	return strings.Join(words, " ")
+}
+
+func looksLikeJSONDocument(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+}
+
+// shouldValidateStrictJSONBody treats a declared JSON media type as a hard
+// contract, including scalar documents such as true, false and null. The
+// leading-byte heuristic remains only for bodies without a JSON declaration;
+// multipart payloads are framed data and must never be fed to the JSON parser.
+func shouldValidateStrictJSONBody(contentType string, raw []byte) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if index := strings.IndexByte(mediaType, ';'); index >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:index])
+	}
+	if mediaType == "multipart/form-data" {
+		return false
+	}
+	return isJSONContentType(contentType) || looksLikeJSONDocument(raw)
+}
+
+// sjsonPathJoin 拼接 sjson 路径段，用于数组索引或不带 `:` 前缀的键。
+func sjsonPathJoin(prefix, segment string) string {
+	escaped := sjsonPathEscape(segment)
+	if prefix == "" {
+		return escaped
+	}
+	return prefix + "." + escaped
+}
+
+// sjsonObjectPathJoin 拼接 sjson 路径段并加 `:` 前缀，强制按对象键寻址。
+func sjsonObjectPathJoin(prefix, segment string) string {
+	escaped := ":" + sjsonPathEscape(segment)
+	if prefix == "" {
+		return escaped
+	}
+	return prefix + "." + escaped
+}
+
+var sjsonPathEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`.`, `\.`,
+	`|`, `\|`,
+	`#`, `\#`,
+	`@`, `\@`,
+	`*`, `\*`,
+	`?`, `\?`,
+	`:`, `\:`,
+)
+
+// sjsonPathEscape 转义 sjson 路径中的特殊字符。
+func sjsonPathEscape(segment string) string {
+	return sjsonPathEscaper.Replace(segment)
+}
+
+// isMutableJSONObject 判定 raw 能否安全交给 gjson/sjson 做就地改写。
+//
+// 两个条件缺一不可，这不是重复防御：
+//   - sonic.Valid 拦语法错误。gjson 对残缺输入是宽松的——`gjson.ParseBytes([]byte("{\"a\":1")).IsObject()`
+//     返回 true，而 sjson.SetBytes 对同一份字节会静默返回 `,"z":1}` 且 err == nil，
+//     等于把损坏的字节发给上游。
+//   - IsObject 拦顶层类型。数组、字符串、null 都能通过语法校验，但按对象键去 set/delete
+//     的结果没有意义。
+//
+// 注意它守的是"能被 sjson 安全改写"，不是"能被 encoding/json 解析"：sonic.Valid 接受
+// 非法 `\u` 转义（`{"a":"\u00"}`），这类字节经 sjson 是原样透传的，不产生新的损坏。
+// 需要 encoding/json 语义的调用方（如 parseOrderedJSON）必须自己用 gjson.ValidBytes。
+func isMutableJSONObject(raw []byte) bool {
+	return sonic.Valid(raw) && gjson.ParseBytes(raw).IsObject()
 }

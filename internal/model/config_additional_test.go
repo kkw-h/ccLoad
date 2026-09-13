@@ -5,6 +5,66 @@ import (
 	"time"
 )
 
+// 渠道条目字面写成 gpt-5.6-luna(max) 时，对外暴露的名字和选路索引必须一致，
+// 否则会出现「模型列表里看得到、请求却没有可用渠道」。
+func TestThinkingSuffixEntriesAreRoutableByBaseName(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{ModelEntries: []ModelEntry{
+		{Model: "gpt-5.6-luna(max)", RedirectModel: "gpt-5.6-luna-2026"},
+		{Model: "claude-opus-4-6"},
+	}}
+
+	models := cfg.GetModels()
+	want := []string{"gpt-5.6-luna", "claude-opus-4-6"}
+	if len(models) != len(want) {
+		t.Fatalf("GetModels() = %v, want %v", models, want)
+	}
+	for i, name := range want {
+		if models[i] != name {
+			t.Fatalf("GetModels()[%d] = %q, want %q", i, models[i], name)
+		}
+	}
+
+	if !cfg.SupportsModel("gpt-5.6-luna") {
+		t.Fatal("base name must resolve to the suffixed entry")
+	}
+	if redirect, ok := cfg.GetRedirectModel("gpt-5.6-luna"); !ok || redirect != "gpt-5.6-luna-2026" {
+		t.Fatalf("GetRedirectModel(base) = %q, %v; want the suffixed entry's redirect", redirect, ok)
+	}
+}
+
+// 显式配置的基名条目不能被后缀条目派生的别名顶掉。
+func TestThinkingSuffixAliasDoesNotShadowExplicitEntry(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{ModelEntries: []ModelEntry{
+		{Model: "gpt-5.6-luna", RedirectModel: "explicit"},
+		{Model: "gpt-5.6-luna(max)", RedirectModel: "alias"},
+	}}
+
+	if redirect, ok := cfg.GetRedirectModel("gpt-5.6-luna"); !ok || redirect != "explicit" {
+		t.Fatalf("GetRedirectModel(base) = %q, %v; want explicit", redirect, ok)
+	}
+	if models := cfg.GetModels(); len(models) != 1 || models[0] != "gpt-5.6-luna" {
+		t.Fatalf("GetModels() = %v, want a single deduplicated base name", models)
+	}
+}
+
+func TestFuzzyMatchModelReturnsBaseNameForSuffixedEntry(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{ModelEntries: []ModelEntry{
+		{Model: "gpt-5.6-luna(max)"},
+		{Model: "gpt-5.6-luna"},
+	}}
+
+	matched, ok := cfg.FuzzyMatchModel("luna")
+	if !ok || matched != "gpt-5.6-luna" {
+		t.Fatalf("FuzzyMatchModel() = %q, %v; want gpt-5.6-luna", matched, ok)
+	}
+}
+
 func TestModelEntry_Validate(t *testing.T) {
 	t.Parallel()
 
@@ -230,6 +290,31 @@ func TestAPIKey_IsCoolingDown(t *testing.T) {
 	}
 }
 
+func TestAPIKey_AllowsModel(t *testing.T) {
+	t.Parallel()
+
+	unrestricted := &APIKey{}
+	if !unrestricted.AllowsModel("gpt-5") {
+		t.Fatal("empty allowlist must preserve unrestricted behavior")
+	}
+
+	restricted := &APIKey{AllowedModels: []string{"GPT-5", "claude-sonnet-4(max)"}}
+	if !restricted.AllowsModel("gpt-5") {
+		t.Fatal("model matching should be case-insensitive")
+	}
+	if !restricted.AllowsModel("claude-sonnet-4") {
+		t.Fatal("thinking suffix must not change model identity")
+	}
+	if restricted.AllowsModel("qwen3") {
+		t.Fatal("unlisted model must be rejected")
+	}
+
+	empty := &APIKey{ModelScopeEmpty: true}
+	if empty.AllowsModel("gpt-5") || empty.AllowsModel("*") {
+		t.Fatal("explicit empty model scope must reject every model")
+	}
+}
+
 func TestDefaultHealthScoreConfig(t *testing.T) {
 	t.Parallel()
 
@@ -304,5 +389,21 @@ func TestConfig_AnthropicOAuthAuthType(t *testing.T) {
 	if NormalizeAuthType(AuthTypeAnthropicOAuth) != AuthTypeAnthropicOAuth ||
 		!cfg.UsesAnthropicOAuth() || !cfg.UsesOAuth() || cfg.UsesXAIOAuth() {
 		t.Fatalf("Anthropic OAuth auth type was not isolated: %+v", cfg)
+	}
+}
+
+func TestConfig_CursorOAuthAuthType(t *testing.T) {
+	cfg := &Config{AuthType: AuthTypeCursorOAuth}
+	if NormalizeAuthType(AuthTypeCursorOAuth) != AuthTypeCursorOAuth ||
+		!cfg.UsesCursorOAuth() || !cfg.UsesOAuth() || cfg.UsesZAIOAuth() {
+		t.Fatalf("Cursor OAuth auth type was not isolated: %+v", cfg)
+	}
+}
+
+func TestConfig_ZedOAuthAuthType(t *testing.T) {
+	cfg := &Config{AuthType: AuthTypeZedOAuth}
+	if NormalizeAuthType(AuthTypeZedOAuth) != AuthTypeZedOAuth ||
+		!cfg.UsesZedOAuth() || !cfg.UsesOAuth() || cfg.UsesCodexOAuth() {
+		t.Fatalf("Zed OAuth auth type was not isolated: %+v", cfg)
 	}
 }

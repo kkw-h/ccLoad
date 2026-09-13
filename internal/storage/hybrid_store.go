@@ -215,6 +215,22 @@ func (h *HybridStore) CompareAndSwapOAuthCredential(
 	return true, nil
 }
 
+func (h *HybridStore) CompareAndSwapChannelManagement(
+	ctx context.Context,
+	channelID int64,
+	expectedEnvelope, nextEnvelope string,
+) (bool, error) {
+	h.oauthCredentialMu.Lock()
+	defer h.oauthCredentialMu.Unlock()
+
+	updated, err := h.sqlite.CompareAndSwapChannelManagement(ctx, channelID, expectedEnvelope, nextEnvelope)
+	if err != nil || !updated {
+		return updated, err
+	}
+	h.markChannelDirty(channelID, false)
+	return true, nil
+}
+
 func (h *HybridStore) ResetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error {
 	h.oauthCredentialMu.Lock()
 	defer h.oauthCredentialMu.Unlock()
@@ -428,6 +444,28 @@ func (h *HybridStore) UpdateAPIKeyNotes(ctx context.Context, channelID int64, no
 	return nil
 }
 
+func (h *HybridStore) UpdateAPIKeyCostMultipliers(ctx context.Context, channelID int64, multipliersByIndex map[int]float64) error {
+	if err := h.sqlite.UpdateAPIKeyCostMultipliers(ctx, channelID, multipliersByIndex); err != nil {
+		return err
+	}
+
+	h.markChannelDirty(channelID, false)
+	return nil
+}
+
+func (h *HybridStore) UpdateAPIKeyModelScopes(
+	ctx context.Context,
+	channelID int64,
+	scopesByIndex map[int]model.APIKeyModelScope,
+) error {
+	if err := h.sqlite.UpdateAPIKeyModelScopes(ctx, channelID, scopesByIndex); err != nil {
+		return err
+	}
+
+	h.markChannelDirty(channelID, false)
+	return nil
+}
+
 func (h *HybridStore) DeleteAPIKey(ctx context.Context, channelID int64, keyIndex int) error {
 	if err := h.sqlite.DeleteAPIKey(ctx, channelID, keyIndex); err != nil {
 		return err
@@ -464,6 +502,10 @@ func (h *HybridStore) ConfigureCooldown(settings util.CooldownSettings) {
 
 func (h *HybridStore) GetAllChannelCooldowns(ctx context.Context) (map[int64]time.Time, error) {
 	return h.sqlite.GetAllChannelCooldowns(ctx)
+}
+
+func (h *HybridStore) FetchChannelInfoBatch(ctx context.Context, channelIDs map[int64]bool) (map[int64]model.ChannelInfo, error) {
+	return h.sqlite.FetchChannelInfoBatch(ctx, channelIDs)
 }
 
 func (h *HybridStore) BumpChannelCooldown(ctx context.Context, channelID int64, now time.Time, statusCode int) (time.Duration, error) {
@@ -728,6 +770,12 @@ func (h *HybridStore) GetClientProtocolStats(ctx context.Context, startTime, end
 	})
 }
 
+func (h *HybridStore) GetAuthTypeStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.AuthTypeStats, error) {
+	return readAnalytics(h, "GetAuthTypeStats", func(store *sqlstore.SQLStore) ([]model.AuthTypeStats, error) {
+		return store.GetAuthTypeStats(ctx, startTime, endTime, filter)
+	})
+}
+
 func (h *HybridStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) (*model.RPMStats, error) {
 	return readAnalytics(h, "GetRPMStats", func(store *sqlstore.SQLStore) (*model.RPMStats, error) {
 		return store.GetRPMStats(ctx, startTime, endTime, filter, isToday)
@@ -830,8 +878,8 @@ func (h *HybridStore) UpdateTokenLastUsed(ctx context.Context, tokenHash string,
 	return nil
 }
 
-func (h *HybridStore) UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64, completedAt time.Time) error {
-	if err := h.sqlite.UpdateTokenStats(ctx, tokenHash, isSuccess, duration, isStreaming, firstByteTime, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens, costUSD, effectiveCostUSD, completedAt); err != nil {
+func (h *HybridStore) UpdateTokenStats(ctx context.Context, tokenHash string, outcome model.TokenStatOutcome, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64, completedAt time.Time) error {
+	if err := h.sqlite.UpdateTokenStats(ctx, tokenHash, outcome, duration, isStreaming, firstByteTime, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens, costUSD, effectiveCostUSD, completedAt); err != nil {
 		return err
 	}
 	token, err := h.sqlite.GetAuthTokenByValue(ctx, tokenHash)
