@@ -113,6 +113,12 @@ func normalizeAnthropicToolChoice(body []byte) []byte {
 	if choiceType != "any" && choiceType != "tool" {
 		return body
 	}
+	// Forced tool use is incompatible with enabled thinking. An explicit
+	// disable remains valid and must not become the upstream's default mode.
+	switch strings.ToLower(strings.TrimSpace(jsonStringValue(gjson.GetBytes(body, "thinking.type")))) {
+	case "disabled", "off", "none":
+		return normalizeAnthropicThinking(body)
+	}
 	body = deleteJSONPath(body, "thinking")
 	return deleteAnthropicOutputEffort(body)
 }
@@ -128,7 +134,9 @@ func normalizeAnthropicThinking(body []byte) []byte {
 		body = setJSONRaw(body, "thinking.type", `"adaptive"`)
 		typ = "adaptive"
 	case "disabled", "off", "none":
-		body = deleteJSONPath(body, "thinking")
+		// Absence delegates to the upstream default, which can enable thinking.
+		// Use the explicit wire value and discard enabled-only budget fields.
+		body = setJSONRaw(body, "thinking", `{"type":"disabled"}`)
 		return deleteAnthropicOutputEffort(body)
 	}
 	if typ != "adaptive" {

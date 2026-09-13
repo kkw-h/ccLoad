@@ -470,7 +470,7 @@ func TestProxyModelsExposeReasoningCapabilitiesForOpenAIAndAnthropic(t *testing.
 		t.Fatalf("new resolver: %v", err)
 	}
 	server.modelReasoningCapabilities = resolver
-	metadataResolver, err := newModelMetadataResolver(`{}`)
+	metadataResolver, err := newModelMetadataResolver(`{"gpt-5.6-sol":{"thinkingRequestFormat":"anthropic-adaptive","systemTextReasoningAllowance":1024}}`)
 	if err != nil {
 		t.Fatalf("new metadata resolver: %v", err)
 	}
@@ -522,6 +522,8 @@ func TestProxyModelsExposeReasoningCapabilitiesForOpenAIAndAnthropic(t *testing.
 			assertMetadataInt64(t, "contextWindow", metadata.ContextWindow, 372000)
 			assertMetadataInt64(t, "maxTokens", metadata.MaxTokens, 128000)
 			assertMetadataStrings(t, "inputTypes", metadata.InputTypes, []string{"text"})
+			assertMetadataString(t, "thinkingRequestFormat", metadata.ThinkingRequestFormat, "anthropic-adaptive")
+			assertMetadataInt64(t, "systemTextReasoningAllowance", metadata.SystemTextReasoningAllowance, 1024)
 		})
 	}
 }
@@ -731,13 +733,15 @@ func modelReasoningEffortsFromResponse(t testing.TB, body []byte, modelID string
 }
 
 type modelListMetadataResponse struct {
-	DisplayName       string    `json:"displayName"`
-	LegacyDisplayName string    `json:"display_name"`
-	Provider          *string   `json:"provider"`
-	ThinkingLevels    *[]string `json:"thinkingLevels"`
-	ContextWindow     *int64    `json:"contextWindow"`
-	MaxTokens         *int64    `json:"maxTokens"`
-	InputTypes        *[]string `json:"inputTypes"`
+	DisplayName                  string    `json:"displayName"`
+	LegacyDisplayName            string    `json:"display_name"`
+	Provider                     *string   `json:"provider"`
+	ThinkingLevels               *[]string `json:"thinkingLevels"`
+	ContextWindow                *int64    `json:"contextWindow"`
+	MaxTokens                    *int64    `json:"maxTokens"`
+	InputTypes                   *[]string `json:"inputTypes"`
+	ThinkingRequestFormat        *string   `json:"thinkingRequestFormat"`
+	SystemTextReasoningAllowance *int64    `json:"systemTextReasoningAllowance"`
 }
 
 func modelListMetadataFromResponse(t testing.TB, body []byte, modelID string) modelListMetadataResponse {

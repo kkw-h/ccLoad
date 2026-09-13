@@ -598,16 +598,18 @@ type ChannelModelStats struct {
 // AdminChannelModelEntry 是管理接口的模型响应结构。
 // 推理强度是运行时能力，不属于渠道持久化配置，因此不放入 model.ModelEntry。
 type AdminChannelModelEntry struct {
-	Model                     string    `json:"model"`
-	RedirectModel             string    `json:"redirect_model,omitempty"`
-	Disabled                  bool      `json:"disabled,omitempty"`
-	SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
-	DisplayName               string    `json:"displayName"`
-	Provider                  *string   `json:"provider,omitempty"`
-	ThinkingLevels            *[]string `json:"thinkingLevels,omitempty"`
-	ContextWindow             *int64    `json:"contextWindow,omitempty"`
-	MaxTokens                 *int64    `json:"maxTokens,omitempty"`
-	InputTypes                *[]string `json:"inputTypes,omitempty"`
+	Model                        string    `json:"model"`
+	RedirectModel                string    `json:"redirect_model,omitempty"`
+	Disabled                     bool      `json:"disabled,omitempty"`
+	SupportedReasoningEfforts    *[]string `json:"supported_reasoning_efforts,omitempty"`
+	DisplayName                  string    `json:"displayName"`
+	Provider                     *string   `json:"provider,omitempty"`
+	ThinkingLevels               *[]string `json:"thinkingLevels,omitempty"`
+	ContextWindow                *int64    `json:"contextWindow,omitempty"`
+	MaxTokens                    *int64    `json:"maxTokens,omitempty"`
+	InputTypes                   *[]string `json:"inputTypes,omitempty"`
+	ThinkingRequestFormat        *string   `json:"thinkingRequestFormat,omitempty"`
+	SystemTextReasoningAllowance *int64    `json:"systemTextReasoningAllowance,omitempty"`
 }
 
 // ChannelWithCooldown 带冷却状态的渠道响应结构

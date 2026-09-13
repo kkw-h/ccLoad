@@ -481,6 +481,8 @@ func (s *Server) adminChannelModelEntries(entries []model.ModelEntry) []AdminCha
 			responseEntry.ContextWindow = metadata.ContextWindow
 			responseEntry.MaxTokens = metadata.MaxTokens
 			responseEntry.InputTypes = metadata.InputTypes
+			responseEntry.ThinkingRequestFormat = metadata.ThinkingRequestFormat
+			responseEntry.SystemTextReasoningAllowance = metadata.SystemTextReasoningAllowance
 		}
 		out = append(out, responseEntry)
 	}

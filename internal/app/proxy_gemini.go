@@ -211,34 +211,38 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 
 	if clientProtocol == "anthropic" {
 		type ModelInfo struct {
-			ID                        string    `json:"id"`
-			DisplayName               string    `json:"display_name"`
-			CamelCaseDisplayName      string    `json:"displayName"`
-			Type                      string    `json:"type"`
-			CreatedAt                 string    `json:"created_at"`
-			SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
-			Provider                  *string   `json:"provider,omitempty"`
-			ThinkingLevels            *[]string `json:"thinkingLevels,omitempty"`
-			ContextWindow             *int64    `json:"contextWindow,omitempty"`
-			MaxTokens                 *int64    `json:"maxTokens,omitempty"`
-			InputTypes                *[]string `json:"inputTypes,omitempty"`
+			ID                           string    `json:"id"`
+			DisplayName                  string    `json:"display_name"`
+			CamelCaseDisplayName         string    `json:"displayName"`
+			Type                         string    `json:"type"`
+			CreatedAt                    string    `json:"created_at"`
+			SupportedReasoningEfforts    *[]string `json:"supported_reasoning_efforts,omitempty"`
+			Provider                     *string   `json:"provider,omitempty"`
+			ThinkingLevels               *[]string `json:"thinkingLevels,omitempty"`
+			ContextWindow                *int64    `json:"contextWindow,omitempty"`
+			MaxTokens                    *int64    `json:"maxTokens,omitempty"`
+			InputTypes                   *[]string `json:"inputTypes,omitempty"`
+			ThinkingRequestFormat        *string   `json:"thinkingRequestFormat,omitempty"`
+			SystemTextReasoningAllowance *int64    `json:"systemTextReasoningAllowance,omitempty"`
 		}
 		modelList := make([]ModelInfo, 0, len(models))
 		for _, modelName := range models {
 			capability := capabilities[modelName]
 			displayName := formatModelDisplayName(modelName)
 			modelList = append(modelList, ModelInfo{
-				ID:                        modelName,
-				DisplayName:               displayName,
-				CamelCaseDisplayName:      displayName,
-				Type:                      "model",
-				CreatedAt:                 time.Unix(0, 0).UTC().Format(time.RFC3339),
-				SupportedReasoningEfforts: capability.SupportedReasoningEfforts,
-				Provider:                  capability.Metadata.Provider,
-				ThinkingLevels:            capability.ThinkingLevels,
-				ContextWindow:             capability.Metadata.ContextWindow,
-				MaxTokens:                 capability.Metadata.MaxTokens,
-				InputTypes:                capability.Metadata.InputTypes,
+				ID:                           modelName,
+				DisplayName:                  displayName,
+				CamelCaseDisplayName:         displayName,
+				Type:                         "model",
+				CreatedAt:                    time.Unix(0, 0).UTC().Format(time.RFC3339),
+				SupportedReasoningEfforts:    capability.SupportedReasoningEfforts,
+				Provider:                     capability.Metadata.Provider,
+				ThinkingLevels:               capability.ThinkingLevels,
+				ContextWindow:                capability.Metadata.ContextWindow,
+				MaxTokens:                    capability.Metadata.MaxTokens,
+				InputTypes:                   capability.Metadata.InputTypes,
+				ThinkingRequestFormat:        capability.Metadata.ThinkingRequestFormat,
+				SystemTextReasoningAllowance: capability.Metadata.SystemTextReasoningAllowance,
 			})
 		}
 
@@ -256,35 +260,39 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 
 	// 构造 OpenAI API 响应格式
 	type ModelInfo struct {
-		ID                        string    `json:"id"`
-		Object                    string    `json:"object"`
-		Created                   int64     `json:"created"`
-		OwnedBy                   string    `json:"owned_by"`
-		MultiAgentVersion         string    `json:"multi_agent_version,omitempty"`
-		SupportedReasoningEfforts *[]string `json:"supported_reasoning_efforts,omitempty"`
-		DisplayName               string    `json:"displayName"`
-		Provider                  *string   `json:"provider,omitempty"`
-		ThinkingLevels            *[]string `json:"thinkingLevels,omitempty"`
-		ContextWindow             *int64    `json:"contextWindow,omitempty"`
-		MaxTokens                 *int64    `json:"maxTokens,omitempty"`
-		InputTypes                *[]string `json:"inputTypes,omitempty"`
+		ID                           string    `json:"id"`
+		Object                       string    `json:"object"`
+		Created                      int64     `json:"created"`
+		OwnedBy                      string    `json:"owned_by"`
+		MultiAgentVersion            string    `json:"multi_agent_version,omitempty"`
+		SupportedReasoningEfforts    *[]string `json:"supported_reasoning_efforts,omitempty"`
+		DisplayName                  string    `json:"displayName"`
+		Provider                     *string   `json:"provider,omitempty"`
+		ThinkingLevels               *[]string `json:"thinkingLevels,omitempty"`
+		ContextWindow                *int64    `json:"contextWindow,omitempty"`
+		MaxTokens                    *int64    `json:"maxTokens,omitempty"`
+		InputTypes                   *[]string `json:"inputTypes,omitempty"`
+		ThinkingRequestFormat        *string   `json:"thinkingRequestFormat,omitempty"`
+		SystemTextReasoningAllowance *int64    `json:"systemTextReasoningAllowance,omitempty"`
 	}
 
 	modelList := make([]ModelInfo, 0, len(models))
 	for _, modelName := range models {
 		capability := capabilities[modelName]
 		modelList = append(modelList, ModelInfo{
-			ID:                        modelName,
-			Object:                    "model",
-			Created:                   0,
-			OwnedBy:                   "system",
-			SupportedReasoningEfforts: capability.SupportedReasoningEfforts,
-			DisplayName:               formatModelDisplayName(modelName),
-			Provider:                  capability.Metadata.Provider,
-			ThinkingLevels:            capability.ThinkingLevels,
-			ContextWindow:             capability.Metadata.ContextWindow,
-			MaxTokens:                 capability.Metadata.MaxTokens,
-			InputTypes:                capability.Metadata.InputTypes,
+			ID:                           modelName,
+			Object:                       "model",
+			Created:                      0,
+			OwnedBy:                      "system",
+			SupportedReasoningEfforts:    capability.SupportedReasoningEfforts,
+			DisplayName:                  formatModelDisplayName(modelName),
+			Provider:                     capability.Metadata.Provider,
+			ThinkingLevels:               capability.ThinkingLevels,
+			ContextWindow:                capability.Metadata.ContextWindow,
+			MaxTokens:                    capability.Metadata.MaxTokens,
+			InputTypes:                   capability.Metadata.InputTypes,
+			ThinkingRequestFormat:        capability.Metadata.ThinkingRequestFormat,
+			SystemTextReasoningAllowance: capability.Metadata.SystemTextReasoningAllowance,
 			MultiAgentVersion: func() string {
 				if clientProtocol == "codex" {
 					return "v2"

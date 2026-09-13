@@ -396,11 +396,12 @@ func TestApplyThinkingSuffixWritesClientProtocolFields(t *testing.T) {
 			},
 		},
 		{
-			name:           "anthropic none 归零为无 thinking 字段",
+			name:           "anthropic none 显式关闭 thinking",
 			clientProtocol: protocol.Anthropic,
 			requestedModel: "claude-opus-4-6(none)",
 			body:           `{"model":"claude-opus-4-6","thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`,
-			wantAbsent:     []string{"thinking", "output_config"},
+			wantStrings:    map[string]string{"thinking.type": "disabled"},
+			wantAbsent:     []string{"thinking.budget_tokens", "output_config"},
 		},
 		{
 			name:           "anthropic auto 写 adaptive 不写 effort",

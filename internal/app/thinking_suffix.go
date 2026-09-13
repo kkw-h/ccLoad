@@ -77,7 +77,7 @@ func thinkingEffortLabel(cfg thinking.ThinkingConfig) string {
 	}
 }
 
-// thinkingEffortFromRequest 优先采用后缀声明的等级：(none)/(auto) 在部分协议上以
+// thinkingEffortFromRequest 优先采用后缀声明的等级：(auto) 在部分协议上以
 // "删除字段"表达，请求体里读不回来。
 func thinkingEffortFromRequest(requestedModel string, body []byte) string {
 	if _, cfg, ok := model.ParseThinkingSuffix(requestedModel); ok {
@@ -174,9 +174,8 @@ func indexOfOpenAIStyleLevel(level string) int {
 // 重定向前拿不到实际上游模型。
 func applyAnthropicThinking(body []byte, cfg thinking.ThinkingConfig) []byte {
 	if cfg.Mode == thinking.ModeNone {
-		// ccLoad 全链路以"没有 thinking 字段"表示关闭思考（见 normalizeAnthropicThinking），
-		// 直接写成终态，避免归一化路径与原生 Claude Code 直通路径给出两种线协议。
-		out, _ := sjson.DeleteBytes(body, "thinking")
+		// 关闭必须显式写入客户端协议，转换器才能继续把关闭语义传到上游。
+		out, _ := sjson.SetRawBytes(body, "thinking", []byte(`{"type":"disabled"}`))
 		return deleteAnthropicThinkingEffort(out)
 	}
 	if cfg.Mode == thinking.ModeBudget {

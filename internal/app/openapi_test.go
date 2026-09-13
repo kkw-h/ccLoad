@@ -99,7 +99,7 @@ func TestManagementOpenAPIDocumentsModelListMetadata(t *testing.T) {
 
 	for _, schemaName := range []string{"OpenAIModel", "AnthropicModel", "ModelEntry"} {
 		schema := document.Components.Schemas[schemaName]
-		for _, field := range []string{"displayName", "provider", "thinkingLevels", "contextWindow", "maxTokens", "inputTypes"} {
+		for _, field := range []string{"displayName", "provider", "thinkingLevels", "contextWindow", "maxTokens", "inputTypes", "thinkingRequestFormat", "systemTextReasoningAllowance"} {
 			if _, ok := schema.Properties[field]; !ok {
 				t.Errorf("%s must document %s", schemaName, field)
 			}
